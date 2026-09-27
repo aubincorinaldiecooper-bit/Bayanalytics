@@ -1,0 +1,62 @@
+"""FastAPI application factory with lifespan-managed local runtimes (AGENT.md section 36)."""
+
+from __future__ import annotations
+
+import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+from bayanalytics import __version__
+from bayanalytics.api.errors import install_error_handlers
+from bayanalytics.api.router import build_router
+from bayanalytics.config import Settings, get_settings
+from bayanalytics.runtime import Runtime
+
+log = logging.getLogger(__name__)
+
+
+def create_app(settings: Settings | None = None, runtime: Runtime | None = None) -> FastAPI:
+    settings = settings or get_settings()
+    logging.basicConfig(level=getattr(logging, settings.log_level.upper(), logging.INFO))
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        rt = runtime
+        if rt is None:
+            from bayanalytics.wiring import build_runtime
+
+            rt = build_runtime(settings)
+        app.state.runtime = rt
+        log.info(
+            "starting BayAnalytics backend %s with settings %s", __version__, settings.redacted()
+        )
+        await rt.start()
+        try:
+            yield
+        finally:
+            await rt.close()
+
+    app = FastAPI(
+        title="BayAnalytics",
+        version=__version__,
+        lifespan=lifespan,
+        docs_url="/api/docs",
+        openapi_url="/api/openapi.json",
+    )
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.cors_origins,
+        allow_credentials=False,
+        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_headers=["*"],
+        expose_headers=["*"],
+    )
+    install_error_handlers(app)
+    app.include_router(build_router(settings.api_prefix))
+    return app
+
+
+app = None  # created lazily by ``bayanalytics serve``; import ``create_app`` in tests

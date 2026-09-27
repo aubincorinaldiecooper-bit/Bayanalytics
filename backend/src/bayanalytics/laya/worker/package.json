@@ -1,0 +1,16 @@
+{
+  "name": "bayanalytics-laya-worker",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Persistent NDJSON worker that exposes @receptron/laya (load / system_one / health / close) to the Python backend. No finance logic lives here.",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node worker.mjs"
+  },
+  "dependencies": {
+    "@receptron/laya": "0.1.2"
+  }
+}

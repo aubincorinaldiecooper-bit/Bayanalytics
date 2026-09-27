@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+dist/
+build/
+
+# Node (Laya worker)
+node_modules/
+
+# Local secrets and environment
+.env
+.env.local
+*.local.json
+
+# Model artifacts and caches (never commit weights)
+models/
+*.gguf
+*.onnx
+*.onnx.data
+*.bin
+.cache/
+
+# Benchmark and runtime output
+backend/bench/
+backend/runtime-data/
+*.log

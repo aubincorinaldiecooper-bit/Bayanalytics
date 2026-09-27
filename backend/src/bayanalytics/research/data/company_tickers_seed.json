@@ -1,0 +1,490 @@
+{
+ "_comment": "SEED ONLY. A small hand-maintained subset of SEC EDGAR company_tickers.json in EDGAR's own shape (cik_str/ticker/title) plus an exchange key where known and ticker aliases (former tickers). At runtime EdgarClient.company_tickers() refreshes from https://www.sec.gov/files/company_tickers.json (24 h cache) and only falls back to this seed when EDGAR is unreachable. ASML and TSM are ADRs. Alphabet appears twice (GOOGL/GOOG share one CIK); American Airlines / American Express share a word on purpose for identity-resolution tests.",
+ "seed": true,
+ "source": "https://www.sec.gov/files/company_tickers.json",
+ "companies": [
+  {
+   "cik_str": 320193,
+   "ticker": "AAPL",
+   "title": "Apple Inc.",
+   "exchange": "NASDAQ"
+  },
+  {
+   "cik_str": 789019,
+   "ticker": "MSFT",
+   "title": "MICROSOFT CORP",
+   "exchange": "NASDAQ"
+  },
+  {
+   "cik_str": 1045810,
+   "ticker": "NVDA",
+   "title": "NVIDIA CORP",
+   "exchange": "NASDAQ"
+  },
+  {
+   "cik_str": 1652044,
+   "ticker": "GOOGL",
+   "title": "Alphabet Inc.",
+   "exchange": "NASDAQ"
+  },
+  {
+   "cik_str": 1652044,
+   "ticker": "GOOG",
+   "title": "Alphabet Inc.",
+   "exchange": "NASDAQ"
+  },
+  {
+   "cik_str": 1018724,
+   "ticker": "AMZN",
+   "title": "AMAZON COM INC",
+   "exchange": "NASDAQ"
+  },
+  {
+   "cik_str": 1326801,
+   "ticker": "META",
+   "title": "Meta Platforms, Inc.",
+   "exchange": "NASDAQ",
+   "aliases": [
+    "FB"
+   ]
+  },
+  {
+   "cik_str": 1318605,
+   "ticker": "TSLA",
+   "title": "Tesla, Inc.",
+   "exchange": "NASDAQ"
+  },
+  {
+   "cik_str": 1067983,
+   "ticker": "BRK-B",
+   "title": "BERKSHIRE HATHAWAY INC",
+   "exchange": "NYSE",
+   "aliases": [
+    "BRK.B"
+   ]
+  },
+  {
+   "cik_str": 19617,
+   "ticker": "JPM",
+   "title": "JPMORGAN CHASE & CO",
+   "exchange": "NYSE"
+  },
+  {
+   "cik_str": 1403161,
+   "ticker": "V",
+   "title": "VISA INC.",
+   "exchange": "NYSE"
+  },
+  {
+   "cik_str": 1141391,
+   "ticker": "MA",
+   "title": "Mastercard Inc",
+   "exchange": "NYSE"
+  },
+  {
+   "cik_str": 731766,
+   "ticker": "UNH",
+   "title": "UNITEDHEALTH GROUP INC",
+   "exchange": "NYSE"
+  },
+  {
+   "cik_str": 34088,
+   "ticker": "XOM",
+   "title": "EXXON MOBIL CORP",
+   "exchange": "NYSE"
+  },
+  {
+   "cik_str": 200406,
+   "ticker": "JNJ",
+   "title": "JOHNSON & JOHNSON",
+   "exchange": "NYSE"
+  },
+  {
+   "cik_str": 80424,
+   "ticker": "PG",
+   "title": "PROCTER & GAMBLE Co",
+   "exchange": "NYSE"
+  },
+  {
+   "cik_str": 354950,
+   "ticker": "HD",
+   "title": "HOME DEPOT, INC.",
+   "exchange": "NYSE"
+  },
+  {
+   "cik_str": 909832,
+   "ticker": "COST",
+   "title": "COSTCO WHOLESALE CORP /NEW",
+   "exchange": "NASDAQ"
+  },
+  {
+   "cik_str": 1551152,
+   "ticker": "ABBV",
+   "title": "AbbVie Inc.",
+   "exchange": "NYSE"
+  },
+  {
+   "cik_str": 21344,
+   "ticker": "KO",
+   "title": "COCA COLA CO",
+   "exchange": "NYSE"
+  },
+  {
+   "cik_str": 77476,
+   "ticker": "PEP",
+   "title": "PEPSICO INC",
+   "exchange": "NASDAQ"
+  },
+  {
+   "cik_str": 310158,
+   "ticker": "MRK",
+   "title": "Merck & Co., Inc.",
+   "exchange": "NYSE"
+  },
+  {
+   "cik_str": 1730168,
+   "ticker": "AVGO",
+   "title": "Broadcom Inc.",
+   "exchange": "NASDAQ"
+  },
+  {
+   "cik_str": 796343,
+   "ticker": "ADBE",
+   "title": "ADOBE INC.",
+   "exchange": "NASDAQ"
+  },
+  {
+   "cik_str": 1108524,
+   "ticker": "CRM",
+   "title": "Salesforce, Inc.",
+   "exchange": "NYSE"
+  },
+  {
+   "cik_str": 1065280,
+   "ticker": "NFLX",
+   "title": "NETFLIX INC",
+   "exchange": "NASDAQ"
+  },
+  {
+   "cik_str": 2488,
+   "ticker": "AMD",
+   "title": "ADVANCED MICRO DEVICES INC",
+   "exchange": "NASDAQ"
+  },
+  {
+   "cik_str": 50863,
+   "ticker": "INTC",
+   "title": "INTEL CORP",
+   "exchange": "NASDAQ"
+  },
+  {
+   "cik_str": 858877,
+   "ticker": "CSCO",
+   "title": "CISCO SYSTEMS, INC.",
+   "exchange": "NASDAQ"
+  },
+  {
+   "cik_str": 1341439,
+   "ticker": "ORCL",
+   "title": "ORACLE CORP",
+   "exchange": "NYSE"
+  },
+  {
+   "cik_str": 1594805,
+   "ticker": "SHOP",
+   "title": "SHOPIFY INC.",
+   "exchange": "NASDAQ"
+  },
+  {
+   "cik_str": 104169,
+   "ticker": "WMT",
+   "title": "Walmart Inc.",
+   "exchange": "NYSE"
+  },
+  {
+   "cik_str": 1744489,
+   "ticker": "DIS",
+   "title": "Walt Disney Co",
+   "exchange": "NYSE"
+  },
+  {
+   "cik_str": 12927,
+   "ticker": "BA",
+   "title": "BOEING CO",
+   "exchange": "NYSE"
+  },
+  {
+   "cik_str": 18230,
+   "ticker": "CAT",
+   "title": "CATERPILLAR INC",
+   "exchange": "NYSE"
+  },
+  {
+   "cik_str": 40545,
+   "ticker": "GE",
+   "title": "GE Aerospace",
+   "exchange": "NYSE"
+  },
+  {
+   "cik_str": 51143,
+   "ticker": "IBM",
+   "title": "INTERNATIONAL BUSINESS MACHINES CORP",
+   "exchange": "NYSE"
+  },
+  {
+   "cik_str": 804328,
+   "ticker": "QCOM",
+   "title": "QUALCOMM INC/DE",
+   "exchange": "NASDAQ"
+  },
+  {
+   "cik_str": 97476,
+   "ticker": "TXN",
+   "title": "TEXAS INSTRUMENTS INC",
+   "exchange": "NASDAQ"
+  },
+  {
+   "cik_str": 773840,
+   "ticker": "HON",
+   "title": "HONEYWELL INTERNATIONAL INC",
+   "exchange": "NASDAQ"
+  },
+  {
+   "cik_str": 1090727,
+   "ticker": "UPS",
+   "title": "UNITED PARCEL SERVICE INC",
+   "exchange": "NYSE"
+  },
+  {
+   "cik_str": 320187,
+   "ticker": "NKE",
+   "title": "NIKE, Inc.",
+   "exchange": "NYSE"
+  },
+  {
+   "cik_str": 63908,
+   "ticker": "MCD",
+   "title": "MCDONALDS CORP",
+   "exchange": "NYSE"
+  },
+  {
+   "cik_str": 829224,
+   "ticker": "SBUX",
+   "title": "STARBUCKS CORP",
+   "exchange": "NASDAQ"
+  },
+  {
+   "cik_str": 78003,
+   "ticker": "PFE",
+   "title": "PFIZER INC",
+   "exchange": "NYSE"
+  },
+  {
+   "cik_str": 59478,
+   "ticker": "LLY",
+   "title": "ELI LILLY & Co",
+   "exchange": "NYSE"
+  },
+  {
+   "cik_str": 97745,
+   "ticker": "TMO",
+   "title": "THERMO FISHER SCIENTIFIC INC.",
+   "exchange": "NYSE"
+  },
+  {
+   "cik_str": 1800,
+   "ticker": "ABT",
+   "title": "ABBOTT LABORATORIES",
+   "exchange": "NYSE"
+  },
+  {
+   "cik_str": 313616,
+   "ticker": "DHR",
+   "title": "DANAHER CORP /DE/",
+   "exchange": "NYSE"
+  },
+  {
+   "cik_str": 14272,
+   "ticker": "BMY",
+   "title": "BRISTOL MYERS SQUIBB CO",
+   "exchange": "NYSE"
+  },
+  {
+   "cik_str": 318154,
+   "ticker": "AMGN",
+   "title": "AMGEN INC",
+   "exchange": "NASDAQ"
+  },
+  {
+   "cik_str": 882095,
+   "ticker": "GILD",
+   "title": "GILEAD SCIENCES, INC.",
+   "exchange": "NASDAQ"
+  },
+  {
+   "cik_str": 93410,
+   "ticker": "CVX",
+   "title": "CHEVRON CORP",
+   "exchange": "NYSE"
+  },
+  {
+   "cik_str": 1163165,
+   "ticker": "COP",
+   "title": "CONOCOPHILLIPS",
+   "exchange": "NYSE"
+  },
+  {
+   "cik_str": 87347,
+   "ticker": "SLB",
+   "title": "SCHLUMBERGER LIMITED/NV",
+   "exchange": "NYSE"
+  },
+  {
+   "cik_str": 886982,
+   "ticker": "GS",
+   "title": "GOLDMAN SACHS GROUP INC",
+   "exchange": "NYSE"
+  },
+  {
+   "cik_str": 895421,
+   "ticker": "MS",
+   "title": "MORGAN STANLEY",
+   "exchange": "NYSE"
+  },
+  {
+   "cik_str": 70858,
+   "ticker": "BAC",
+   "title": "BANK OF AMERICA CORP /DE/",
+   "exchange": "NYSE"
+  },
+  {
+   "cik_str": 72971,
+   "ticker": "WFC",
+   "title": "WELLS FARGO & COMPANY/MN",
+   "exchange": "NYSE"
+  },
+  {
+   "cik_str": 831001,
+   "ticker": "C",
+   "title": "CITIGROUP INC",
+   "exchange": "NYSE"
+  },
+  {
+   "cik_str": 4962,
+   "ticker": "AXP",
+   "title": "AMERICAN EXPRESS CO",
+   "exchange": "NYSE"
+  },
+  {
+   "cik_str": 1364742,
+   "ticker": "BLK",
+   "title": "BlackRock, Inc.",
+   "exchange": "NYSE"
+  },
+  {
+   "cik_str": 64040,
+   "ticker": "SPGI",
+   "title": "S&P Global Inc.",
+   "exchange": "NYSE"
+  },
+  {
+   "cik_str": 1633917,
+   "ticker": "PYPL",
+   "title": "PayPal Holdings, Inc.",
+   "exchange": "NASDAQ"
+  },
+  {
+   "cik_str": 1512673,
+   "ticker": "XYZ",
+   "title": "Block, Inc.",
+   "exchange": "NYSE",
+   "aliases": [
+    "SQ"
+   ]
+  },
+  {
+   "cik_str": 1543151,
+   "ticker": "UBER",
+   "title": "Uber Technologies, Inc",
+   "exchange": "NYSE"
+  },
+  {
+   "cik_str": 1559720,
+   "ticker": "ABNB",
+   "title": "Airbnb, Inc.",
+   "exchange": "NASDAQ"
+  },
+  {
+   "cik_str": 1321655,
+   "ticker": "PLTR",
+   "title": "Palantir Technologies Inc.",
+   "exchange": "NASDAQ"
+  },
+  {
+   "cik_str": 1640147,
+   "ticker": "SNOW",
+   "title": "Snowflake Inc.",
+   "exchange": "NYSE"
+  },
+  {
+   "cik_str": 1535527,
+   "ticker": "CRWD",
+   "title": "CrowdStrike Holdings, Inc.",
+   "exchange": "NASDAQ"
+  },
+  {
+   "cik_str": 1327567,
+   "ticker": "PANW",
+   "title": "Palo Alto Networks Inc",
+   "exchange": "NASDAQ"
+  },
+  {
+   "cik_str": 1373715,
+   "ticker": "NOW",
+   "title": "ServiceNow, Inc.",
+   "exchange": "NYSE"
+  },
+  {
+   "cik_str": 896878,
+   "ticker": "INTU",
+   "title": "INTUIT INC.",
+   "exchange": "NASDAQ"
+  },
+  {
+   "cik_str": 6951,
+   "ticker": "AMAT",
+   "title": "APPLIED MATERIALS INC /DE",
+   "exchange": "NASDAQ"
+  },
+  {
+   "cik_str": 707549,
+   "ticker": "LRCX",
+   "title": "LAM RESEARCH CORP",
+   "exchange": "NASDAQ"
+  },
+  {
+   "cik_str": 723125,
+   "ticker": "MU",
+   "title": "MICRON TECHNOLOGY INC",
+   "exchange": "NASDAQ"
+  },
+  {
+   "cik_str": 937966,
+   "ticker": "ASML",
+   "title": "ASML HOLDING NV",
+   "exchange": "NASDAQ"
+  },
+  {
+   "cik_str": 1046179,
+   "ticker": "TSM",
+   "title": "TAIWAN SEMICONDUCTOR MANUFACTURING CO LTD",
+   "exchange": "NYSE"
+  },
+  {
+   "cik_str": 6201,
+   "ticker": "AAL",
+   "title": "American Airlines Group Inc.",
+   "exchange": "NASDAQ"
+  }
+ ]
+}
