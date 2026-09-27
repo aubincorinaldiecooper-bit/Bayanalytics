@@ -7,6 +7,7 @@ app state. Tests build it with mock runtimes and the in-memory store.
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -34,6 +35,7 @@ class Runtime:
     research: Any = None  # research stack (provider, edgar, prices); opaque to the API layer
     extras: dict[str, Any] = field(default_factory=dict)
     _started: bool = False
+    _health_cache: tuple[float, Health] | None = None
 
     async def start(self) -> None:
         if self._started:
@@ -45,6 +47,9 @@ class Runtime:
         self.extras["laya_load"] = info.model_dump()
         log.info("laya loaded in %.0f ms", info.load_ms)
         await self.spark.start()
+        voice = self.transcriber.available()
+        log.info("voice input %s", "available" if voice else "disabled")
+        self.extras["voice_available_at_start"] = voice
         self._started = True
 
     async def close(self) -> None:
@@ -76,6 +81,17 @@ class Runtime:
         )
 
     async def health(self, version: str) -> Health:
+        # Cached briefly: the Laya round trip takes the worker lock, and unauthenticated
+        # pollers must not contend with analyses.
+        now = time.monotonic()
+        cached = self._health_cache
+        if cached is not None and now - cached[0] < self.settings.health_cache_s:
+            return cached[1].model_copy(update={"active_analyses": self.runner.active_count})
+        health = await self._health(version)
+        self._health_cache = (now, health)
+        return health
+
+    async def _health(self, version: str) -> Health:
         components: list[ComponentHealth] = []
         try:
             laya = await self.laya.health()

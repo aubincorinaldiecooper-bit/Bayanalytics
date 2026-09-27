@@ -324,8 +324,11 @@ async def test_truncated_when_finish_reason_is_length(harness: Harness, server: 
 async def test_token_counts_estimated_without_usage(harness: Harness, server: FakeLlamaServer):
     server.include_usage = False
     server.include_timings = False
-    gen = await harness.client.run("fast", messages(), harness.on_token, harness.ctx())
-    assert gen.stats.output_tokens == len(server.deltas)
+    ctx = harness.ctx()
+    gen = await harness.client.run("fast", messages(), harness.on_token, ctx)
+    # Without usage/timings the count is unknown: never report the delta count as measured.
+    assert gen.stats.output_tokens is None
+    assert ctx.diagnostics["spark_streamed_deltas"] == len(server.deltas)
     assert gen.stats.prompt_tokens is None
     assert gen.stats.tokens_per_second is None
 

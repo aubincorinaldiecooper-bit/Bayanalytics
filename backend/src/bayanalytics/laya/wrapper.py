@@ -15,7 +15,7 @@ from typing import Any
 
 from bayanalytics.context import AnalysisContext
 from bayanalytics.errors import AnalysisError
-from bayanalytics.laya.base import LayaClient
+from bayanalytics.laya.base import LAYA_MAX_LEN, LayaClient
 from bayanalytics.laya.compaction import (
     compact_state,
     state_budget_for,
@@ -24,7 +24,12 @@ from bayanalytics.laya.compaction import (
 )
 from bayanalytics.laya.schemas import LAYA_SCHEMA_VERSION
 from bayanalytics.schemas.common import ErrorCode, new_id, utcnow
-from bayanalytics.schemas.decisions import LayaDecision, LayaQuestionSet, answer_confidence
+from bayanalytics.schemas.decisions import (
+    LayaDecision,
+    LayaQuestionSet,
+    LayaResult,
+    answer_confidence,
+)
 
 TIMER_NAME = "laya"
 DROPPED_KEYS_DIAGNOSTIC = "laya_dropped_keys"
@@ -116,6 +121,7 @@ class LayaFinanceWrapper:
                     schema_version=self._schema_version,
                 )
             )
+        self._check_truncation(question_set, result, ctx)
         return decisions
 
     async def ask_many(
@@ -131,3 +137,24 @@ class LayaFinanceWrapper:
     def as_dict(decisions: Sequence[LayaDecision]) -> dict[str, Any]:
         """``{decision_type: decision value}`` for quick branching in the orchestrator."""
         return {d.decision_type: d.decision for d in decisions}
+
+    @staticmethod
+    def _check_truncation(
+        question_set: LayaQuestionSet, result: LayaResult, ctx: AnalysisContext
+    ) -> None:
+        """Laya truncates the state to ``max_len`` silently; the worker's real token count is
+        per batch (every question's sequence includes the state), so the per-question average
+        reaching the limit means the compacted state was still too long."""
+        tokens = result.usage.input_tokens
+        count = len(question_set.questions)
+        if not tokens or not count:
+            return
+        per_question = tokens / count
+        if per_question >= LAYA_MAX_LEN:
+            ctx.diagnostics.setdefault("laya_truncated", []).append(
+                {
+                    "stage": question_set.stage,
+                    "segment_id": question_set.segment_id,
+                    "tokens": per_question,
+                }
+            )

@@ -58,7 +58,8 @@ The SSE stream (`GET /api/v1/analyses/{id}/events`) carries only recorded system
 ```
 analysis.started → instrument.resolved
 → research.started / research.query / research.source_found / research.source_rejected
-  (per round; laya.started/laya.decision/laya.completed for the research_plan stage)
+  (per round; then laya.started → laya.decision × n → laya.completed for the research_plan
+  stage, which chooses the next bounded intent)
 → research.completed → normalization.completed
 → laya.started → laya.decision × n → laya.completed        (evidence_scan, history_scan, text_evidence)
 → calculation.started → calculation.completed × n
@@ -89,9 +90,12 @@ calls only originate from application logic and Laya's bounded choices.
 ## Persistence
 
 Postgres (Railway project `bayanalytics`) holds `analyses`, `analysis_events`, `sources`,
-`facts`, `laya_decisions`, `calculations`, `results`. Without `DATABASE_URL` the in-memory
-store is used (development and tests). On startup every non-terminal job left by a previous
-process is marked `failed` / `INTERRUPTED`; nothing is resumed silently.
+`facts`, `laya_decisions`, `calculations`, `results` and `schema_migrations`. Without
+`DATABASE_URL` the in-memory store is used (development and tests; finished analyses are
+evicted beyond a cap). On startup every non-terminal job left by a previous process is marked
+`failed` / `INTERRUPTED` and receives a terminal `analysis.failed` event; nothing is resumed
+silently. A backend shutdown interrupts running jobs the same way (never reported as a user
+cancellation).
 
 ## Profiles and memory safety
 
@@ -109,5 +113,17 @@ pressure. Thresholds and KV precision are planning inputs until measured with
 ## Historical evaluation hook
 
 `BAY_EVAL_AS_OF` freezes the information set: every source published after that timestamp and
-every XBRL fact filed after it is dropped and counted (`leakage guard`). Combined with the
-fixture recorder this is the replay foundation for the section-14 evaluation harness.
+every XBRL fact filed after it is dropped and counted (`leakage guard`). `RecordingProvider` /
+`RecordingFetcher` (research/fixture_provider.py) can capture live responses into the fixture
+layout but are not yet wired to a setting. The rest of the section-14 harness (per-request
+`as_of`, date-bounded search templates, an evaluations table and outcome comparison) is not
+built; see the README "What is verified where" table.
+
+## Request guardrails
+
+Loopback binding needs no credential; any other host refuses to start without `BAY_API_KEY`
+(sent as `Authorization: Bearer` or `X-API-Key`). Request bodies are limited by
+`Content-Length` before they are buffered (64 KiB for JSON, 25 MiB for audio uploads), at most
+`BAY_MAX_ACTIVE_ANALYSES` analyses run at once (`429 TOO_MANY_ANALYSES` beyond that), the
+retrieval loop is bounded by `ResearchBudget.timeout_s`, and the fetcher refuses loopback,
+link-local and private targets on the initial URL and on every redirect hop.

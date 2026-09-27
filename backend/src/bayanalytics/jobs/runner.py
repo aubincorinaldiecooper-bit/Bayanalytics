@@ -36,13 +36,16 @@ class AnalysisRunner:
         pipeline: PipelineFn,
         *,
         versions: dict[str, Any] | None = None,
+        max_active: int = 4,
     ) -> None:
         self._store = store
         self._bus = bus
         self._pipeline = pipeline
         self._versions = versions or {}
+        self._max_active = max(1, int(max_active))
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._contexts: dict[str, AnalysisContext] = {}
+        self._jobs: dict[str, AnalysisJob] = {}
         self._accepting = True
 
     # -- lifecycle -----------------------------------------------------------------------
@@ -83,7 +86,7 @@ class AnalysisRunner:
     async def shutdown(self, timeout_s: float = 10.0) -> None:
         self._accepting = False
         for ctx in list(self._contexts.values()):
-            ctx.cancel.cancel()
+            ctx.cancel.cancel(ErrorCode.INTERRUPTED)
         tasks = list(self._tasks.values())
         if tasks:
             _done, pending = await asyncio.wait(tasks, timeout=timeout_s)
@@ -110,6 +113,11 @@ class AnalysisRunner:
     ) -> AnalysisJob:
         if not self._accepting:
             raise AnalysisError(ErrorCode.INTERNAL_ERROR, "The backend is shutting down.")
+        if len(self._tasks) >= self._max_active:
+            raise AnalysisError(
+                ErrorCode.TOO_MANY_ANALYSES,
+                details={"active": len(self._tasks), "limit": self._max_active},
+            )
         job = AnalysisJob(
             analysis_id=new_id("an"),
             query=request.query,
@@ -129,6 +137,7 @@ class AnalysisRunner:
         self._bus.register(job.analysis_id)
         ctx = AnalysisContext(analysis_id=job.analysis_id, emit=self._emitter(job.analysis_id))
         self._contexts[job.analysis_id] = ctx
+        self._jobs[job.analysis_id] = job
         task = asyncio.create_task(self._run(job, ctx), name=f"analysis:{job.analysis_id}")
         self._tasks[job.analysis_id] = task
         return job
@@ -145,22 +154,41 @@ class AnalysisRunner:
         try:
             result = await self._pipeline(job, ctx)
         except asyncio.CancelledError:
-            result = self._aborted_result(job, ErrorCode.CANCELLED)
-        except BaseException as exc:  # the pipeline promised not to raise; keep the contract
+            # A hard task cancel only happens during shutdown: report INTERRUPTED, not a
+            # user cancellation.
+            reason = ErrorCode.CANCELLED if self._accepting else ErrorCode.INTERRUPTED
+            result = self._aborted_result(job, reason)
+        except Exception as exc:  # the pipeline promised not to raise; keep the contract
             log.exception("pipeline raised for %s", job.analysis_id)
             result = self._aborted_result(job, AnalysisError.from_exception(exc).code)
         try:
             await self._finish(job, result)
         except Exception:
             log.exception("failed to persist terminal state for %s", job.analysis_id)
+            await self._finish_degraded(job)
         finally:
             self._tasks.pop(job.analysis_id, None)
             self._contexts.pop(job.analysis_id, None)
+            self._jobs.pop(job.analysis_id, None)
+            self._bus.close(job.analysis_id)
             self._bus.forget(job.analysis_id)
+
+    async def _finish_degraded(self, job: AnalysisJob) -> None:
+        """Persistence failed mid-finish: leave the job terminal (failed/INTERNAL_ERROR) if
+        the store lets us, so it is not resumed or reported as running."""
+        job.status = "failed"
+        job.error = job.error or AnalysisError(ErrorCode.INTERNAL_ERROR).payload()
+        job.finished_at = job.finished_at or utcnow()
+        job.touch()
+        try:
+            await self._store.update_job(job)
+        except Exception:  # pragma: no cover - store is down; INTERRUPTED at next start
+            log.exception("could not mark %s failed after a persistence error", job.analysis_id)
 
     def _aborted_result(self, job: AnalysisJob, code: ErrorCode) -> AnalysisResult:
         error = AnalysisError(code).payload()
         status = "cancelled" if code == ErrorCode.CANCELLED else "failed"
+        job.status = status  # type: ignore[assignment]
         return AnalysisResult(
             analysis_id=job.analysis_id,
             status=status,
@@ -217,18 +245,21 @@ class AnalysisRunner:
 
     # -- cancellation --------------------------------------------------------------------
     async def cancel(self, analysis_id: str) -> AnalysisJob | None:
-        job = await self._store.get_job(analysis_id)
+        live = self._jobs.get(analysis_id)
+        job = live if live is not None else await self._store.get_job(analysis_id)
         if job is None:
             return None
         if job.terminal:
             return job
+        # Flag the live object the task holds, so the final row keeps cancel_requested and
+        # no stale status is written over the orchestrator's progress.
         job.cancel_requested = True
         job.touch()
         await self._store.update_job(job)
         ctx = self._contexts.get(analysis_id)
         if ctx is not None:
-            ctx.cancel.cancel()
-        return job
+            ctx.cancel.cancel(ErrorCode.CANCELLED)
+        return job.model_copy(deep=True) if live is not None else job
 
     def cancel_token(self, analysis_id: str) -> CancelToken | None:
         ctx = self._contexts.get(analysis_id)

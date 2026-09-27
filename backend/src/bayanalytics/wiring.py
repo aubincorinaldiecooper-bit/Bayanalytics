@@ -97,6 +97,10 @@ def build_runtime(
         extras={"analyzer_factory": analyzer_factory, "spark_lock": spark_lock or {}},
     )
     runtime.runner = AnalysisRunner(
-        store, bus, functools.partial(run_analysis, rt=runtime), versions=versions
+        store,
+        bus,
+        functools.partial(run_analysis, rt=runtime),
+        versions=versions,
+        max_active=settings.max_active_analyses,
     )
     return runtime

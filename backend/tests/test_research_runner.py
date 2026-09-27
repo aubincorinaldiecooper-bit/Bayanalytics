@@ -95,6 +95,7 @@ def test_seed_plan_per_horizon() -> None:
     assert seed_plan("near_term") == [
         ResearchIntent.retrieve_recent_news,
         ResearchIntent.retrieve_price_history,
+        ResearchIntent.retrieve_earnings_history,
         ResearchIntent.retrieve_sector_benchmark,
         ResearchIntent.retrieve_latest_filing,
     ]

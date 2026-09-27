@@ -46,7 +46,7 @@ def test_normalize_name() -> None:
         ("Is Microsoft expensive relative to its history?", "MSFT", "name_match"),
         ("Assess NVDA", "NVDA", "ticker_token"),
         ("How is $msft doing?", "MSFT", "cashtag"),
-        ("Assess Google.", "GOOG", "name_match"),
+        ("Assess Google.", "GOOGL", "name_match"),
         ("Is Facebook growing?", "META", "name_match"),
         ("Assess Berkshire Hathaway", "BRK-B", "name_match"),
         ("What is the outlook for American Express?", "AXP", "name_match"),
@@ -63,7 +63,7 @@ def test_resolve_from_query(
 
 def test_share_classes_are_aliases_not_ambiguity(resolver: InstrumentResolver) -> None:
     identity = resolver.resolve("Assess Alphabet.")
-    assert identity.symbol == "GOOG" and identity.aliases == ["GOOGL"]
+    assert identity.symbol == "GOOGL" and identity.aliases == ["GOOG"]
 
 
 def test_explicit_instrument_ref(resolver: InstrumentResolver) -> None:

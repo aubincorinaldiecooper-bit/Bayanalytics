@@ -55,9 +55,23 @@ class AnalysisEventBus:
     def last_seq(self, analysis_id: str) -> int:
         return self._seq.get(analysis_id, 0)
 
+    def close(self, analysis_id: str) -> None:
+        """Release live subscribers (used when a terminal event could not be published)."""
+        for queue in self._subscribers.get(analysis_id, ()):
+            queue.put_nowait(_CLOSE)
+
     def forget(self, analysis_id: str) -> None:
-        """Drop in-memory bookkeeping for a finished analysis (its events stay in the store)."""
+        """Drop in-memory bookkeeping for a finished analysis (its events stay in the store).
+
+        Only terminal analyses are forgotten: a later ``stream()`` replays the persisted
+        events and stops at the persisted terminal event, so nothing is lost.
+        """
+        if analysis_id not in self._terminal:
+            self._subscribers.pop(analysis_id, None)
+            return
         self._subscribers.pop(analysis_id, None)
+        self._seq.pop(analysis_id, None)
+        self._terminal.discard(analysis_id)
 
     async def stream(self, analysis_id: str, after_seq: int = 0) -> AsyncIterator[AnalysisEvent]:
         """Replay persisted events after ``after_seq`` then follow live events until terminal."""

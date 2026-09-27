@@ -204,7 +204,10 @@ def _runtime(pipeline, *, deep: bool = True, voice: bool = True) -> Runtime:
     ("query", "expected"),
     [
         ("Assess Apple.", "multi_horizon"),
-        ("What might happen to Shopify over the next 12 months?", "multi_horizon"),
+        ("What might happen to Shopify over the next 12 months?", "medium_term"),
+        ("What might happen to NVDA next quarter?", "next_cycle"),
+        ("long-term outlook for Apple", "long_term"),
+        ("5-year view on Costco", "long_term"),
         ("Is Microsoft expensive relative to its history?", "multi_horizon"),
         ("How will NVIDIA trade this week?", "near_term"),
         ("What should I expect from Apple's next earnings?", "next_cycle"),
@@ -477,3 +480,117 @@ async def test_interrupted_jobs_get_a_terminal_event_on_startup() -> None:
     # Starting again is idempotent: no second terminal event.
     await rt.runner.start()
     assert len(await rt.store.list_events("an_stale2")) == 3
+
+
+# ---------------------------------------------------------------- hardening (security review)
+
+
+async def test_api_key_gate_when_configured() -> None:
+    rt = _runtime(_pipeline_ok)
+    rt.settings = rt.settings.model_copy(update={"api_key": "s3cret"})
+    async for client in _client(rt):
+        assert (await client.get("/api/v1/health")).status_code == 401
+        denied = await client.post("/api/v1/analyses", json={"query": "Assess Apple."})
+        assert denied.status_code == 401 and denied.json()["error"]["code"] == "UNAUTHORIZED"
+        ok = await client.get("/api/v1/health", headers={"Authorization": "Bearer s3cret"})
+        assert ok.status_code == 200
+        ok2 = await client.get("/api/v1/capabilities", headers={"X-API-Key": "s3cret"})
+        assert ok2.status_code == 200
+        wrong = await client.get("/api/v1/health", headers={"X-API-Key": "nope"})
+        assert wrong.status_code == 401
+
+
+async def test_refuses_non_loopback_without_api_key() -> None:
+    rt = _runtime(_pipeline_ok)
+    rt.settings = rt.settings.model_copy(update={"host": "0.0.0.0"})
+    app = create_app(rt.settings, runtime=rt)
+    with pytest.raises(RuntimeError, match="BAY_API_KEY"):
+        async with app.router.lifespan_context(app):
+            pass
+    rt2 = _runtime(_pipeline_ok)
+    rt2.settings = rt2.settings.model_copy(update={"host": "0.0.0.0", "api_key": "k"})
+    app2 = create_app(rt2.settings, runtime=rt2)
+    async with app2.router.lifespan_context(app2):
+        pass
+
+
+async def test_body_limits() -> None:
+    rt = _runtime(_pipeline_ok)
+    rt.settings = rt.settings.model_copy(
+        update={"max_request_body_bytes": 200, "max_upload_bytes": 300}
+    )
+    async for client in _client(rt):
+        big = await client.post("/api/v1/analyses", json={"query": "x" * 500})
+        assert big.status_code == 413 and big.json()["error"]["code"] == "INVALID_REQUEST"
+        small = await client.post("/api/v1/analyses", json={"query": "Assess Apple."})
+        assert small.status_code == 202
+        upload = await client.post(
+            "/api/v1/transcriptions", files={"audio": ("a.wav", b"x" * 1000, "audio/wav")}
+        )
+        assert upload.status_code == 413
+
+
+async def test_admission_control_limits_concurrent_analyses() -> None:
+    rt = _runtime(_pipeline_slow)
+    rt.runner._max_active = 2
+    async for client in _client(rt):
+        first = await client.post("/api/v1/analyses", json={"query": "Assess Apple."})
+        second = await client.post("/api/v1/analyses", json={"query": "Assess Apple."})
+        third = await client.post("/api/v1/analyses", json={"query": "Assess Apple."})
+        assert first.status_code == 202 and second.status_code == 202
+        assert third.status_code == 429
+        assert third.json()["error"]["code"] == "TOO_MANY_ANALYSES"
+        assert third.json()["error"]["retryable"] is True
+        for resp in (first, second):
+            await client.post(f"/api/v1/analyses/{resp.json()['analysis_id']}/cancel")
+        await asyncio.sleep(0.1)
+        again = await client.post("/api/v1/analyses", json={"query": "Assess Apple."})
+        assert again.status_code == 202
+
+
+async def test_bus_forgets_terminal_bookkeeping_but_replays_from_store() -> None:
+    rt = _runtime(_pipeline_ok)
+    await rt.runner.start()
+    job = await rt.runner.submit(
+        CreateAnalysisRequest(query="Assess Apple."), resolved_horizon="multi_horizon", budget=None
+    )
+    events = [e async for e in rt.bus.stream(job.analysis_id)]
+    await asyncio.sleep(0.02)
+    assert job.analysis_id not in rt.bus._seq
+    assert not rt.bus.is_terminal(job.analysis_id)
+    replay = [e async for e in rt.bus.stream(job.analysis_id, after_seq=0)]
+    assert [e.seq for e in replay] == [e.seq for e in events]
+    assert replay[-1].terminal
+
+
+async def test_health_is_cached_briefly() -> None:
+    rt = _runtime(_pipeline_ok)
+    rt.settings = rt.settings.model_copy(update={"health_cache_s": 10.0})
+    calls = {"n": 0}
+    original = rt.laya.health
+
+    async def counting() -> Any:
+        calls["n"] += 1
+        return await original()
+
+    rt.laya.health = counting  # type: ignore[method-assign]
+    async for client in _client(rt):
+        await client.get("/api/v1/health")
+        await client.get("/api/v1/health")
+        await client.get("/api/v1/health")
+    assert calls["n"] == 1
+
+
+def test_redacted_settings_hide_paths_and_email() -> None:
+    from pathlib import Path
+
+    s = Settings(
+        database_url="postgres://u:p@h/db",
+        api_key="k",
+        spark_model_path=Path("/Users/me/models/spark/model-q4.gguf"),
+        research_contact_email="me@example.com",
+    )
+    red = s.redacted()
+    assert red["database_url"] == "***" and red["api_key"] == "***"
+    assert red["spark_model_path"] == ".../model-q4.gguf"
+    assert red["research_contact_email"] == "***"

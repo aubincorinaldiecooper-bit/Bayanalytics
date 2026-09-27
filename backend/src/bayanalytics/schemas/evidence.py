@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import date, datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, computed_field
 
 from bayanalytics.schemas.common import (
     Basis,
@@ -66,10 +66,12 @@ class SourceRecord(BaseModel):
     research_intent: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
+    @computed_field  # type: ignore[prop-decorator]
     @property
     def is_primary(self) -> bool:
         return is_primary_source(self.source_type)
 
+    @computed_field  # type: ignore[prop-decorator]
     @property
     def rank(self) -> int:
         return source_rank(self.source_type)

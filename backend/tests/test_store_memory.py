@@ -358,3 +358,41 @@ def test_interrupted_payload_shape() -> None:
     assert payload.retryable is True
     assert payload.message == default_message(ErrorCode.INTERRUPTED)
     assert payload.details is None
+
+
+async def test_terminal_analyses_are_evicted_beyond_the_cap() -> None:
+    from bayanalytics.jobs.models import AnalysisJob
+    from bayanalytics.schemas.events import AnalysisEvent
+    from bayanalytics.store.memory import InMemoryStore
+
+    store = InMemoryStore(max_terminal=2)
+    for i in range(4):
+        job = AnalysisJob(
+            analysis_id=f"an_{i}",
+            query="q",
+            profile="fast",
+            requested_horizon="auto",
+            resolved_horizon="multi_horizon",
+        )
+        await store.create_job(job)
+        await store.append_event(
+            AnalysisEvent(event="analysis.started", analysis_id=job.analysis_id, seq=1, data={})
+        )
+        job.status = "completed"
+        job.finished_at = job.created_at
+        await store.update_job(job)
+    assert store.resident_analyses == 2
+    assert await store.get_job("an_0") is None and await store.list_events("an_0") == []
+    assert await store.get_job("an_3") is not None
+    # Active jobs are never evicted.
+    active = AnalysisJob(
+        analysis_id="an_active",
+        query="q",
+        profile="fast",
+        requested_horizon="auto",
+        resolved_horizon="multi_horizon",
+        status="researching",
+    )
+    await store.create_job(active)
+    await store.update_job(active)
+    assert await store.get_job("an_active") is not None

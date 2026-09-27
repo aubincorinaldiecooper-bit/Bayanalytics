@@ -58,6 +58,8 @@ class HorizonAssessment(BaseModel):
     summary: str = ""
     key_evidence: list[EvidenceItem] = Field(default_factory=list)
     decision_id: str | None = None
+    synthesized: bool = True  # False when Spark produced no section for this horizon
+    low_confidence: bool = False  # Laya's stance confidence was below the floor
 
 
 class ResearchStats(BaseModel):
@@ -136,6 +138,7 @@ class AnalysisResult(BaseModel):
     sources: list[SourceRecord] = Field(default_factory=list)
     calculations: list[CalculationResult] = Field(default_factory=list)
     laya_decisions: list[LayaDecision] = Field(default_factory=list)
+    freshness_summary: dict[str, Any] = Field(default_factory=dict)
     streamed_text: str = ""  # exactly what was streamed as spark.token, for recovery
     telemetry: Telemetry = Field(default_factory=Telemetry)
     error: ErrorPayload | None = None

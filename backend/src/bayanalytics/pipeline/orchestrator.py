@@ -37,7 +37,12 @@ from bayanalytics.schemas.results import (
     VersionInfo,
 )
 from bayanalytics.spark.base import SparkMessage, SparkRunOptions
-from bayanalytics.spark.bundle import estimate_tokens, fit_bundle, reserved_output_tokens
+from bayanalytics.spark.bundle import (
+    OVERFLOW_TRIM,
+    estimate_tokens,
+    fit_bundle,
+    reserved_output_tokens,
+)
 from bayanalytics.spark.parse import parse_sections, to_assessment
 from bayanalytics.spark.prompt import SYSTEM_PROMPT, build_messages
 from bayanalytics.telemetry.tracker import PeakTracker
@@ -64,6 +69,8 @@ class _Draft:
         self.horizon_assessments: dict[str, Any] = {}
         self.telemetry = Telemetry(profile=job.profile)
         self.extra_uncertainties: list[str] = []
+        self.freshness_summary: dict[str, Any] = {}
+        self.partial_synthesis = False
 
     def instrument_view(self) -> InstrumentView | None:
         if self.identity is None:
@@ -92,10 +99,11 @@ class _Draft:
             sources=self.sources,
             calculations=self.calculations.calculations,
             laya_decisions=self.decisions.decisions,
+            freshness_summary=self.freshness_summary,
             streamed_text=self.streamed_text,
             telemetry=self.telemetry,
             error=error.payload() if error else None,
-            partial=status != "completed",
+            partial=status != "completed" or self.partial_synthesis,
         )
 
 
@@ -162,7 +170,7 @@ async def run_analysis(job: AnalysisJob, ctx: AnalysisContext, rt: Runtime) -> A
                 segments=len(evidence.segments),
                 freshness=_freshness_view(evidence.freshness_summary),
             )
-            _evidence_gate(evidence)
+            _evidence_gate(evidence, analyzer.compute_gaps(job.resolved_horizon, job.as_of))
             # 4. Laya scoring -----------------------------------------------------------
             await _set_status(rt, job, "scoring")
             question_sets = analyzer.build_laya_questions(evidence, request)
@@ -213,7 +221,19 @@ async def run_analysis(job: AnalysisJob, ctx: AnalysisContext, rt: Runtime) -> A
                 reserved_output_tokens(options),
                 estimate_tokens(SYSTEM_PROMPT),
             )
-            draft.extra_uncertainties.extend(trims)
+            draft.extra_uncertainties.extend(t for t in trims if t != OVERFLOW_TRIM)
+            if OVERFLOW_TRIM in trims:
+                raise AnalysisError(
+                    ErrorCode.SPARK_INFERENCE_FAILED,
+                    "The evidence bundle exceeds this profile's context ceiling even after "
+                    "trimming. Try the Deep profile.",
+                    retryable=True,
+                    details={
+                        "reason": "context_overflow",
+                        "profile": job.profile,
+                        "context_ceiling": spec.context_ceiling,
+                    },
+                )
             messages: list[SparkMessage] = build_messages(fitted, options)
             prompt_estimate = sum(estimate_tokens(m.content) for m in messages)
             started = False
@@ -261,12 +281,29 @@ async def run_analysis(job: AnalysisJob, ctx: AnalysisContext, rt: Runtime) -> A
             draft.assessment = finalize_assessment(
                 assessment, evidence, draft.decisions, calculations, draft.extra_uncertainties
             )
-            draft.horizon_assessments = merge_horizons(
+            draft.horizon_assessments, horizon_notes = merge_horizons(
                 horizons,
                 parsed_horizons,
                 draft.decisions,
                 draft.assessment.bull_evidence,
                 draft.assessment.bear_evidence,
+                known_ids,
+            )
+            for note in horizon_notes:
+                if note not in draft.assessment.uncertainties:
+                    draft.assessment.uncertainties.append(note)
+            for entry in ctx.diagnostics.get("laya_truncated", []):
+                note = (
+                    f"Laya state was truncated in stage {entry.get('stage')}; "
+                    "those decisions saw partial evidence"
+                )
+                if note not in draft.assessment.uncertainties:
+                    draft.assessment.uncertainties.append(note)
+            draft.freshness_summary = dict(evidence.freshness_summary)
+            # A cut-off synthesis or a missing horizon section is reported, never passed off
+            # as a complete assessment (section 24).
+            draft.partial_synthesis = generation.truncated or not all(
+                h.synthesized for h in draft.horizon_assessments.values()
             )
             ctx.timers.stop("total")
             draft.telemetry = _telemetry(rt, ctx, draft, analyzer, tracker, stats)
@@ -280,6 +317,7 @@ async def run_analysis(job: AnalysisJob, ctx: AnalysisContext, rt: Runtime) -> A
         if draft.evidence is not None:
             draft.assessment.conflicts = list(draft.evidence.conflicts)
             draft.assessment.uncertainties = list(draft.evidence.uncertainties)
+            draft.freshness_summary = dict(draft.evidence.freshness_summary)
         return draft.result(status, exc)
     except Exception as exc:
         ctx.timers.stop("total")
@@ -328,14 +366,25 @@ def _pack_name(decisions: LayaDecisions) -> str:
     return str(chosen.decision) if chosen is not None else "all_standard"
 
 
-def _evidence_gate(evidence: NormalizedEvidence) -> None:
-    usable = len(evidence.facts) + len(evidence.text_evidence)
-    if usable < _MIN_USABLE_EVIDENCE and evidence.prices is None:
+def _evidence_gate(evidence: NormalizedEvidence, gaps: list[str]) -> None:
+    """Refuse to synthesise without at least one normalized fact and one primary source
+    (AGENT.md section 24): a price series or a lone news snippet is not an assessment."""
+    primary = [s for s in evidence.sources if s.is_primary and not s.rejected_reason]
+    missing: list[str] = []
+    if not evidence.facts:
+        missing.append("normalized financial facts (filings / XBRL)")
+    if not primary:
+        missing.append("a primary source (regulatory filing, issuer release or transcript)")
+    if evidence.prices is None:
+        missing.append("price history")
+    if not evidence.facts or not primary:
         raise AnalysisError(
             ErrorCode.INSUFFICIENT_EVIDENCE,
             details={
-                "missing": ["financial facts", "recent public coverage", "price history"],
+                "missing": missing,
+                "evidence_gaps": gaps,
                 "sources": len(evidence.sources),
+                "facts": len(evidence.facts),
             },
         )
     facts_buckets = (evidence.freshness_summary or {}).get("facts") or {}

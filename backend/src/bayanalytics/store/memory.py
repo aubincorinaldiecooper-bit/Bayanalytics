@@ -33,8 +33,11 @@ def interrupted_payload() -> ErrorPayload:
 class InMemoryStore:
     """Dict-backed store. ``create_job``/``update_job`` and ``save_*`` overwrite by id."""
 
-    def __init__(self) -> None:
+    def __init__(self, max_terminal: int = 200) -> None:
+        """``max_terminal`` bounds how many finished analyses stay resident; the oldest
+        finished ones (by ``finished_at``) are evicted with all their artifacts."""
         self._lock = asyncio.Lock()
+        self._max_terminal = max(1, int(max_terminal))
         self._jobs: dict[str, AnalysisJob] = {}
         self._events: dict[str, dict[int, AnalysisEvent]] = {}
         self._sources: dict[str, dict[str, SourceRecord]] = {}
@@ -60,6 +63,31 @@ class InMemoryStore:
     async def update_job(self, job: AnalysisJob) -> None:
         async with self._lock:
             self._jobs[job.analysis_id] = job.model_copy(deep=True)
+            if job.status in TERMINAL_STATUSES:
+                self._evict_locked()
+
+    def _evict_locked(self) -> None:
+        terminal = [j for j in self._jobs.values() if j.status in TERMINAL_STATUSES]
+        excess = len(terminal) - self._max_terminal
+        if excess <= 0:
+            return
+        terminal.sort(key=lambda j: (j.finished_at or j.updated_at, j.analysis_id))
+        for job in terminal[:excess]:
+            analysis_id = job.analysis_id
+            for bucket in (
+                self._jobs,
+                self._events,
+                self._sources,
+                self._facts,
+                self._decisions,
+                self._calculations,
+                self._results,
+            ):
+                bucket.pop(analysis_id, None)
+
+    @property
+    def resident_analyses(self) -> int:
+        return len(self._jobs)
 
     async def get_job(self, analysis_id: str) -> AnalysisJob | None:
         async with self._lock:

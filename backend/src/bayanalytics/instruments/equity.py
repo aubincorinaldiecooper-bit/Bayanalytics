@@ -9,6 +9,7 @@ bundle are built here from the accumulated evidence.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -173,6 +174,33 @@ class EquityAnalyzer:
         plan: list[ResearchIntent] = list(seed_plan(request.resolved_horizon))
         gaps: list[str] = []
         with ctx.timers.span("retrieval"):
+            try:
+                async with asyncio.timeout(budget.timeout_s):
+                    await self._research_loop(runner, identity, request, ctx, plan, gaps)
+            except TimeoutError:
+                self.state.termination_reason = "timeout"
+                log.warning("research budget timeout after %.0fs", budget.timeout_s)
+            gaps = self.compute_gaps(request.resolved_horizon, request.as_of)
+        runner_stats = runner.finish(self.state.termination_reason or "max_rounds")
+        self.stats = self._merge_stats(runner_stats, gaps)
+        self.stats.termination_reason = self.state.termination_reason
+        self.stats.search_rounds = self.state.rounds
+        self.stats.intents = list(self.state.executed)
+        self.stats.retrieval_total_ms = ctx.timers.elapsed_ms.get("retrieval", 0.0)
+        await ctx.event("research.completed", **self.stats.model_dump(mode="json"))
+        return list(self.state.sources)
+
+    async def _research_loop(
+        self,
+        runner: ResearchRunner,
+        identity: InstrumentIdentity,
+        request: AnalysisRequest,
+        ctx: AnalysisContext,
+        plan: list[ResearchIntent],
+        gaps: list[str],
+    ) -> None:
+        budget = request.budget
+        if True:
             while self.state.rounds < budget.max_rounds:
                 ctx.check_cancelled()
                 self.state.rounds += 1
@@ -207,20 +235,14 @@ class EquityAnalyzer:
                 if decision_intent == ResearchIntent.stop_research:
                     self.state.termination_reason = "laya_stop"
                     break
-                if not gaps and str(decision_intent) in self.state.executed:
+                if str(decision_intent) in self.state.executed:
+                    # The only intent that could help was already executed: more rounds would
+                    # re-issue identical queries (termination rule 2).
                     self.state.termination_reason = "no_new_evidence"
                     break
                 plan = [decision_intent]
             else:
                 self.state.termination_reason = "max_rounds"
-        runner_stats = runner.finish(self.state.termination_reason or "max_rounds")
-        self.stats = self._merge_stats(runner_stats, gaps)
-        self.stats.termination_reason = self.state.termination_reason
-        self.stats.search_rounds = self.state.rounds
-        self.stats.intents = list(self.state.executed)
-        self.stats.retrieval_total_ms = ctx.timers.elapsed_ms.get("retrieval", 0.0)
-        await ctx.event("research.completed", **self.stats.model_dump(mode="json"))
-        return list(self.state.sources)
 
     async def _execute(
         self,
@@ -338,10 +360,14 @@ class EquityAnalyzer:
                 decision.answer, NoulAnswer
             ):
                 sufficient = decision.answer.noul
-        # Prefer a Laya intent that addresses a real gap; otherwise fall back to the first gap.
+        # Laya's stop is honoured unless a gap remains whose intent has not been tried yet.
         if intent != ResearchIntent.stop_research or not gaps:
             return intent, sufficient
-        return gap_to_intent(gaps[0]), sufficient
+        for gap in gaps:
+            candidate = gap_to_intent(gap)
+            if str(candidate) not in self.state.executed:
+                return candidate, sufficient
+        return ResearchIntent.stop_research, sufficient
 
     # ------------------------------------------------------------------ normalize
     def _quick_facts(self, as_of: datetime) -> list[NormalizedFact]:
@@ -399,10 +425,10 @@ class EquityAnalyzer:
     def _text_evidence(self, records: list[SourceRecord]) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []
         for source in records:
-            if source.source_type in {"regulatory_filing", "market_data"} and not source.excerpt:
-                continue
             if not source.excerpt:
                 continue
+            if source.extraction_method in {"json", "csv"} or source.source_type == "market_data":
+                continue  # structured endpoints are facts/prices, not prose to be judged
             items.append(
                 {
                     "source_id": source.source_id,

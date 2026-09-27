@@ -71,6 +71,12 @@ _DEFAULTS: dict[ErrorCode, tuple[str, bool, int]] = {
     ErrorCode.INTERNAL_ERROR: ("An internal error occurred.", True, 500),
     ErrorCode.NOT_FOUND: ("No analysis exists with that id.", False, 404),
     ErrorCode.INVALID_REQUEST: ("The request was invalid.", False, 422),
+    ErrorCode.UNAUTHORIZED: ("A valid API key is required.", False, 401),
+    ErrorCode.TOO_MANY_ANALYSES: (
+        "Too many analyses are running on this backend. Try again shortly.",
+        True,
+        429,
+    ),
 }
 
 

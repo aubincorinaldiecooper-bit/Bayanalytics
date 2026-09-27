@@ -132,6 +132,37 @@ _ALIASES: dict[str, str] = {
     "eli lilly": "eli lilly",
     "nvidia": "nvidia",
     "apple": "apple",
+    "disney": "walt disney",
+    "pepsi": "pepsico",
+    "att": "at t",
+    "at&t": "at t",
+    "lowes": "lowes companies",
+    "lowe's": "lowes companies",
+    "3m": "3m",
+    "hp": "hp",
+    "dell": "dell technologies",
+    "alphabet": "alphabet",
+}
+
+# Leading words shared by many unrelated issuers; never a match on their own.
+_GENERIC_PREFIXES = {
+    "american",
+    "first",
+    "united",
+    "general",
+    "national",
+    "international",
+    "new",
+    "global",
+    "bank",
+    "north",
+    "south",
+    "west",
+    "east",
+    "us",
+    "china",
+    "texas",
+    "pacific",
 }
 
 _WORD = re.compile(r"[A-Za-z0-9&.'\-]+")
@@ -185,11 +216,25 @@ class InstrumentResolver:
         ]
         self._by_ticker: dict[str, TickerRow] = {}
         self._by_name: dict[str, list[TickerRow]] = {}
+        prefix_rows: dict[str, list[TickerRow]] = {}
         for row in self.rows:
             if not row.ticker:
                 continue
             self._by_ticker.setdefault(normalize_ticker(row.ticker), row)
-            self._by_name.setdefault(normalize_name(row.title), []).append(row)
+            name = normalize_name(row.title)
+            self._by_name.setdefault(name, []).append(row)
+            words = name.split()
+            # Leading-token prefixes ("amazon" for "amazon com", "cisco" for "cisco systems")
+            # are usable only when exactly one company owns them.
+            for n in (1, 2):
+                if len(words) > n:
+                    prefix_rows.setdefault(" ".join(words[:n]), []).append(row)
+        self._by_prefix: dict[str, list[TickerRow]] = {}
+        for prefix, rows in prefix_rows.items():
+            if prefix in self._by_name or prefix in _GENERIC_PREFIXES:
+                continue
+            if len({r.cik for r in rows}) == 1:
+                self._by_prefix[prefix] = rows
         self._names = list(self._by_name)
 
     # -- public --------------------------------------------------------------------------
@@ -260,6 +305,8 @@ class InstrumentResolver:
             rows = self._by_name.get(key)
             if not rows and len(phrase.split()) >= 2:
                 rows = self._by_name.get(normalize_name(phrase))
+            if not rows:
+                rows = self._by_prefix.get(key)
             if rows:
                 for row in rows:
                     hits.append((row, (start, end)))
@@ -268,8 +315,9 @@ class InstrumentResolver:
 
     @staticmethod
     def _prefer_primary_class(rows: list[TickerRow]) -> TickerRow:
-        # Same company, several share classes (GOOGL/GOOG): prefer the shortest/plain ticker.
-        return sorted(rows, key=lambda r: (len(r.ticker), r.ticker))[0]
+        # Same company, several share classes (GOOGL/GOOG): the SEC list orders the primary
+        # listing first, so keep list order.
+        return rows[0]
 
     def _identity(
         self,

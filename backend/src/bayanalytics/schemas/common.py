@@ -62,6 +62,8 @@ class ErrorCode(StrEnum):
     # HTTP-level codes outside the analysis failure set (never emitted on the SSE stream).
     NOT_FOUND = "NOT_FOUND"
     INVALID_REQUEST = "INVALID_REQUEST"
+    UNAUTHORIZED = "UNAUTHORIZED"
+    TOO_MANY_ANALYSES = "TOO_MANY_ANALYSES"
 
 
 Stance = Literal["bullish", "neutral", "bearish", "mixed"]

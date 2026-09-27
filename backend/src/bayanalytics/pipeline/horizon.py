@@ -40,12 +40,13 @@ _PATTERNS: dict[str, list[str]] = {
         r"\bover the (?:next|coming) year\b",
         r"\bmedium[- ]term\b",
         r"\bintermediate[- ]term\b",
+        r"\b(?:1[3-9]|2[0-4]) months\b",
     ],
     "long_term": [
         r"\blong[- ]term\b",
         r"\bmulti[- ]year\b",
         r"\bdecade\b",
-        r"\b(?:[2-9]|\d{2}|two|three|five|ten)\+? years?\b",
+        r"\b(?:[2-9]|\d{2}|two|three|five|ten)\+?[- ]years?\b",
         r"\bover the (?:next|coming) (?:\d+|several|many) years\b",
         r"\bsecular\b",
     ],
@@ -75,10 +76,10 @@ def resolve_horizon(query: str, requested: str = "auto") -> ResolvedHorizon:
     if requested != "auto":
         return requested  # type: ignore[return-value]
     found = detect_horizons(query)
-    if "multi_horizon" in found:
-        return "multi_horizon"
-    if len(found) == 1:
-        return found[0]  # type: ignore[return-value]
+    specific = [h for h in found if h != "multi_horizon"]
+    if len(specific) == 1:
+        # "What might happen to NVDA next quarter?" names a period: that period wins.
+        return specific[0]  # type: ignore[return-value]
     return "multi_horizon"
 
 

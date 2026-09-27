@@ -17,7 +17,9 @@ from pydantic import BaseModel, Field
 
 Deployment = Literal["local", "cloud"]
 
-_SECRET_FIELDS = {"database_url"}
+_SECRET_FIELDS = {"database_url", "api_key"}
+_PATH_FIELDS_ARE_MASKED = True
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 _DEFAULT_WORKER_DIR = Path(__file__).resolve().parent / "laya" / "worker"
 
 
@@ -58,6 +60,13 @@ class Settings(BaseModel):
     )
     log_level: str = "INFO"
     api_prefix: str = "/api/v1"
+    # Required on every request when set (Authorization: Bearer <key> or X-API-Key). The
+    # backend refuses to start on a non-loopback host without it (AGENT.md section 20).
+    api_key: str | None = None
+    max_active_analyses: int = 4
+    max_request_body_bytes: int = 64 * 1024
+    max_upload_bytes: int = 25 * 1024 * 1024
+    health_cache_s: float = 2.0
 
     # --- persistence --------------------------------------------------------------------
     database_url: str | None = None
@@ -153,16 +162,22 @@ class Settings(BaseModel):
         return cls(**kwargs)
 
     def redacted(self) -> dict[str, Any]:
-        """Settings safe for logs: secrets replaced, paths stringified."""
+        """Settings safe for logs: secrets replaced, paths reduced to basenames, email masked."""
         out: dict[str, Any] = {}
         for name, value in self.model_dump().items():
             if name in _SECRET_FIELDS:
                 out[name] = "***" if value else None
             elif isinstance(value, Path):
-                out[name] = str(value)
+                out[name] = f".../{value.name}" if value.name else str(value)
+            elif name == "research_contact_email" and value:
+                out[name] = "***"
             else:
                 out[name] = value
         return out
+
+    @property
+    def is_loopback(self) -> bool:
+        return self.host in _LOOPBACK_HOSTS
 
     @property
     def user_agent(self) -> str:

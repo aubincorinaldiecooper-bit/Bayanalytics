@@ -11,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from bayanalytics import __version__
 from bayanalytics.api.errors import install_error_handlers
+from bayanalytics.api.limits import BodyLimitMiddleware
 from bayanalytics.api.router import build_router
 from bayanalytics.config import Settings, get_settings
 from bayanalytics.runtime import Runtime
@@ -30,6 +31,11 @@ def create_app(settings: Settings | None = None, runtime: Runtime | None = None)
 
             rt = build_runtime(settings)
         app.state.runtime = rt
+        if not settings.is_loopback and not settings.api_key:
+            raise RuntimeError(
+                "refusing to bind a non-loopback host without BAY_API_KEY "
+                "(AGENT.md section 20: never expose the API publicly without authentication)"
+            )
         log.info(
             "starting BayAnalytics backend %s with settings %s", __version__, settings.redacted()
         )
@@ -53,6 +59,12 @@ def create_app(settings: Settings | None = None, runtime: Runtime | None = None)
         allow_methods=["GET", "POST", "OPTIONS"],
         allow_headers=["*"],
         expose_headers=["*"],
+    )
+    app.add_middleware(
+        BodyLimitMiddleware,
+        default_limit=settings.max_request_body_bytes,
+        upload_limit=settings.max_upload_bytes,
+        upload_path_suffix="/transcriptions",
     )
     install_error_handlers(app)
     app.include_router(build_router(settings.api_prefix))

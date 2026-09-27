@@ -39,6 +39,8 @@ docs/ARCHITECTURE.md
 
 ## Quick start (development, no models)
 
+All commands below run from `backend/`; relative paths such as `models/…` and `bench/…` assume it.
+
 ```bash
 cd backend
 uv venv --python 3.12 .venv && uv pip install -p .venv/bin/python -e ".[dev]"
@@ -64,7 +66,10 @@ synthetic and labelled as such; it never reaches a real analysis path.
 6. **Whisper (optional)**: `scripts/setup_whisper.sh`.
 7. **Configuration**: copy `backend/.env.example` to `backend/.env`, fill in the paths the scripts
    printed, `BAY_RESEARCH_CONTACT_EMAIL` (SEC EDGAR requires it), `BAY_RESEARCH_SEARCH_URL` (a SearXNG
-   instance, the search backend carried over from GNSIS) and `DATABASE_URL`.
+   instance, the search backend carried over from GNSIS) and `DATABASE_URL`. The backend binds
+   `127.0.0.1` and needs no key there; any other host refuses to start unless `BAY_API_KEY` is set,
+   and clients then send `Authorization: Bearer <key>`. `BAY_MAX_ACTIVE_ANALYSES` (default 4) bounds
+   concurrent analyses; further requests get `429 TOO_MANY_ANALYSES`.
 8. **Database**: `set -a; source .env; set +a; .venv/bin/bayanalytics migrate`.
 9. **Measure before trusting**: `.venv/bin/python scripts/benchmark_local.py --profiles fast deep`
    records load times, TTFT, tokens/s, resident RAM, system peak RAM and swap per profile. Choose
@@ -76,15 +81,19 @@ synthetic and labelled as such; it never reaches a real analysis path.
 
 A Railway project `bayanalytics` with a `Postgres` service (postgres-ssl image, 5 GB volume,
 us-west2) was provisioned for this backend. Its public TCP endpoint is
-`altaria.proxy.rlwy.net:14222`; copy the password from the Railway dashboard (service
-`Postgres` → Variables → `POSTGRES_PASSWORD` or `DATABASE_PUBLIC_URL`) into `DATABASE_URL`:
+`altaria.proxy.rlwy.net:14222`. The service's own `DATABASE_URL` variable is the private-network
+form and only works inside Railway; from the Mac build the URL yourself from the dashboard
+values (service `Postgres` → Variables → `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`):
 
 ```
-DATABASE_URL=postgresql://postgres:<password>@altaria.proxy.rlwy.net:14222/railway?sslmode=require
+DATABASE_URL=postgresql://postgres:<POSTGRES_PASSWORD>@altaria.proxy.rlwy.net:14222/railway?sslmode=require
 ```
 
-The image uses a self-signed certificate; `sslmode=require` encrypts without verifying the CA.
-Without `DATABASE_URL` the backend uses an in-memory store (development only).
+`BAY_DATABASE_URL` is honoured as well. The image uses a self-signed certificate, so
+`sslmode=require` encrypts without verifying the CA (`verify-full` needs the CA via
+`?sslrootcert=`). Without a database URL the backend uses an in-memory store (development only;
+finished analyses are evicted after 200). The Postgres tests run when
+`BAY_TEST_DATABASE_URL` points at a disposable database.
 
 ## API contract (`/api/v1`)
 
@@ -102,8 +111,13 @@ Errors always use `{"error": {"code", "message", "retryable", "details?"}}` with
 (`AMBIGUOUS_INSTRUMENT`, `INSUFFICIENT_EVIDENCE`, `STALE_EVIDENCE`, `RESEARCH_UNAVAILABLE`,
 `SOURCE_CONFLICT`, `MISSING_CALCULATION_INPUT`, `FAST_PROFILE_UNAVAILABLE`,
 `DEEP_PROFILE_UNAVAILABLE`, `MEMORY_PRESSURE`, `SPARK_START_FAILED`, `SPARK_INFERENCE_FAILED`,
-`LAYA_INFERENCE_FAILED`, `WHISPER_FAILED`, `INTERRUPTED`, `CANCELLED`, `INTERNAL_ERROR`) plus two
-HTTP-level codes (`NOT_FOUND`, `INVALID_REQUEST`) that never appear on the event stream.
+`LAYA_INFERENCE_FAILED`, `WHISPER_FAILED`, `INTERRUPTED`, `CANCELLED`, `INTERNAL_ERROR`) plus four
+HTTP-level codes (`NOT_FOUND`, `INVALID_REQUEST`, `UNAUTHORIZED`, `TOO_MANY_ANALYSES`) that never
+appear on the event stream. Notes for the client: `AMBIGUOUS_INSTRUMENT` arrives as
+`analysis.failed` (resolution runs inside the job, after `202`); a user cancel ends with
+`analysis.failed` whose `status` is `cancelled` and `error.code` is `CANCELLED`; a result with
+`partial: true` and `status: completed` means the synthesis was cut off or a horizon section is
+missing (`horizon_assessments[*].synthesized`).
 
 See `docs/ARCHITECTURE.md` for the event sequence, retrieval-loop termination rules, the
 evidence-only boundary and the profile/memory policy.

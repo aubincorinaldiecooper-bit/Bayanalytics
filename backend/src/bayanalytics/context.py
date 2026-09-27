@@ -24,12 +24,19 @@ async def null_sink(_event: str, _data: dict[str, Any]) -> None:
 
 
 class CancelToken:
-    """Best-effort cooperative cancellation. Stages call ``check()`` at safe boundaries."""
+    """Best-effort cooperative cancellation. Stages call ``check()`` at safe boundaries.
+
+    ``reason`` distinguishes a user cancel (CANCELLED) from a backend shutdown (INTERRUPTED),
+    so a job stopped by a restart is never reported as cancelled by the user.
+    """
 
     def __init__(self) -> None:
         self._event = asyncio.Event()
+        self.reason: ErrorCode = ErrorCode.CANCELLED
 
-    def cancel(self) -> None:
+    def cancel(self, reason: ErrorCode = ErrorCode.CANCELLED) -> None:
+        if not self._event.is_set():
+            self.reason = reason
         self._event.set()
 
     @property
@@ -38,7 +45,7 @@ class CancelToken:
 
     def check(self) -> None:
         if self._event.is_set():
-            raise AnalysisError(ErrorCode.CANCELLED)
+            raise AnalysisError(self.reason)
 
     async def wait(self) -> None:
         await self._event.wait()

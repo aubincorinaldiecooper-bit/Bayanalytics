@@ -45,6 +45,7 @@ SEED_PLANS: dict[str, list[ResearchIntent]] = {
     "near_term": [
         ResearchIntent.retrieve_recent_news,
         ResearchIntent.retrieve_price_history,
+        ResearchIntent.retrieve_earnings_history,
         ResearchIntent.retrieve_sector_benchmark,
         ResearchIntent.retrieve_latest_filing,
     ],

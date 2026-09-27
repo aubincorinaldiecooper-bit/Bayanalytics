@@ -265,6 +265,7 @@ def build_evidence_lists(
     # Laya scan decisions that are directional.
     scan = {d.decision_type: d for d in decisions.decisions if d.stage == "evidence_scan"}
     guidance = scan.get("guidance_trend")
+    text_source_ids = [item["source_id"] for item in evidence.text_evidence[:8]]
     if guidance is not None and isinstance(guidance.answer, ChoiceAnswer):
         if guidance.answer.choice == "improving":
             bull.append(
@@ -272,6 +273,16 @@ def build_evidence_lists(
                     text="Guidance trend classified as improving",
                     stance="bullish",
                     decision_id=guidance.decision_id,
+                    source_ids=text_source_ids,
+                )
+            )
+        elif guidance.answer.choice == "deteriorating":
+            bear.append(
+                EvidenceItem(
+                    text="Guidance trend classified as deteriorating",
+                    stance="bearish",
+                    decision_id=guidance.decision_id,
+                    source_ids=text_source_ids,
                 )
             )
         elif guidance.answer.choice == "deteriorating":
@@ -314,9 +325,13 @@ def build_evidence_lists(
         and isinstance(valuation.answer, ScoreAnswer)
         and valuation.answer.score >= 3.0
     ):
+        pe = by_name.get("pe_ttm")
         risks.append(
             EvidenceItem(
-                text="Valuation scored above its historical norm", decision_id=valuation.decision_id
+                text="Valuation scored above its historical norm",
+                decision_id=valuation.decision_id,
+                source_ids=_calc_sources(pe) if pe else [],
+                calc_id=pe.calc_id if pe else None,
             )
         )
     for conflict in evidence.conflicts:
@@ -372,35 +387,59 @@ def build_evidence_lists(
     return bull, bear, risks, changed
 
 
+LOW_CONFIDENCE_FLOOR = 0.4  # four-way choice: uniform is 0.25; below this no stance is forced
+
+
 def merge_horizons(
     horizons: list[str],
     parsed: dict[str, HorizonAssessment],
     decisions: LayaDecisions,
     bull: list[EvidenceItem],
     bear: list[EvidenceItem],
-) -> dict[str, HorizonAssessment]:
-    """Laya owns stance + confidence; Spark supplies the explanation."""
+    known_source_ids: set[str] | None = None,
+) -> tuple[dict[str, HorizonAssessment], list[str]]:
+    """Laya owns stance + confidence; Spark supplies the explanation.
+
+    Returns the assessments and the uncertainties they raise (missing synthesis for a
+    horizon, or a stance Laya was not confident about and is therefore reported as mixed).
+    """
     out: dict[str, HorizonAssessment] = {}
+    notes: list[str] = []
+    known = known_source_ids or set()
     for horizon in horizons:
         decision = decisions.latest(f"horizon_stance_{horizon}")
         spark = parsed.get(horizon) or parsed.get(f"horizon_{horizon}")
+        evidence = [
+            i
+            for i in (spark.key_evidence if spark else [])
+            if i.source_ids and all(sid in known for sid in i.source_ids)
+        ]
         item = HorizonAssessment(
             horizon=horizon,
             summary=(spark.summary if spark else ""),
-            key_evidence=list(spark.key_evidence) if spark else [],
+            key_evidence=evidence,
+            synthesized=bool(spark and spark.summary),
         )
         if decision is not None and isinstance(decision.answer, ChoiceAnswer):
-            item.stance = decision.answer.choice  # type: ignore[assignment]
             item.confidence = round(decision.confidence, 3)
             item.decision_id = decision.decision_id
+            if decision.confidence < LOW_CONFIDENCE_FLOOR:
+                item.stance = "mixed"
+                item.low_confidence = True
+                notes.append(
+                    f"{HORIZON_LABELS.get(horizon, horizon)}: Laya was not confident "
+                    f"({decision.confidence:.2f}) so no directional stance is reported"
+                )
+            else:
+                item.stance = decision.answer.choice  # type: ignore[assignment]
         if not item.key_evidence:
             item.key_evidence = (bull[:2] + bear[:2])[:4]
-        if not item.summary:
-            item.summary = (
-                f"{HORIZON_LABELS.get(horizon, horizon)}: Laya stance {item.stance}; see evidence."
+        if not item.synthesized:
+            notes.append(
+                f"no synthesis was produced for the {HORIZON_LABELS.get(horizon, horizon)} horizon"
             )
         out[horizon] = item
-    return out
+    return out, notes
 
 
 def finalize_assessment(

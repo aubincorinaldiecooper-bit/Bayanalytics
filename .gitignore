@@ -17,8 +17,9 @@ node_modules/
 .env.local
 *.local.json
 
-# Model artifacts and caches (never commit weights)
-models/
+# Model artifacts and caches (never commit weights; keep the README)
+backend/models/*
+!backend/models/README.md
 *.gguf
 *.onnx
 *.onnx.data

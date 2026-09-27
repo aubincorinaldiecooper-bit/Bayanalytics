@@ -16,9 +16,11 @@ here, guarded by a setting that does not exist yet.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import time
+from collections.abc import AsyncIterator
 from typing import Any
 
 import httpx
@@ -136,11 +138,13 @@ class LlamaSparkClient:
             outcome = await self._manager.ensure(profile, ctx)
             spec = self._specs[profile]
             runtime_version = await self._manager.runtime_version()
-            if outcome.load_ms is not None:
-                ctx.diagnostics["spark_load_ms"] = outcome.load_ms
+            load_ms = outcome.load_ms if outcome.loaded_now else None
+            if load_ms is not None:
+                ctx.diagnostics["spark_load_ms"] = load_ms
+            ctx.diagnostics["spark_loaded_now"] = bool(outcome.loaded_now)
             with self._manager.request_scope():
                 return await self._generate(
-                    profile, spec, messages, on_token, ctx, opts, outcome.load_ms, runtime_version
+                    profile, spec, messages, on_token, ctx, opts, load_ms, runtime_version
                 )
 
     # --- streaming ----------------------------------------------------------------------
@@ -190,9 +194,7 @@ class LlamaSparkClient:
                         ErrorCode.SPARK_INFERENCE_FAILED,
                         details={"reason": "http_status", "status": response.status_code},
                     )
-                async for raw_line in response.aiter_lines():
-                    if ctx.cancel.cancelled:
-                        raise AnalysisError(ErrorCode.CANCELLED)
+                async for raw_line in _cancellable_lines(response, ctx):
                     line = raw_line.strip()
                     if not line or line.startswith(":"):
                         continue
@@ -246,12 +248,13 @@ class LlamaSparkClient:
                 ErrorCode.SPARK_INFERENCE_FAILED, details={"reason": "stream_ended_early"}
             )
         if ctx.cancel.cancelled:
-            raise AnalysisError(ErrorCode.CANCELLED)
+            raise AnalysisError(ctx.cancel.reason)
 
         rss = self._manager.rss_mb()
         if rss is not None:
             rss_samples.append(rss)
         prompt_tokens, output_tokens, tps = _token_stats(usage, timings, delta_count)
+        ctx.diagnostics["spark_streamed_deltas"] = delta_count
         stats = SparkStreamStats(
             profile=profile,
             context_ceiling=spec.context_ceiling,
@@ -320,8 +323,8 @@ def _token_stats(
             predicted_ms = timings.get("predicted_ms")
             if predicted_n and isinstance(predicted_ms, int | float) and predicted_ms > 0:
                 tps = predicted_n / (predicted_ms / 1000.0)
-    if output_tokens is None:
-        output_tokens = delta_count or None
+    # When neither usage nor timings is present the count is unknown; the streamed-delta
+    # count is only a diagnostic (see ``_generate``), never a measured statistic.
     return prompt_tokens, output_tokens, tps
 
 
@@ -334,3 +337,39 @@ def _int_or_none(source: dict[str, Any] | None, key: str) -> int | None:
     if isinstance(value, int | float) and value >= 0:
         return int(value)
     return None
+
+
+async def _cancellable_lines(response: httpx.Response, ctx: AnalysisContext) -> AsyncIterator[str]:
+    """Yield SSE lines while watching the cancel token even when the server is silent.
+
+    During prompt processing llama-server sends nothing, sometimes for minutes on a CPU; a
+    plain ``async for`` would only notice a cancel at the next line. Racing each read against
+    the token lets ``POST /cancel`` close the response (llama-server aborts the request) and
+    release the Spark lock promptly.
+    """
+    iterator = response.aiter_lines().__aiter__()
+    cancel_wait = asyncio.ensure_future(ctx.cancel.wait())
+    pending: asyncio.Task[str] | None = None
+    try:
+        while True:
+            if pending is None:
+                pending = asyncio.ensure_future(iterator.__anext__())
+            done, _ = await asyncio.wait(
+                {pending, cancel_wait}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if cancel_wait in done and pending not in done:
+                raise AnalysisError(ctx.cancel.reason)
+            task, pending = pending, None
+            try:
+                line = task.result()
+            except StopAsyncIteration:
+                return
+            if ctx.cancel.cancelled:
+                raise AnalysisError(ctx.cancel.reason)
+            yield line
+    finally:
+        cancel_wait.cancel()
+        if pending is not None and not pending.done():
+            pending.cancel()
+            with contextlib.suppress(BaseException):
+                await pending
