@@ -307,7 +307,10 @@ nothing: it is met when the prior completed assessment exists that the question-
 
 After the prior-assessment lookup, `check_requirements` records every requirement as satisfied
 or unmet, and each required calculation, operand and intent as satisfied or missing (with the
-missing inputs or the reason a formula had no meaningful value). Every gap is one sentence such
+missing inputs or the reason a formula had no meaningful value). A requirement with no
+calculations or operands of its own (guidance, recent coverage) is met only when at least one
+kept source was retrieved by one of its intents: an executed search that returned nothing
+usable leaves it unmet. Every gap is one sentence such
 as "the question needs valuation history but the P/E's five-year percentile could not be
 computed: missing eps_ttm, pe_history", added to the assessment's uncertainties and shown to
 Spark pass 2 in its instructions (outside the evidence block) with the intent, the requirement

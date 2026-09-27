@@ -518,6 +518,17 @@ def _operand_reason(operand: str) -> str:
     return f"no {operand.replace('_', ' ')} facts were retrieved"
 
 
+def _retrieved_intents(evidence: NormalizedEvidence | None) -> set[str]:
+    """The research intents that produced at least one kept (not rejected) source."""
+    if evidence is None:
+        return set()
+    return {
+        s.research_intent
+        for s in evidence.sources
+        if s.research_intent and s.rejected_reason is None
+    }
+
+
 def _owner(requirements: Sequence[str], attribute: str, item: str) -> str:
     """The first kept requirement whose row lists ``item`` (for the sentence's subject)."""
     for name in requirements:
@@ -554,8 +565,11 @@ def check_requirements(
     unavailable result names its missing operands (or the reason it has no meaningful value).
     A required operand is satisfied when the normalized evidence holds it; a required intent
     when the research loop executed it; ``prior_assessment`` when a prior completed assessment
-    exists (``prior_available``: ``None`` means the lookup was not reached). A requirement is
-    satisfied when all of its own parts are. Nothing here fails the analysis.
+    exists (``prior_available``: ``None`` means the lookup was not reached). A requirement with
+    no calculations or operands of its own (guidance, recent coverage) is met only by evidence:
+    at least one kept source retrieved by one of its intents, since an executed search can
+    return nothing usable. A requirement is satisfied when all of its own parts are. Nothing
+    here fails the analysis.
     """
     kept = list(requirements.requirements)
     by_name = {c.name: c for c in calculations.calculations}
@@ -624,6 +638,17 @@ def check_requirements(
             for intent in REQUIREMENT_TABLE[name].intents:
                 if str(intent) in missing_intents:
                     unmet_parts[name].append(f"{intent} was not executed")
+
+    retrieved = _retrieved_intents(evidence)
+    for name in kept:
+        row = REQUIREMENT_TABLE[name]
+        if row.calculations or row.operands or not row.intents:
+            continue  # met through its calculations and operands, or (prior) its own lookup
+        if any(str(intent) in retrieved for intent in row.intents):
+            continue
+        reason = "no usable source was retrieved for it"
+        unmet_parts[name].append(reason)
+        uncertainties.append(f"the question needs {_needs(name)} but {reason}")
 
     if PRIOR_ASSESSMENT in kept and not prior_available:
         subject = symbol or (evidence.symbol if evidence is not None else None)

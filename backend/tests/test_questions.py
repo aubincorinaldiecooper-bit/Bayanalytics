@@ -85,6 +85,7 @@ from bayanalytics.schemas.evidence import (
     Period,
     PricePoint,
     PriceSeries,
+    SourceRecord,
 )
 from bayanalytics.schemas.questions import (
     COMPARISON_FOCI,
@@ -1074,6 +1075,54 @@ def test_check_requirements_reports_every_unmet_part_as_an_uncertainty() -> None
     )
     assert broad.satisfied and broad.uncertainties == [] and broad.focus == ""
     assert broad.question_intent == "General assessment" and broad.requirements == []
+
+
+def test_retrieval_only_requirements_need_a_kept_source_not_just_an_executed_intent() -> None:
+    requirements = _requirements("guidance_outlook", "guidance", "recent_coverage")
+    assert requirements.required_calculations == [] and requirements.required_operands == []
+    executed = list(requirements.required_research_intents)
+
+    def source(source_id: str, intent: str, rejected: str | None = None) -> SourceRecord:
+        return SourceRecord(
+            source_id=source_id,
+            url=f"https://example.com/{source_id}",
+            title=source_id,
+            retrieved_at=AS_OF,
+            research_intent=intent,
+            rejected_reason=rejected,
+        )
+
+    # every intent ran (a search outage, an empty guidance search): nothing is met
+    empty = NormalizedEvidence(symbol="AAPL", as_of=AS_OF)
+    report = check_requirements(requirements, empty, CalculatedMetrics(), executed)
+    assert report.missing_research_intents == [] and not report.satisfied
+    assert [u.name for u in report.unmet_requirements] == ["Guidance", "Recent coverage"]
+    assert "the question needs guidance but no usable source was retrieved for it" in (
+        report.uncertainties
+    )
+    # a rejected source is not evidence
+    rejected = NormalizedEvidence(
+        symbol="AAPL",
+        as_of=AS_OF,
+        sources=[source("src_r", "retrieve_guidance_history", rejected="off_topic")],
+    )
+    report = check_requirements(requirements, rejected, CalculatedMetrics(), executed)
+    assert [u.name for u in report.unmet_requirements] == ["Guidance", "Recent coverage"]
+    # a kept source from one of the requirement's intents meets it
+    kept = NormalizedEvidence(
+        symbol="AAPL",
+        as_of=AS_OF,
+        sources=[
+            source("src_g", "retrieve_management_commentary"),
+            source("src_n", "retrieve_recent_news"),
+        ],
+    )
+    report = check_requirements(requirements, kept, CalculatedMetrics(), executed)
+    assert report.satisfied and report.unmet_requirements == []
+    assert report.satisfied_requirements == ["Guidance", "Recent coverage"]
+    # an intent that never ran is still reported as not executed
+    report = check_requirements(requirements, empty, CalculatedMetrics(), executed[:1])
+    assert report.missing_research_intents == executed[1:]
 
 
 def test_prior_assessment_requirement_uses_the_thesis_diff_lookup() -> None:
