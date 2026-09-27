@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 from bayanalytics.instruments.base import InstrumentIdentity
 from bayanalytics.research.dates import ensure_utc
 from bayanalytics.research.prices import to_stooq_symbol
+from bayanalytics.schemas.questions import AnalyticalRequirements
 
 QueryKind = Literal["search", "edgar_submissions", "edgar_companyfacts", "prices", "benchmarks"]
 
@@ -138,8 +139,64 @@ def gap_to_intent(gap: str) -> ResearchIntent:
     return ResearchIntent.retrieve_missing_metric
 
 
-def seed_plan(horizon: str) -> list[ResearchIntent]:
-    return list(SEED_PLANS.get(horizon, SEED_PLANS["multi_horizon"]))
+INTENT_QUERY_KIND: dict[ResearchIntent, QueryKind] = {
+    ResearchIntent.retrieve_earnings_history: "edgar_companyfacts",
+    ResearchIntent.retrieve_price_history: "prices",
+    ResearchIntent.retrieve_latest_filing: "edgar_submissions",
+    ResearchIntent.retrieve_sector_benchmark: "benchmarks",
+    ResearchIntent.retrieve_recent_news: "search",
+    ResearchIntent.retrieve_historical_coverage: "search",
+    ResearchIntent.retrieve_guidance_history: "search",
+    ResearchIntent.retrieve_management_commentary: "search",
+    ResearchIntent.retrieve_missing_metric: "search",
+}
+"""The query kind each intent's template issues (``build_queries``; checked by the tests)."""
+
+_KIND_RANK: dict[str, int] = {
+    "edgar_companyfacts": 0,  # company facts: the evidence gate needs them
+    "prices": 0,
+    "edgar_submissions": 1,
+    "benchmarks": 1,
+    "search": 2,  # up to max_fetch_per_round sources each: can fill max_sources on its own
+}
+
+
+def retrieval_rank(intent: ResearchIntent | str) -> int:
+    """0 for company facts and prices, 1 for the other structured sources, 2 for searches."""
+    kind = INTENT_QUERY_KIND.get(ResearchIntent(intent))
+    return _KIND_RANK.get(kind or "search", 2)
+
+
+def facts_first(intents: list[ResearchIntent]) -> list[ResearchIntent]:
+    """Stable reorder: company facts and prices, then the other structured sources, then
+    searches. The loop stops an intent list as soon as ``max_sources`` is reached and each
+    search can fetch several sources, so searches planned first could fill the budget before
+    the company facts the evidence gate requires were retrieved."""
+    return sorted(intents, key=retrieval_rank)
+
+
+def seed_plan(
+    horizon: str, requirements: AnalyticalRequirements | None = None
+) -> list[ResearchIntent]:
+    """The first round's intents: the question's required intents and the horizon seed.
+
+    Required intents come first and are deduplicated against the seed and each other, then the
+    whole plan is reordered facts first (:func:`facts_first`, stable) so a question that needs
+    searches never starves the company facts; ``stop_research`` is never planned, so the plan
+    is bounded by the intent set and execution by the research budget (sources, rounds, time),
+    which the loop checks after every intent. Without required intents (a general assessment)
+    the plan is exactly the horizon seed.
+    """
+    base = list(SEED_PLANS.get(horizon, SEED_PLANS["multi_horizon"]))
+    if requirements is None or not requirements.required_research_intents:
+        return base
+    plan: list[ResearchIntent] = []
+    for name in [*requirements.required_research_intents, *base]:
+        intent = ResearchIntent(name)
+        if intent is ResearchIntent.stop_research or intent in plan:
+            continue
+        plan.append(intent)
+    return facts_first(plan)
 
 
 def _display_name(identity: InstrumentIdentity) -> str:
@@ -152,12 +209,18 @@ def build_queries(
     horizon: str,
     as_of: datetime,
     gaps: list[str] | None = None,
+    min_price_days: int | None = None,
 ) -> list[PlannedQuery]:
-    """Deterministic templates: same inputs always yield the same planned queries."""
+    """Deterministic templates: same inputs always yield the same planned queries.
+
+    Price and benchmark windows are the horizon's (``PRICE_DAYS``), widened to
+    ``min_price_days`` when the question's requirements need a longer history (a P/E
+    percentile needs years of quarter-end prices whatever the horizon).
+    """
     intent = ResearchIntent(intent)
     name = _display_name(identity)
     year = ensure_utc(as_of).year
-    days = PRICE_DAYS.get(horizon, PRICE_DAYS["multi_horizon"])
+    days = max(PRICE_DAYS.get(horizon, PRICE_DAYS["multi_horizon"]), min_price_days or 0)
     gaps = [g for g in (gaps or []) if g and g.strip()]
 
     if intent is ResearchIntent.stop_research:

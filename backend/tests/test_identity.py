@@ -3,7 +3,12 @@ from __future__ import annotations
 import pytest
 
 from bayanalytics.errors import AnalysisError
-from bayanalytics.instruments.identity import InstrumentResolver, normalize_name
+from bayanalytics.instruments.identity import (
+    InstrumentResolver,
+    normalize_name,
+    possessive_base,
+    query_words,
+)
 from bayanalytics.schemas.requests import InstrumentRef
 
 ROWS = [
@@ -116,3 +121,110 @@ def test_resolver_has_no_directory_completeness_flag() -> None:
     resolver = InstrumentResolver(ROWS)
     assert not hasattr(resolver, "directory_complete")
     assert len(resolver.rows) == len(ROWS)
+
+
+# ------------------------------------------------------------------ possessives
+
+# Issuers whose own names end in "'s", plus a listed ticker that is a stoplisted word.
+POSSESSIVE_ROWS = [
+    *ROWS,
+    {"cik_str": 63908, "ticker": "MCD", "title": "McDonald's Corp", "exchange": "NYSE"},
+    {"cik_str": 1059556, "ticker": "MCO", "title": "MOODY'S CORP /DE/", "exchange": "NYSE"},
+    {"cik_str": 1373715, "ticker": "NOW", "title": "ServiceNow, Inc.", "exchange": "NYSE"},
+]
+# Contrived issuers whose names equal a contraction's base ("what", "it"): stripping "'s" from
+# "What's" / "It's" would match them and make every such question ambiguous.
+CONTRACTION_ROWS = [
+    *ROWS,
+    {"cik_str": 9000001, "ticker": "WHTH", "title": "What Holdings Inc.", "exchange": "NYSE"},
+    {"cik_str": 9000002, "ticker": "ITHD", "title": "IT HOLDINGS INC", "exchange": "NYSE"},
+]
+
+
+@pytest.fixture
+def possessive_resolver() -> InstrumentResolver:
+    return InstrumentResolver(POSSESSIVE_ROWS)
+
+
+@pytest.mark.parametrize(
+    ("query", "symbol", "method"),
+    [
+        # straight and curly possessives on names
+        ("Is Apple's dividend safe?", "AAPL", "name_match"),
+        ("What is Apple's P/E?", "AAPL", "name_match"),
+        ("Assess Apple's valuation", "AAPL", "name_match"),
+        ("Is Apple\u2019s dividend safe?", "AAPL", "name_match"),
+        ("Evaluate Microsoft's margins", "MSFT", "name_match"),
+        ("Evaluate Microsoft\u2019s margins", "MSFT", "name_match"),
+        ("How strong is Berkshire Hathaway's cash position?", "BRK-B", "name_match"),
+        ("What is American Express's outlook?", "AXP", "name_match"),
+        ("Is Google's growth durable?", "GOOGL", "name_match"),  # alias, then possessive
+        # plural possessive: the trailing apostrophe goes, the name's own "s" stays
+        ("Are Meta Platforms' margins improving?", "META", "name_match"),
+        ("Are Meta Platforms\u2019 margins improving?", "META", "name_match"),
+        # straight and curly possessives on tickers and cashtags
+        ("What is AAPL's P/E?", "AAPL", "ticker_token"),
+        ("What is AAPL\u2019s P/E?", "AAPL", "ticker_token"),
+        ("How is $msft's growth?", "MSFT", "cashtag"),
+        ("How is $MSFT\u2019s growth?", "MSFT", "cashtag"),
+        # names that contain "'s" still match as written, straight or curly
+        ("Are McDonald's margins improving?", "MCD", "name_match"),
+        ("Are McDonald\u2019s margins improving?", "MCD", "name_match"),
+        ("Is Moody's growing?", "MCO", "name_match"),
+    ],
+)
+def test_possessives_resolve_like_the_bare_name(
+    possessive_resolver: InstrumentResolver, query: str, symbol: str, method: str
+) -> None:
+    identity = possessive_resolver.resolve(query)
+    assert identity.symbol == symbol
+    assert identity.resolution_method == method
+
+
+@pytest.mark.parametrize(
+    "query",
+    ["What's Apple's P/E?", "What\u2019s Apple\u2019s P/E?", "It's time to assess Apple's margins"],
+)
+def test_contractions_are_not_stripped_into_false_matches(query: str) -> None:
+    identity = InstrumentResolver(CONTRACTION_ROWS).resolve(query)
+    assert identity.symbol == "AAPL" and identity.resolution_method == "name_match"
+
+
+def test_possessives_keep_the_stoplist_generic_prefixes_and_ambiguity(
+    possessive_resolver: InstrumentResolver,
+) -> None:
+    # a stoplisted ticker does not become one because of its possessive; a cashtag still does
+    assert possessive_resolver.resolve("Is NOW's valuation stretched at Shopify?").symbol == "SHOP"
+    assert possessive_resolver.resolve("Is $NOW's valuation stretched?").symbol == "NOW"
+    # a generic leading word stays generic: no silent pick between AAL and AXP
+    with pytest.raises(AnalysisError) as generic:
+        possessive_resolver.resolve("Is American's growth durable?")
+    assert generic.value.details["reason"] == "no_match"
+    assert generic.value.details["candidates"] == []
+    # two companies named possessively are still ambiguous
+    with pytest.raises(AnalysisError) as two:
+        possessive_resolver.resolve("Compare Apple's and Microsoft's margins.")
+    assert two.value.details["reason"] == "multiple_companies"
+    assert {c["symbol"] for c in two.value.details["candidates"]} == {"AAPL", "MSFT"}
+    # a misspelt possessive still offers the closest company, not a resolution
+    with pytest.raises(AnalysisError) as typo:
+        possessive_resolver.resolve("Assess Aple's valuation")
+    assert typo.value.details["reason"] == "no_match"
+    assert [c["symbol"] for c in typo.value.details["candidates"]] == ["AAPL"]
+
+
+def test_query_words_and_possessive_base() -> None:
+    assert query_words("Is Apple\u2019s P/E high? Meta Platforms' too.") == [
+        "is",
+        "apple's",
+        "p",
+        "e",
+        "high",
+        "meta",
+        "platforms",
+        "too",
+    ]
+    assert possessive_base("apple's") == "apple"
+    assert possessive_base("hathaway's") == "hathaway"
+    for kept in ("what's", "it's", "let's", "a's", "apple", "platforms"):
+        assert possessive_base(kept) == kept

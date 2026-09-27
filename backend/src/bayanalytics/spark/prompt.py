@@ -18,6 +18,10 @@ Bundle entry shapes this module reads (all keys optional, unknown keys ignored):
   ``stances``, ``horizon_scope_changed``, ``overall_compared_horizons``, ``metrics``,
   ``new_conflicts``, ``resolved_conflicts``, ``freshness``, ``summary``), rendered as at most
   ``PRIOR_MAX_LINES`` lines.
+- ``question_focus``: ``{"intent", "requirements", "focus", "horizons_emphasis",
+  "recent_period", "unmet_requirements"}`` from the interpreted question (product labels and
+  application sentences, rendered in the instructions, not inside the evidence block: it is
+  produced by the application, never by a retrieved page).
 """
 
 from __future__ import annotations
@@ -61,6 +65,10 @@ SECTION_HEADINGS: tuple[str, ...] = (
 EVIDENCE_SECTIONS: frozenset[str] = frozenset(
     {"What changed", "Bull evidence", "Bear evidence", "Risks", "Conflicts", "Uncertainties"}
 )
+
+FOCUS_TEXT_MAX_CHARS = 500
+MAX_UNMET_REQUIREMENTS = 8
+MAX_FOCUS_REQUIREMENTS = 12
 
 SYSTEM_PROMPT = """You are Spark, the synthesis layer of a CPU-only equity research assistant. \
 You write for a professional analyst who remains the decision-maker. Deterministic tooling has \
@@ -408,6 +416,7 @@ def render_instructions(bundle: SparkEvidenceBundle, options: SparkRunOptions | 
         lines.append(f"As of: {clean_text(request['as_of'], 40)}.")
     if request.get("query"):
         lines.append(f"Analyst question: {clean_text(request['query'], 300)}")
+    lines.extend(_render_question_focus(bundle))
     stances = horizon_stances(bundle)
     if stances:
         labels = "; ".join(f"{h} = {HORIZON_LABELS.get(h, h)}" for h, _ in stances)
@@ -447,6 +456,48 @@ def render_instructions(bundle: SparkEvidenceBundle, options: SparkRunOptions | 
         f"answer under about {max(150, int(opts.max_tokens * 0.7))} words."
     )
     return "\n".join(lines)
+
+
+def _render_question_focus(bundle: SparkEvidenceBundle) -> list[str]:
+    """What the analyst asked and what the evidence could not supply for it.
+
+    Application-generated text (the interpretation's labels, the requirements tables and the
+    requirement check), so it sits with the instructions; the analyst's own words stay capped
+    in ``Analyst question``.
+    """
+    focus = bundle.question_focus or {}
+    if not isinstance(focus, dict):
+        return []
+    lines: list[str] = []
+    text = clean_text(focus.get("focus"), FOCUS_TEXT_MAX_CHARS)
+    if text:
+        intent = clean_text(focus.get("intent"), 60)
+        lines.append(f"Question focus{f' ({intent})' if intent else ''}: {text}")
+    requirements = focus.get("requirements")
+    if isinstance(requirements, list | tuple) and requirements:
+        labels = ", ".join(clean_text(r, 60) for r in requirements[:MAX_FOCUS_REQUIREMENTS] if r)
+        if labels:
+            lines.append(f"What the question requires: {labels}.")
+    horizons = focus.get("horizons_emphasis")
+    if isinstance(horizons, list | tuple) and horizons:
+        labels = ", ".join(HORIZON_LABELS.get(str(h), clean_text(h, 40)) for h in horizons if h)
+        if labels:
+            lines.append(f"Horizons the question emphasises: {labels}.")
+    if focus.get("recent_period"):
+        lines.append(
+            "The question is about a specific recent period: lead with the newest reported "
+            "period and the newest dated evidence."
+        )
+    unmet = focus.get("unmet_requirements")
+    if isinstance(unmet, list | tuple):
+        items = [clean_text(u, 300) for u in unmet[:MAX_UNMET_REQUIREMENTS] if u]
+        if items:
+            lines.append(
+                "What the question needs that could not be retrieved or computed (say so "
+                "explicitly under Uncertainties; never fill the gap):"
+            )
+            lines.extend(f"- {item}" for item in items)
+    return lines
 
 
 def build_messages(

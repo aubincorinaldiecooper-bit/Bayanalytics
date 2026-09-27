@@ -19,15 +19,27 @@ Every figure in its stats is measured or ``None``:
 The scripted text keeps every answer section so the parser and assembly paths are exercised.
 Its lines are labelled ``[scripted]`` and cite ids found in the user message; it never claims to
 be an assessment. Pass ``text_factory`` to script something else.
+
+Structured generations (options carrying ``json_schema``: Spark pass 1, query understanding)
+return a scripted interpretation instead. **The double does not understand language**: it looks
+the question (the ``Question:`` line of the pass-1 prompt) up in the test-supplied
+``interpretations`` mapping, or passes it to the test-supplied callback, and otherwise returns
+the broad interpretation (a general assessment with no requirements). Tests built on it prove
+that the pipeline turns an interpretation into requirements, plans and checks, not that a model
+interprets questions well. A dict is serialised as JSON; a string is returned verbatim (for
+malformed-output tests). Structured generations are recorded in ``understandings`` and their
+sessions are not listed in ``sessions`` (``runs`` and ``sessions`` stay the synthesis record);
+like the real client, they add nothing to the synthesis stage timer or its diagnostics.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import re
 import time
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Mapping
 from typing import Any
 
 from bayanalytics.config import Settings
@@ -35,6 +47,7 @@ from bayanalytics.context import AnalysisContext
 from bayanalytics.errors import AnalysisError
 from bayanalytics.schemas.capabilities import ProfileCapability
 from bayanalytics.schemas.common import ErrorCode, Profile
+from bayanalytics.schemas.questions import QueryUnderstanding
 from bayanalytics.spark.base import (
     ProfileSpec,
     SparkGeneration,
@@ -49,6 +62,11 @@ from bayanalytics.spark.prompt import HORIZON_HEADING_PREFIX, SECTION_HEADINGS
 from .tokens import count_tokens
 
 TextFactory = Callable[[list[SparkMessage]], str]
+Interpretation = Mapping[str, Any] | str
+InterpretationScript = Mapping[str, Interpretation] | Callable[[str], Interpretation | None]
+
+BROAD_INTERPRETATION: dict[str, Any] = QueryUnderstanding.broad().model_dump()
+_QUESTION_RE = re.compile(r"^Question:\s*(.*)$", re.MULTILINE)
 
 _INSTRUMENT_RE = re.compile(r"^Instrument:\s*(.+?)(?:\s*\|.*)?$", re.MULTILINE)
 _HORIZON_PLAN_RE = re.compile(
@@ -138,6 +156,7 @@ class ScriptedSpark:
         delay_s: float = 0.0,
         text_factory: TextFactory | None = None,
         chunk_chars: int = 24,
+        interpretations: InterpretationScript | None = None,
     ) -> None:
         self._settings = settings or Settings()
         self._specs = profile_specs(self._settings)
@@ -146,9 +165,12 @@ class ScriptedSpark:
         self._text_factory: TextFactory = text_factory or scripted_text
         self._chunk_chars = max(1, chunk_chars)
         self._lock = asyncio.Lock()
+        self._waiting = 0  # sessions queued for the lane (as in the real client)
         self._loaded: set[Profile] = set()
+        self._interpretations = interpretations
         self.runs: list[dict[str, Any]] = []
         self.sessions: list[dict[str, Any]] = []
+        self.understandings: list[dict[str, Any]] = []  # pass-1 (json_schema) generations
 
     # --- SparkClient protocol -----------------------------------------------------------
 
@@ -160,7 +182,19 @@ class ScriptedSpark:
 
     @property
     def busy(self) -> bool:
-        return self._lock.locked()
+        return self._lock.locked() or self._waiting > 0
+
+    @contextlib.asynccontextmanager
+    async def _turn(self) -> AsyncIterator[None]:
+        self._waiting += 1
+        try:
+            await self._lock.acquire()
+        finally:
+            self._waiting -= 1
+        try:
+            yield
+        finally:
+            self._lock.release()
 
     def availability(self, profile: Profile) -> ProfileCapability:
         spec = self._specs[profile]
@@ -182,7 +216,7 @@ class ScriptedSpark:
     ) -> AsyncIterator[ScriptedSession]:
         """Exclusive turn with ``profile``: the lock is held until the block ends."""
         ctx.check_cancelled()
-        async with self._lock:
+        async with self._turn():
             ctx.check_cancelled()
             if profile == "deep" and not self.deep_available:
                 raise AnalysisError(
@@ -217,6 +251,21 @@ class ScriptedSpark:
 
     # --- internals ----------------------------------------------------------------------
 
+    def interpretation_text(self, messages: list[SparkMessage]) -> str:
+        """The scripted pass-1 output: a lookup of the question text, never an understanding."""
+        user = next((m.content for m in reversed(messages) if m.role == "user"), "")
+        match = _QUESTION_RE.search(user)
+        question = match.group(1).strip() if match else ""
+        script = self._interpretations
+        scripted: Interpretation | None = None
+        if callable(script):
+            scripted = script(question)
+        elif script is not None:
+            scripted = script.get(question)
+        if scripted is None:
+            scripted = BROAD_INTERPRETATION
+        return scripted if isinstance(scripted, str) else json.dumps(dict(scripted))
+
     def _default_options(self, options: SparkRunOptions | None) -> SparkRunOptions:
         return options or SparkRunOptions(
             max_tokens=self._settings.spark_max_output_tokens,
@@ -232,7 +281,8 @@ class ScriptedSpark:
         ctx: AnalysisContext,
         opts: SparkRunOptions,
     ) -> SparkGeneration:
-        text = self._text_factory(messages)
+        structured = opts.json_schema is not None
+        text = self.interpretation_text(messages) if structured else self._text_factory(messages)
         record: dict[str, Any] = {
             "profile": profile,
             "messages": messages,
@@ -240,11 +290,12 @@ class ScriptedSpark:
             "text": text,
             "completed": False,
         }
-        self.runs.append(record)
+        (self.understandings if structured else self.runs).append(record)
         prompt_tokens = prompt_token_count(messages)
 
         started = time.perf_counter()
-        ctx.timers.start("spark")
+        if not structured:
+            ctx.timers.start("spark")
         ttft_ms: float | None = None
         emitted = 0
         try:
@@ -261,11 +312,12 @@ class ScriptedSpark:
             ctx.check_cancelled()
         finally:
             total_ms = (time.perf_counter() - started) * 1000.0
-            ctx.timers.stop("spark")
+            if not structured:
+                ctx.timers.stop("spark")
             record["chunks_emitted"] = emitted
 
         record["completed"] = True
-        if ttft_ms is not None:
+        if ttft_ms is not None and not structured:
             ctx.diagnostics["spark_ttft_ms"] = ttft_ms
         # Throughput is a wall-clock measurement only when the stream really took time;
         # without a configured delay the clock says nothing about a model, so None.
@@ -325,6 +377,10 @@ class ScriptedSession:
             )
         self.generated = True
         opts = self._client._default_options(options)
+        if opts.json_schema is not None and self.record in self._client.sessions:
+            # A pass-1 session: keep ``sessions`` the record of synthesis sessions.
+            self._client.sessions.remove(self.record)
+            self.record["structured"] = True
         self._ctx.check_cancelled()
         return await self._client._generate(
             self._profile, self._spec, messages, on_token, self._ctx, opts

@@ -118,6 +118,8 @@ class Settings(BaseModel):
     spark_fast_min_available_mb: int = 1536
     spark_max_output_tokens: int = 1400
     spark_temperature: float = 0.2
+    # Spark pass 1 (query understanding): a short JSON interpretation, never an answer.
+    spark_understanding_max_tokens: int = 192
     spark_start_timeout_s: float = 300.0
     spark_request_timeout_s: float = 900.0
 

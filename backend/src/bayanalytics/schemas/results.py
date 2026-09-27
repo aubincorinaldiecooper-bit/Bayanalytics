@@ -12,6 +12,7 @@ from bayanalytics.schemas.common import AnalysisStatus, Profile, ResolvedHorizon
 from bayanalytics.schemas.decisions import LayaDecision
 from bayanalytics.schemas.errors import ErrorPayload
 from bayanalytics.schemas.evidence import Conflict, SourceRecord
+from bayanalytics.schemas.questions import RequirementsReport
 
 
 class InstrumentView(BaseModel):
@@ -125,6 +126,14 @@ class Telemetry(BaseModel):
     spark_output_tokens: int | None = None
     spark_tokens_per_second: float | None = None
 
+    # Spark pass 1 (query understanding), measured separately from the synthesis above.
+    query_understanding_ms: float | None = None  # wall clock of the pass, lock wait included
+    query_understanding_prompt_tokens: int | None = None  # llama-server usage
+    query_understanding_output_tokens: int | None = None  # llama-server usage
+    query_understanding_load_ms: float | None = None  # only when this pass loaded the profile
+    query_understanding_wait_ms: float | None = None  # queued for the Spark lane (no load)
+    query_understanding_generation_ms: float | None = None  # prompt processing + decoding
+
     process_peak_rss_mb: float | None = None
     laya_resident_ram_mb: float | None = None
     laya_peak_rss_mb: float | None = None
@@ -220,6 +229,9 @@ class AnalysisResult(BaseModel):
     laya_decisions: list[LayaDecision] = Field(default_factory=list)
     freshness_summary: dict[str, Any] = Field(default_factory=dict)
     thesis_diff: ThesisDiff | None = None  # None when no prior completed assessment exists
+    # How the question was interpreted (product labels) and which of its requirements were
+    # met; None when the analysis stopped before the question was interpreted.
+    requirements: RequirementsReport | None = None
     streamed_text: str = ""  # exactly what was streamed as spark.token, for recovery
     telemetry: Telemetry = Field(default_factory=Telemetry)
     error: ErrorPayload | None = None

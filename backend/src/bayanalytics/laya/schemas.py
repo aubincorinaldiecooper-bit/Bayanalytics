@@ -14,10 +14,12 @@ from collections.abc import Iterable
 from bayanalytics.laya.compaction import validate_questions
 from bayanalytics.schemas.common import SINGLE_HORIZONS
 from bayanalytics.schemas.decisions import LayaQuestion
+from bayanalytics.schemas.questions import REQUIREMENT_LABELS, REQUIREMENT_NAMES
 
 LAYA_SCHEMA_VERSION = "finance-v1"
 
 # Stage names recorded on LayaDecision.stage.
+STAGE_QUESTION_VALIDATION = "question_validation"
 STAGE_RESEARCH_PLAN = "research_plan"
 STAGE_EVIDENCE_SCAN = "evidence_scan"
 STAGE_HISTORY_SCAN = "history_scan"
@@ -90,6 +92,24 @@ def _score(instructions: str, levels: Iterable[str]) -> LayaQuestion:
 def _noul(instructions: str) -> LayaQuestion:
     return LayaQuestion(type="noul", instructions=instructions)
 
+
+# ---- question validation (Spark pass 1 proposes, Laya confirms or drops) -----------------
+
+REQUIREMENTS_SUPPORTED_KEY = "requirements_supported"
+REQUIREMENTS_SUPPORTED = _noul("The proposed requirements fit the question.")
+
+
+def requirement_key(requirement: str) -> str:
+    """The noul key that asks whether the question needs ``requirement``."""
+    return f"requirement_{requirement}"
+
+
+REQUIREMENT_QUESTIONS: dict[str, LayaQuestion] = {
+    requirement_key(name): _noul(
+        f"Answering the question requires {REQUIREMENT_LABELS[name].lower()}."
+    )
+    for name in REQUIREMENT_NAMES
+}
 
 # ---- research planning (section 21) --------------------------------------------------------
 
@@ -241,6 +261,8 @@ def horizon_stance_key(horizon: str) -> str:
 
 
 ALL_QUESTIONS: dict[str, LayaQuestion] = {
+    **REQUIREMENT_QUESTIONS,
+    REQUIREMENTS_SUPPORTED_KEY: REQUIREMENTS_SUPPORTED,
     "research_intent": RESEARCH_INTENT,
     "evidence_sufficient": EVIDENCE_SUFFICIENT,
     "stale_evidence_matters": STALE_EVIDENCE_MATTERS,
@@ -268,6 +290,26 @@ def _batch(*keys: str) -> dict[str, LayaQuestion]:
 
 
 # ---- builders: one batch per shared state -------------------------------------------------
+
+
+def requirement_validation_questions(requirements: Iterable[str]) -> dict[str, LayaQuestion]:
+    """Bounded validation of Spark's interpretation (stage ``question_validation``): one noul
+    per requirement Spark proposed plus ``requirements_supported``.
+
+    State: the question, the instrument, the horizon, the proposed intent's label and the
+    proposed requirements' labels. Laya can only confirm or drop what was proposed; it never
+    adds a requirement, plans research or computes anything.
+    """
+    keys: list[str] = []
+    for requirement in requirements:
+        if requirement not in REQUIREMENT_LABELS:
+            raise ValueError(f"unknown requirement {requirement!r}")
+        key = requirement_key(requirement)
+        if key not in keys:
+            keys.append(key)
+    if not keys:
+        raise ValueError("at least one proposed requirement is required")
+    return _batch(*keys, REQUIREMENTS_SUPPORTED_KEY)
 
 
 def research_plan_questions() -> dict[str, LayaQuestion]:
@@ -382,6 +424,7 @@ def horizon_context_questions(horizons: Iterable[str]) -> dict[str, LayaQuestion
 
 
 BUILDERS = (
+    lambda: requirement_validation_questions(REQUIREMENT_NAMES),
     research_plan_questions,
     evidence_scan_questions,
     history_segment_questions,

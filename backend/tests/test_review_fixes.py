@@ -520,7 +520,7 @@ class SilentServer(FakeLlamaServer):
         self.release = asyncio.Event()
         self.closed = False
 
-    async def _stream(self) -> AsyncIterator[bytes]:
+    async def _stream(self, body: dict[str, Any] | None = None) -> AsyncIterator[bytes]:
         try:
             await self.release.wait()
             yield b"data: [DONE]\n\n"
@@ -607,6 +607,8 @@ async def test_spark_queued_is_emitted_while_the_lane_is_busy() -> None:
         names2 = [e.event for e in ev2]
         assert "spark.queued" in names2
         assert names2.index("spark.queued") < names2.index("spark.started")
+        stages = {e.data["stage"] for e in [*ev1, *ev2] if e.event == "spark.queued"}
+        assert stages and stages <= {"query_understanding", "synthesis"}
         assert ev1[-1].event == "analysis.completed" and ev2[-1].event == "analysis.completed"
 
 

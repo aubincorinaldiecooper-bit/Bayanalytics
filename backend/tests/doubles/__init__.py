@@ -1,7 +1,9 @@
 """Test doubles: the only place a stand-in for a product component may live.
 
 * ``RuleLaya`` answers Laya questions from a handful of state keys (no model, no subprocess);
-* ``ScriptedSpark`` streams a scripted, sectioned text (no llama-server);
+* ``ScriptedSpark`` streams a scripted, sectioned text (no llama-server) and answers the
+  structured pass-1 request with a scripted interpretation looked up by question text (it
+  does not understand language);
 * ``FixedTranscriber`` returns a fixed transcript (no whisper.cpp);
 * ``FixtureResearchProvider`` / ``FixtureFetcher`` serve the synthetic fixture directories.
 

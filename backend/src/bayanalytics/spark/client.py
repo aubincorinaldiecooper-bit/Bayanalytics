@@ -77,6 +77,7 @@ class LlamaSparkClient:
             settings, probe=self._probe, spawn=spawn, http=self._http
         )
         self._lock = asyncio.Lock()
+        self._waiting = 0  # sessions queued for the lane
         self._specs = profile_specs(settings)
         self.lockfile = read_lockfile(settings.spark_lockfile)
 
@@ -88,7 +89,10 @@ class LlamaSparkClient:
 
     @property
     def busy(self) -> bool:
-        return self._lock.locked()
+        """A turn is running or already queued. ``asyncio.Lock.locked()`` alone reads False
+        between a release and the moment the next waiter runs, although that waiter already
+        owns the next turn, so queued sessions count as busy too."""
+        return self._lock.locked() or self._waiting > 0
 
     async def start(self) -> None:
         """No warm load (see module docstring). External mode: seed the capability cache."""
@@ -124,9 +128,20 @@ class LlamaSparkClient:
 
     @contextlib.asynccontextmanager
     async def session(self, profile: Profile, ctx: AnalysisContext) -> AsyncIterator[_Session]:
-        """Exclusive turn with ``profile`` resident: prompt measurement, then one generation."""
+        """Exclusive turn with ``profile`` resident: prompt measurement, then one generation.
+
+        Turns are granted first come, first served: ``asyncio.Lock`` is fair (the task that
+        started waiting first proceeds first) and nothing here reorders waiters, so no stage
+        has priority. A query-understanding pass queues behind a synthesis already waiting and
+        a synthesis behind a pass already waiting; every waiter is served in arrival order,
+        so none starves."""
         ctx.check_cancelled()
-        async with self._lock:
+        self._waiting += 1
+        try:
+            await self._lock.acquire()
+        finally:
+            self._waiting -= 1
+        try:
             ctx.check_cancelled()
             outcome = await self._manager.ensure(profile, ctx)
             spec = self._specs[profile]
@@ -136,6 +151,8 @@ class LlamaSparkClient:
                 ctx.diagnostics["spark_load_ms"] = load_ms
             ctx.diagnostics["spark_loaded_now"] = bool(outcome.loaded_now)
             yield _Session(self, profile, spec, ctx, load_ms, runtime_version)
+        finally:
+            self._lock.release()
 
     async def run(
         self,
@@ -223,6 +240,16 @@ class LlamaSparkClient:
             "stop": list(opts.stop),
             "cache_prompt": True,
         }
+        structured = opts.json_schema is not None
+        if structured:
+            # llama-server (b10828+) compiles the schema into a grammar; the name is a label.
+            payload["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": str(opts.json_schema.get("title") or "response"),
+                    "schema": opts.json_schema,
+                },
+            }
         url = f"{self._manager.base_url}/v1/chat/completions"
         timeout = httpx.Timeout(self._settings.spark_request_timeout_s, connect=CONNECT_TIMEOUT_S)
 
@@ -239,7 +266,8 @@ class LlamaSparkClient:
         if rss is not None:
             rss_samples.append(rss)
         started = time.perf_counter()
-        ctx.timers.start("spark")
+        if not structured:
+            ctx.timers.start("spark")
         try:
             async with self._http.stream(
                 "POST", url, json=payload, timeout=timeout, headers=self._manager.auth_headers
@@ -296,7 +324,8 @@ class LlamaSparkClient:
             ) from exc
         finally:
             total_ms = (time.perf_counter() - started) * 1000.0
-            ctx.timers.stop("spark")
+            if not structured:
+                ctx.timers.stop("spark")
 
         if not done and finish_reason is None:
             raise AnalysisError(
@@ -309,7 +338,8 @@ class LlamaSparkClient:
         if rss is not None:
             rss_samples.append(rss)
         prompt_tokens, output_tokens, tps = _token_stats(usage, timings, delta_count)
-        ctx.diagnostics["spark_streamed_deltas"] = delta_count
+        if not structured:
+            ctx.diagnostics["spark_streamed_deltas"] = delta_count
         stats = SparkStreamStats(
             profile=profile,
             context_ceiling=spec.context_ceiling,
@@ -325,11 +355,12 @@ class LlamaSparkClient:
             finish_reason=finish_reason,
             runtime_version=runtime_version,
         )
-        if ttft_ms is not None:
+        if ttft_ms is not None and not structured:
             ctx.diagnostics["spark_ttft_ms"] = ttft_ms
         logger.info(
-            "spark generated profile=%s ttft_ms=%s total_ms=%.0f prompt_tokens=%s "
+            "spark generated%s profile=%s ttft_ms=%s total_ms=%.0f prompt_tokens=%s "
             "output_tokens=%s finish=%s",
+            " (structured)" if structured else "",
             profile,
             None if ttft_ms is None else round(ttft_ms),
             total_ms,

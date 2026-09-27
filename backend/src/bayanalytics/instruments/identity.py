@@ -169,6 +169,28 @@ _WORD = re.compile(r"[A-Za-z0-9&.'\-]+")
 _CASHTAG = re.compile(r"\$([A-Za-z]{1,5}(?:[.\-][A-Za-z])?)\b")
 _UPPER_TOKEN = re.compile(r"\b([A-Z]{2,5}(?:[.\-][A-Z])?)\b")
 
+# Apostrophe look-alikes (typographic, modifier letter, fullwidth) fold to "'" before the query
+# is split into words, so a typographic apostrophe is one word exactly like "Apple's".
+_APOSTROPHES = str.maketrans({"\u2019": "'", "\u02bc": "'", "\uff07": "'"})
+# Contractions end in "'s" but are not possessives; their "'s" is never stripped.
+_CONTRACTIONS = frozenset(
+    {
+        "it's",
+        "that's",
+        "what's",
+        "there's",
+        "here's",
+        "let's",
+        "he's",
+        "she's",
+        "who's",
+        "where's",
+        "how's",
+        "when's",
+        "why's",
+    }
+)
+
 
 @dataclass(frozen=True)
 class TickerRow:
@@ -197,6 +219,20 @@ def normalize_name(name: str) -> str:
 
 def normalize_ticker(symbol: str) -> str:
     return symbol.strip().upper().replace(".", "-")
+
+
+def query_words(query: str) -> list[str]:
+    """Lower-case words of a query. A trailing plural possessive ("Platforms'") loses its
+    apostrophe here; a singular one ("Apple's") is kept for ``possessive_base``."""
+    words = [w.strip(".,'\"()?!:;").lower() for w in _WORD.findall(query.translate(_APOSTROPHES))]
+    return [w for w in words if w]
+
+
+def possessive_base(word: str) -> str:
+    """``apple's`` -> ``apple``; contractions (``what's``) and one-letter bases are kept."""
+    if word.endswith("'s") and len(word) > 3 and word not in _CONTRACTIONS:
+        return word[:-2]
+    return word
 
 
 def _ngrams(words: list[str], max_n: int = 4) -> list[tuple[int, int, str]]:
@@ -293,25 +329,34 @@ class InstrumentResolver:
         return self._identity(rows[0], method, confidence=0.98, siblings=rows)
 
     def _name_matches(self, query: str) -> list[tuple[TickerRow, tuple[int, int]]]:
-        words = [w.strip(".,'\"()?!:;").lower() for w in _WORD.findall(query)]
-        words = [w for w in words if w]
+        words = query_words(query)
         hits: list[tuple[TickerRow, tuple[int, int]]] = []
         taken: list[tuple[int, int]] = []
         for start, end, phrase in _ngrams(words):
             if any(s < end and start < e for s, e in taken):
                 continue
-            key = _ALIASES.get(phrase, phrase)
-            key = normalize_name(key)
-            rows = self._by_name.get(key)
-            if not rows and len(phrase.split()) >= 2:
-                rows = self._by_name.get(normalize_name(phrase))
+            rows = self._lookup(phrase)
             if not rows:
-                rows = self._by_prefix.get(key)
+                # A possessive ends a name ("Berkshire Hathaway's"): retry with the last word's
+                # base only after the phrase as written failed, so names that contain "'s"
+                # (McDonald's, Moody's) keep matching exactly as before.
+                base = possessive_base(words[end - 1])
+                if base != words[end - 1]:
+                    rows = self._lookup(" ".join([*words[start : end - 1], base]))
             if rows:
                 for row in rows:
                     hits.append((row, (start, end)))
                 taken.append((start, end))
         return hits
+
+    def _lookup(self, phrase: str) -> list[TickerRow] | None:
+        key = normalize_name(_ALIASES.get(phrase, phrase))
+        rows = self._by_name.get(key)
+        if not rows and len(phrase.split()) >= 2:
+            rows = self._by_name.get(normalize_name(phrase))
+        if not rows:
+            rows = self._by_prefix.get(key)
+        return rows
 
     @staticmethod
     def _prefer_primary_class(rows: list[TickerRow]) -> TickerRow:
@@ -344,10 +389,10 @@ class InstrumentResolver:
         )
 
     def _fuzzy_candidates(self, query: str, limit: int = 3) -> list[InstrumentCandidate]:
-        words = [w.strip(".,'\"()?!:;").lower() for w in _WORD.findall(query)]
+        words = [possessive_base(w) for w in query_words(query)]
         out: list[InstrumentCandidate] = []
         seen: set[str] = set()
-        for _start, _end, phrase in _ngrams([w for w in words if w], max_n=3):
+        for _start, _end, phrase in _ngrams(words, max_n=3):
             for name in difflib.get_close_matches(
                 normalize_name(phrase), self._names, n=2, cutoff=0.86
             ):

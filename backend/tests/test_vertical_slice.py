@@ -113,9 +113,13 @@ async def test_assess_apple_end_to_end() -> None:
     assert names[0] == "analysis.started" and names[-1] == "analysis.completed"
     assert names.count("analysis.completed") == 1 and "analysis.failed" not in names
     # Observable state sequence (AGENT.md 37.2): every stage is visible, in order.
+    # Spark pass 1 (query understanding) runs between instrument.resolved and research: it is
+    # internal, so the first model load shows as spark.loading before research and nothing
+    # else of it is streamed.
     order = [
         "analysis.started",
         "instrument.resolved",
+        "spark.loading",
         "research.started",
         "research.query",
         "research.source_found",
@@ -126,7 +130,6 @@ async def test_assess_apple_end_to_end() -> None:
         "laya.completed",
         "calculation.started",
         "calculation.completed",
-        "spark.loading",
         "spark.started",
         "spark.token",
         "spark.completed",
@@ -142,6 +145,8 @@ async def test_assess_apple_end_to_end() -> None:
     assert positions == sorted(positions), list(zip(order, positions, strict=True))
     assert names.index("laya.started") < names.index("research.completed")  # Laya-directed loop
     assert names.index("spark.loading") < names.index("spark.started") < names.index("spark.token")
+    assert names.count("spark.loading") == 1 and names.count("spark.started") == 1
+    assert names.index("research.completed") < names.index("spark.started")
     started = next(e["data"] for e in events if e["event"] == "analysis.started")
     assert started["execution"] == EXECUTION
     resolved = next(e["data"] for e in events if e["event"] == "instrument.resolved")
@@ -198,6 +203,7 @@ async def test_assess_apple_end_to_end() -> None:
         assert horizon in {"near_term", "next_cycle", "medium_term", "long_term"}
     telemetry = result["telemetry"]
     for key in (
+        "query_understanding_ms",
         "retrieval_ms",
         "normalization_ms",
         "laya_ms",
@@ -221,6 +227,8 @@ async def test_assess_apple_end_to_end() -> None:
         "spark_output_tokens",
         "spark_tokens_per_second",
         "spark_load_ms",
+        "query_understanding_output_tokens",
+        "query_understanding_load_ms",
         "spark_resident_ram_mb",
         "laya_resident_ram_mb",
         "laya_warm_inference_ms",

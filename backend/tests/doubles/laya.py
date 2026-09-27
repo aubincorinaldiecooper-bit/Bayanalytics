@@ -4,7 +4,9 @@ No subprocess, no model. Answers are derived from a handful of well-known state 
 (``revenue_growth_yoy``, ``operating_margin_change_bp``, ``price_return_1m``,
 ``volatility_30d_annualized``, ``pe_5y_percentile``, ``evidence_gaps``, ``sources_count``,
 ``freshness``, ``guidance_hint``, ``sentiment_hint``, ...) with stable defaults when they are
-missing, so orchestration code sees plausible, repeatable decisions. Every choice answer
+missing, so orchestration code sees plausible, repeatable decisions. The
+``question_validation`` nouls (``requirement_<name>``, ``requirements_supported``) confirm at
+0.8 unless ``force`` pins them; the double never reads the question text. Every choice answer
 returns a probability for every option summing to one; every call is recorded in ``calls``.
 
 Token figures are measured with the doubles' word/punctuation tokenizer (``doubles.tokens``):
@@ -202,6 +204,10 @@ def _rule_research_intent(state: Mapping[str, Any], q: LayaQuestion) -> ChoiceAn
             if intent is not None and "retrieve_missing_metric" in keys:
                 return _choice_answer(q, "retrieve_missing_metric", 0.55)
     return _choice_answer(q, "stop_research", 0.8)
+
+
+VALIDATION_CONFIRM = 0.8
+"""Default noul for the question_validation keys: the proposed requirement is confirmed."""
 
 
 def _rule_calculation_pack(state: Mapping[str, Any], q: LayaQuestion) -> ChoiceAnswer:
@@ -480,4 +486,6 @@ class RuleLaya:
         if key == "stale_evidence_matters":
             freshness = _text(state, "freshness")
             return 0.7 if freshness in {"stale", "unknown"} else 0.25
+        if key == "requirements_supported" or key.startswith("requirement_"):
+            return VALIDATION_CONFIRM
         return 0.5
