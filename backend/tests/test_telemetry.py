@@ -38,6 +38,19 @@ def test_sample_process_returns_sane_numbers() -> None:
         assert peak < 1024**4  # kilobytes were converted to bytes, not left as KB or squared
 
 
+def test_lifetime_peak_rss_is_in_bytes_and_physically_plausible() -> None:
+    peak = own_peak_rss_bytes()
+    rss_now = psutil.Process().memory_info().rss
+    assert peak is not None
+    assert peak >= rss_now * 0.5  # a lifetime peak is at least about the current RSS
+    assert peak <= psutil.virtual_memory().total * 2  # and can never dwarf physical memory
+    assert abs(sample_process().peak_rss_mb - peak / 2**20) < 8.0
+    if sys.platform.startswith("linux"):
+        import resource
+
+        assert peak == resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
+
+
 def test_sample_system_returns_sane_numbers() -> None:
     sample = sample_system()
     assert isinstance(sample, SystemSample)

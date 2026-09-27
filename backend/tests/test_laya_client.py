@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import shutil
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -13,11 +14,12 @@ import bayanalytics.laya as laya_pkg
 from bayanalytics.config import Settings
 from bayanalytics.errors import AnalysisError
 from bayanalytics.laya.client import LayaWorkerClient, parse_answer
+from bayanalytics.procenv import child_env
 from bayanalytics.schemas.common import ErrorCode
 from bayanalytics.schemas.decisions import ChoiceAnswer, LayaQuestion, NoulAnswer, ScoreAnswer
 
 WORKER_DIR = Path(laya_pkg.__file__).resolve().parent / "worker"
-STUB = WORKER_DIR / "stub_laya.mjs"
+STUB = Path(__file__).resolve().parent / "doubles" / "stub_laya.mjs"
 SECRET = "SECRET_STATE_VALUE_7f3a"
 
 pytestmark = pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
@@ -64,6 +66,8 @@ async def test_load_health_system_one_round_trip(client: LayaWorkerClient) -> No
     assert info.load_ms >= 0
     assert info.max_len == 512 and info.head_max_len == 192
     assert info.resident_rss_mb is not None and info.resident_rss_mb > 0
+    # The module was injected by path: no package version is measured, so none is reported.
+    assert info.package_version is None
     assert client.stats["load_ms"] == info.load_ms
 
     again = await client.load()  # idempotent
@@ -102,6 +106,75 @@ async def test_system_one_auto_loads(client: LayaWorkerClient) -> None:
     assert (await client.health()).loaded
 
 
+# --- count_tokens: measured by the worker with the loaded module's tokenizer ---------------
+
+
+async def _worker_round_trip(requests: list[dict]) -> list[dict]:
+    """Drive ``worker.mjs`` over its NDJSON protocol directly (no Python client)."""
+    proc = await asyncio.create_subprocess_exec(
+        "node",
+        "worker.mjs",
+        cwd=str(WORKER_DIR),
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env=child_env({"LAYA_MODULE": str(STUB)}),
+    )
+    assert proc.stdin is not None and proc.stdout is not None
+    responses: list[dict] = []
+    try:
+        for request in requests:
+            proc.stdin.write((json.dumps(request) + "\n").encode())
+            await proc.stdin.drain()
+            line = await asyncio.wait_for(proc.stdout.readline(), 15.0)
+            responses.append(json.loads(line))
+    finally:
+        proc.stdin.close()
+        try:
+            await asyncio.wait_for(proc.wait(), 5.0)
+        except TimeoutError:
+            proc.kill()
+            await proc.wait()
+    return responses
+
+
+async def test_worker_count_tokens_op_answers_through_the_stub_tokenizer() -> None:
+    before_load, loaded, counted, empty, bad = await _worker_round_trip(
+        [
+            {"id": "1", "op": "count_tokens", "params": {"texts": ["a b, c"]}},
+            {"id": "2", "op": "load", "params": {}},
+            {"id": "3", "op": "count_tokens", "params": {"texts": ["a b, c"]}},
+            {"id": "4", "op": "count_tokens", "params": {"texts": []}},
+            {"id": "5", "op": "count_tokens", "params": {"texts": ["ok", 7]}},
+        ]
+    )
+    # The worker itself never counts without a loaded module: that is the client's job.
+    assert before_load["id"] == "1" and before_load["ok"] is False
+    assert before_load["error"]["code"] == "NOT_LOADED"
+    assert loaded["ok"] is True and loaded["result"]["loaded"] is True
+    assert loaded["result"]["package_version"] is None  # injected by path, not the package
+    assert counted == {"id": "3", "ok": True, "result": {"counts": [4]}}
+    assert empty["result"] == {"counts": []}
+    assert bad["ok"] is False and bad["error"]["code"] == "BAD_REQUEST"
+
+
+async def test_client_count_tokens_returns_the_worker_counts(client: LayaWorkerClient) -> None:
+    # Counting before load triggers the load, exactly like system_one does.
+    assert client.load_info is None
+    assert await client.count_tokens(["a b, c"]) == [4]
+    assert client.load_info is not None and (await client.health()).loaded
+    assert await client.count_tokens(["", "one", "x-y", "Hello, world!", "a  b"]) == [
+        0,
+        1,
+        3,
+        4,
+        2,
+    ]
+    assert await client.count_tokens([]) == []  # no round trip for nothing
+    assert client.stats["requests"] == 0  # count_tokens is not a system_one request
+    assert client.restarts == 0
+
+
 async def test_request_timeout_maps_to_laya_inference_failed() -> None:
     client = make_client(laya_request_timeout_s=0.3)
     try:
@@ -124,7 +197,8 @@ async def test_worker_error_maps_with_worker_code(client: LayaWorkerClient) -> N
     err = info.value
     assert err.code is ErrorCode.LAYA_INFERENCE_FAILED
     assert err.details["worker_code"] == "LAYA_ERROR"
-    assert err.details["message"] == "stub failure"
+    assert err.details["reason"] == "library_error"
+    assert "message" not in err.details  # the worker's free text stays in the server log
     assert SECRET not in str(err.details)
     # The worker survives a thrown error: no restart, next call works.
     result = await client.system_one({"a": 1}, questions())

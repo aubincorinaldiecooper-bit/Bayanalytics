@@ -1,7 +1,9 @@
-"""EDGAR (seed, submissions, company facts), Stooq and benchmark tests against fixtures."""
+"""EDGAR (ticker directory, submissions, company facts), Stooq and benchmark tests against
+the synthetic fixture."""
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, date, datetime
 from pathlib import Path
 
@@ -9,16 +11,15 @@ import pytest
 
 from bayanalytics.config import Settings
 from bayanalytics.research.edgar import (
+    COMPANY_TICKERS_URL,
     CONCEPT_MAP,
     FACT_FORMS,
     EdgarClient,
     fiscal_period_label,
-    load_company_tickers_seed,
     parse_company_facts,
     parse_company_tickers,
     select_filings,
 )
-from bayanalytics.research.fixture_provider import FixtureFetcher
 from bayanalytics.research.prices import (
     BENCHMARKS,
     StooqPrices,
@@ -28,6 +29,9 @@ from bayanalytics.research.prices import (
     to_stooq_symbol,
 )
 from bayanalytics.research.provider import ResearchProviderError
+from bayanalytics.research.sources import canonical_url
+from bayanalytics.schemas.common import stable_id
+from doubles import FixtureFetcher
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures" / "research" / "apple"
 AS_OF = datetime(2026, 9, 26, tzinfo=UTC)
@@ -61,25 +65,8 @@ def edgar(settings: Settings) -> EdgarClient:
 
 
 # --------------------------------------------------------------------------------------
-# seed / tickers
+# ticker directory
 # --------------------------------------------------------------------------------------
-
-
-def test_seed_loads_and_contains_large_caps() -> None:
-    seed = load_company_tickers_seed()
-    assert len(seed) >= 75
-    by_ticker = {row["ticker"]: row for row in seed}
-    assert by_ticker["AAPL"]["cik_str"] == 320193
-    assert by_ticker["MSFT"]["cik_str"] == 789019
-    assert by_ticker["NVDA"]["cik_str"] == 1045810
-    assert by_ticker["GOOGL"]["cik_str"] == by_ticker["GOOG"]["cik_str"] == 1652044
-    assert by_ticker["XYZ"]["aliases"] == ["SQ"]
-    assert by_ticker["AAL"]["cik_str"] == 6201 and by_ticker["AXP"]["cik_str"] == 4962
-    for row in seed:
-        assert isinstance(row["cik_str"], int) and row["cik_str"] > 0
-        assert row["ticker"] == row["ticker"].upper()
-        assert row["title"]
-        assert row.get("exchange") in (None, "NASDAQ", "NYSE")
 
 
 def test_parse_company_tickers_edgar_shape() -> None:
@@ -96,17 +83,38 @@ def test_parse_company_tickers_edgar_shape() -> None:
         parse_company_tickers("nope")
 
 
-async def test_company_tickers_live_and_seed_fallback(
+async def test_company_tickers_live_directory_only(
     edgar: EdgarClient, settings: Settings, tmp_path: Path
 ) -> None:
     rows = await edgar.company_tickers()
-    assert edgar.seed_fallback is False
     assert {r["ticker"] for r in rows} >= {"AAPL", "MSFT", "AAL", "AXP"}
+    assert all(isinstance(r["cik_str"], int) and r["ticker"] == r["ticker"].upper() for r in rows)
+    # There is no packaged directory to fall back on: an unreachable one is an outage.
+    assert not hasattr(edgar, "seed_fallback")
     (tmp_path / "pages.json").write_text('{"fixture": true, "pages": {}}')
     offline = EdgarClient(FixtureFetcher(tmp_path), settings)
-    rows = await offline.company_tickers()
-    assert offline.seed_fallback is True
-    assert any(r["ticker"] == "AAPL" and r["cik_str"] == 320193 for r in rows)
+    with pytest.raises(ResearchProviderError):
+        await offline.company_tickers()
+    # A directory that answers with no companies, or with something other than JSON, is
+    # unavailable too: nothing is guessed from a partial list.
+    for name, body in (("empty.json", "{}"), ("broken.json", "<html>maintenance</html>")):
+        (tmp_path / name).write_text(body)
+        (tmp_path / "pages.json").write_text(
+            json.dumps(
+                {
+                    "fixture": True,
+                    "pages": {
+                        COMPANY_TICKERS_URL: {
+                            "status": 200,
+                            "content_type": "application/json",
+                            "body_file": name,
+                        }
+                    },
+                }
+            )
+        )
+        with pytest.raises(ResearchProviderError):
+            await EdgarClient(FixtureFetcher(tmp_path), settings).company_tickers()
 
 
 # --------------------------------------------------------------------------------------
@@ -222,6 +230,12 @@ async def test_company_facts_rows_follow_contract(edgar: EdgarClient) -> None:
     source = facts.source
     assert source.title == "SEC XBRL company facts"
     assert source.url == "https://data.sec.gov/api/xbrl/companyfacts/CIK0000320193.json"
+    # Provenance ids are a function of the canonical URL: the same facts endpoint yields the
+    # same id in every run (and every row points at it).
+    assert source.source_id == stable_id("src", canonical_url(source.url))
+    again = await edgar.company_facts(320193, as_of=AS_OF, symbol="AAPL")
+    assert again.source.source_id == source.source_id
+    assert all(r["source_id"] == source.source_id for r in again.rows)
     assert source.source_type == "regulatory_filing" and source.redistribution == "allowed"
     assert source.symbol == "AAPL" and source.extraction_method == "json"
     assert source.published_at == datetime(2026, 7, 31, tzinfo=UTC)
@@ -340,6 +354,7 @@ async def test_filing_source_record_and_excerpt(edgar: EdgarClient) -> None:
         ten_k, symbol="AAPL", as_of=AS_OF, fiscal_year_end=subs.fiscal_year_end, excerpt=excerpt
     )
     assert source.title == "10-K filed 2025-10-31"
+    assert source.source_id == stable_id("src", canonical_url(ten_k.index_url))
     assert source.fiscal_period == "FY2025"
     assert source.source_type == "regulatory_filing" and source.publisher == "SEC EDGAR"
     assert source.url == ten_k.index_url
@@ -390,6 +405,7 @@ async def test_stooq_daily_from_fixture_and_as_of_cut() -> None:
     assert series.split_adjusted is True and series.dividend_adjusted is False
     assert series.currency == "USD" and series.exchange_timezone == "America/New_York"
     assert series.source_id == source.source_id
+    assert source.source_id == stable_id("src", canonical_url(source.url))
     assert source.source_type == "market_data" and source.redistribution == "metadata_only"
     assert source.terms_note == "Stooq terms: personal use, verify before redistribution"
     assert source.url == "https://stooq.com/q/d/l/?s=aapl.us&i=d"

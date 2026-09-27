@@ -4,6 +4,7 @@ runtimes. These tests do not depend on the store/laya/spark implementations."""
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -27,7 +28,7 @@ from bayanalytics.schemas.decisions import LayaDecision, LayaResult
 from bayanalytics.schemas.events import AnalysisEvent
 from bayanalytics.schemas.evidence import NormalizedFact, SourceRecord
 from bayanalytics.schemas.requests import CreateAnalysisRequest
-from bayanalytics.schemas.results import AnalysisResult
+from bayanalytics.schemas.results import AnalysisResult, ExecutionInfo
 from bayanalytics.schemas.transcriptions import Transcription
 from bayanalytics.spark.base import ProfileSpec, SparkGeneration, SparkStreamStats
 
@@ -91,6 +92,9 @@ class FakeLaya:
     async def system_one(self, state: Any, questions: Any) -> LayaResult:
         return LayaResult(answers={})
 
+    async def count_tokens(self, texts: Any) -> list[int]:
+        return [len(str(t).split()) for t in texts]
+
     async def health(self) -> LayaHealth:
         return LayaHealth(ok=True, loaded=True)
 
@@ -122,6 +126,10 @@ class FakeSpark:
             name=profile, context_ceiling=32768, kv_cache_type="f16", min_available_mb=0
         )  # type: ignore[arg-type]
 
+    @contextlib.asynccontextmanager
+    async def session(self, profile, ctx):
+        yield _FakeSparkSession(self, profile)
+
     async def run(self, profile, messages, on_token, ctx, options=None) -> SparkGeneration:
         await on_token("hello")
         return SparkGeneration(
@@ -130,6 +138,19 @@ class FakeSpark:
                 profile=profile, context_ceiling=32768, kv_cache_type="f16", total_ms=1
             ),
         )
+
+
+class _FakeSparkSession:
+    def __init__(self, spark: FakeSpark, profile: str) -> None:
+        self.spec = spark.profile_spec(profile)
+        self._spark = spark
+        self._profile = profile
+
+    async def count_prompt_tokens(self, messages) -> int:
+        return sum(len(m.content.split()) for m in messages)
+
+    async def generate(self, messages, on_token, options=None) -> SparkGeneration:
+        return await self._spark.run(self._profile, messages, on_token, None, options)
 
 
 class FakeTranscriber:
@@ -182,7 +203,7 @@ async def _pipeline_raises(job: AnalysisJob, ctx: AnalysisContext) -> AnalysisRe
 
 
 def _runtime(pipeline, *, deep: bool = True, voice: bool = True) -> Runtime:
-    settings = Settings(laya_mode="mock", spark_mode="mock", whisper_mode="mock")
+    settings = Settings()
     store = FakeStore()
     bus = AnalysisEventBus(store)
     runner = AnalysisRunner(store, bus, pipeline, versions={"normalization_version": "t"})
@@ -311,6 +332,83 @@ async def test_runner_contract_violation_becomes_internal_error() -> None:
     assert events[-1].data["error"]["code"] == "INTERNAL_ERROR"
 
 
+async def test_runner_reads_versions_at_submit_time() -> None:
+    calls: list[int] = []
+
+    def versions() -> dict[str, Any]:
+        calls.append(1)
+        return {
+            "normalization_version": "n-1",
+            "laya_schema_version": "l-1",
+            "spark_artifact": None,  # not measured yet: never a configured label
+            "spark_runtime": "b1234",
+        }
+
+    rt = _runtime(_pipeline_ok)
+    rt.runner = AnalysisRunner(rt.store, rt.bus, _pipeline_ok, versions=versions)
+    await rt.runner.start()
+    assert calls == []  # nothing is read at construction
+    job = await rt.runner.submit(
+        CreateAnalysisRequest(query="Assess Apple."), resolved_horizon="multi_horizon", budget=None
+    )
+    assert calls == [1]
+    assert job.normalization_version == "n-1" and job.laya_schema_version == "l-1"
+    assert job.spark_artifact is None and job.spark_runtime == "b1234"
+    [_ async for _ in rt.bus.stream(job.analysis_id)]
+    stored = await rt.store.get_job(job.analysis_id)
+    assert stored is not None and stored.spark_artifact is None
+    # A plain dict still works, and an empty one leaves the fields empty/None.
+    plain = AnalysisRunner(rt.store, rt.bus, _pipeline_ok, versions={})
+    job2 = await plain.submit(
+        CreateAnalysisRequest(query="Assess Apple."), resolved_horizon="near_term", budget=None
+    )
+    assert job2.spark_artifact is None and job2.normalization_version == ""
+    [_ async for _ in rt.bus.stream(job2.analysis_id)]
+
+
+async def test_admission_reserves_the_slot_before_the_store_write() -> None:
+    class SuspendingStore(FakeStore):
+        """``create_job`` suspends, as a real database round trip would."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.gate = asyncio.Event()
+
+        async def create_job(self, job: AnalysisJob) -> None:
+            await self.gate.wait()
+            await super().create_job(job)
+
+    store = SuspendingStore()
+    bus = AnalysisEventBus(store)
+    runner = AnalysisRunner(store, bus, _pipeline_ok, versions={}, max_active=4)
+    await runner.start()
+
+    async def submit() -> AnalysisJob | AnalysisError:
+        try:
+            return await runner.submit(
+                CreateAnalysisRequest(query="Assess Apple."),
+                resolved_horizon="multi_horizon",
+                budget=None,
+            )
+        except AnalysisError as exc:
+            return exc
+
+    tasks = [asyncio.create_task(submit()) for _ in range(5)]
+    await asyncio.sleep(0)  # every submit has reached the store write (or been refused)
+    assert runner.active_count == 4  # admissions awaiting the write already count
+    store.gate.set()
+    outcomes = await asyncio.gather(*tasks)
+    refused = [o for o in outcomes if isinstance(o, AnalysisError)]
+    admitted = [o for o in outcomes if isinstance(o, AnalysisJob)]
+    assert len(refused) == 1 and len(admitted) == 4
+    assert refused[0].code == ErrorCode.TOO_MANY_ANALYSES
+    assert refused[0].details == {"active": 4, "limit": 4}
+    for job in admitted:
+        [_ async for _ in bus.stream(job.analysis_id)]
+    await asyncio.sleep(0.01)
+    assert runner.active_count == 0
+
+
 async def test_runner_marks_interrupted_on_start() -> None:
     rt = _runtime(_pipeline_ok)
     stale = AnalysisJob(
@@ -332,6 +430,7 @@ async def test_runner_marks_interrupted_on_start() -> None:
 # ---------------------------------------------------------------- API
 
 
+@contextlib.asynccontextmanager
 async def _client(rt: Runtime) -> AsyncIterator[httpx.AsyncClient]:
     app = create_app(rt.settings, runtime=rt)
     async with app.router.lifespan_context(app):
@@ -342,7 +441,7 @@ async def _client(rt: Runtime) -> AsyncIterator[httpx.AsyncClient]:
 
 async def test_api_create_stream_get_cancel() -> None:
     rt = _runtime(_pipeline_ok)
-    async for client in _client(rt):
+    async with _client(rt) as client:
         health = await client.get("/api/v1/health")
         assert health.status_code == 200 and health.json()["status"] == "ok"
         caps = await client.get("/api/v1/capabilities")
@@ -387,7 +486,7 @@ async def test_api_create_stream_get_cancel() -> None:
 
 async def test_api_deep_unavailable_is_structured() -> None:
     rt = _runtime(_pipeline_ok, deep=False)
-    async for client in _client(rt):
+    async with _client(rt) as client:
         caps = await client.get("/api/v1/capabilities")
         deep = caps.json()["profiles"]["deep"]
         assert deep["available"] is False and deep["code"] == "DEEP_PROFILE_UNAVAILABLE"
@@ -401,7 +500,7 @@ async def test_api_deep_unavailable_is_structured() -> None:
 
 async def test_api_validation_and_transcription() -> None:
     rt = _runtime(_pipeline_ok, voice=False)
-    async for client in _client(rt):
+    async with _client(rt) as client:
         bad = await client.post("/api/v1/analyses", json={"query": "   "})
         assert bad.status_code == 422 and bad.json()["error"]["code"] == "INVALID_REQUEST"
         bad2 = await client.post("/api/v1/analyses", json={"query": "x", "profile": "turbo"})
@@ -411,7 +510,7 @@ async def test_api_validation_and_transcription() -> None:
         )
         assert tr.status_code == 503 and tr.json()["error"]["code"] == "WHISPER_FAILED"
     rt2 = _runtime(_pipeline_ok, voice=True)
-    async for client in _client(rt2):
+    async with _client(rt2) as client:
         tr = await client.post(
             "/api/v1/transcriptions", files={"audio": ("a.wav", b"RIFF....", "audio/wav")}
         )
@@ -420,6 +519,61 @@ async def test_api_validation_and_transcription() -> None:
             "/api/v1/transcriptions", files={"audio": ("a.wav", b"", "audio/wav")}
         )
         assert empty.status_code == 422
+
+
+async def test_result_is_readable_the_moment_the_terminal_event_arrives() -> None:
+    class SlowStore(FakeStore):
+        """Writes suspend, as a real database would."""
+
+        async def save_result(self, result: AnalysisResult) -> None:
+            await asyncio.sleep(0)
+            await super().save_result(result)
+
+        async def update_job(self, job: AnalysisJob) -> None:
+            await asyncio.sleep(0)
+            await super().update_job(job)
+
+    store = SlowStore()
+    bus = AnalysisEventBus(store)
+    runner = AnalysisRunner(store, bus, _pipeline_ok, versions={})
+    await runner.start()
+    job = await runner.submit(
+        CreateAnalysisRequest(query="Assess Apple."), resolved_horizon="multi_horizon", budget=None
+    )
+    seen_terminal = False
+    async for event in bus.stream(job.analysis_id):
+        if event.terminal:
+            seen_terminal = True
+            result = await store.get_result(job.analysis_id)
+            assert result is not None and result.status == "completed"  # GET must not 404
+            stored = await store.get_job(job.analysis_id)
+            assert stored is not None and stored.status == "completed"
+    assert seen_terminal
+
+
+async def test_event_published_during_replay_is_delivered_exactly_once() -> None:
+    class InterleavingStore(FakeStore):
+        """``list_events`` suspends (a real query would), so a publish can land in between."""
+
+        async def list_events(self, analysis_id: str, after_seq: int = 0) -> list[AnalysisEvent]:
+            await asyncio.sleep(0)
+            return await super().list_events(analysis_id, after_seq)
+
+    store = InterleavingStore()
+    bus = AnalysisEventBus(store)
+    bus.register("an_x")
+    await bus.publish("an_x", "analysis.started", {"query": "q"})
+
+    async def collect() -> list[int]:
+        return [e.seq async for e in bus.stream("an_x")]
+
+    task = asyncio.create_task(collect())
+    await asyncio.sleep(0)  # subscriber registered, replay query in flight
+    await bus.publish("an_x", "spark.token", {"text": "a"})  # queued live AND in the replay
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    await bus.publish("an_x", "analysis.completed", {"status": "completed"})
+    assert await task == [1, 2, 3]
 
 
 # ---------------------------------------------------------------- regressions (PR review)
@@ -488,7 +642,7 @@ async def test_interrupted_jobs_get_a_terminal_event_on_startup() -> None:
 async def test_api_key_gate_when_configured() -> None:
     rt = _runtime(_pipeline_ok)
     rt.settings = rt.settings.model_copy(update={"api_key": "s3cret"})
-    async for client in _client(rt):
+    async with _client(rt) as client:
         assert (await client.get("/api/v1/health")).status_code == 401
         denied = await client.post("/api/v1/analyses", json={"query": "Assess Apple."})
         assert denied.status_code == 401 and denied.json()["error"]["code"] == "UNAUTHORIZED"
@@ -519,7 +673,7 @@ async def test_body_limits() -> None:
     rt.settings = rt.settings.model_copy(
         update={"max_request_body_bytes": 200, "max_upload_bytes": 300}
     )
-    async for client in _client(rt):
+    async with _client(rt) as client:
         big = await client.post("/api/v1/analyses", json={"query": "x" * 500})
         assert big.status_code == 413 and big.json()["error"]["code"] == "INVALID_REQUEST"
         small = await client.post("/api/v1/analyses", json={"query": "Assess Apple."})
@@ -533,7 +687,7 @@ async def test_body_limits() -> None:
 async def test_admission_control_limits_concurrent_analyses() -> None:
     rt = _runtime(_pipeline_slow)
     rt.runner._max_active = 2
-    async for client in _client(rt):
+    async with _client(rt) as client:
         first = await client.post("/api/v1/analyses", json={"query": "Assess Apple."})
         second = await client.post("/api/v1/analyses", json={"query": "Assess Apple."})
         third = await client.post("/api/v1/analyses", json={"query": "Assess Apple."})
@@ -563,6 +717,76 @@ async def test_bus_forgets_terminal_bookkeeping_but_replays_from_store() -> None
     assert replay[-1].terminal
 
 
+async def test_unhandled_exception_envelope_never_leaks_the_exception_text() -> None:
+    rt = _runtime(_pipeline_ok)
+
+    def boom(profile: str) -> ProfileCapability:
+        raise RuntimeError("secret detail: /Users/me/models/spark.gguf")
+
+    rt.spark.availability = boom  # type: ignore[method-assign]
+    app = create_app(rt.settings, runtime=rt)
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post("/api/v1/analyses", json={"query": "Assess Apple."})
+    assert resp.status_code == 500
+    error = resp.json()["error"]
+    assert error["code"] == "INTERNAL_ERROR" and error["retryable"] is True
+    assert "secret" not in resp.text and "spark.gguf" not in resp.text
+    assert "RuntimeError" not in error["message"]
+    assert error["details"] == {"exception": "RuntimeError"}
+
+
+async def test_health_overall_follows_the_worst_component() -> None:
+    rt = _runtime(_pipeline_ok, voice=False)
+    async with _client(rt) as client:
+        health = (await client.get("/api/v1/health")).json()
+        # "disabled" is a truthful state, not a degradation
+        assert health["status"] == "ok"
+        assert {c["name"]: c["status"] for c in health["components"]} == {
+            "laya": "ok",
+            "spark": "ok",
+            "whisper": "disabled",
+            "store": "ok",
+        }
+        assert health["execution"] == {
+            "spark_mode": "managed",
+            "whisper_mode": "disabled",
+            "deployment": "local",
+            "search_configured": False,
+        }
+        assert set(ExecutionInfo.model_fields) == set(health["execution"])
+        caps = (await client.get("/api/v1/capabilities")).json()
+        assert caps["execution"] == health["execution"] and caps["voice"] is False
+
+    degraded = _runtime(_pipeline_ok)
+
+    async def loading() -> LayaHealth:
+        return LayaHealth(ok=True, loaded=False, detail="loading")
+
+    degraded.laya.health = loading  # type: ignore[method-assign]
+    async with _client(degraded) as client:
+        health = (await client.get("/api/v1/health")).json()
+        assert health["status"] == "degraded"
+        assert next(c for c in health["components"] if c["name"] == "laya")["status"] == "degraded"
+
+    class DownStore(FakeStore):
+        async def count_active(self) -> int:
+            raise ConnectionError("database gone")
+
+    down = _runtime(_pipeline_ok)
+    down.store = DownStore()
+    down.bus = AnalysisEventBus(down.store)
+    down.runner = AnalysisRunner(down.store, down.bus, _pipeline_ok, versions={})
+    down.laya.health = loading  # type: ignore[method-assign]  # degraded AND down -> down
+    async with _client(down) as client:
+        health = (await client.get("/api/v1/health")).json()
+        assert health["status"] == "down"
+        store = next(c for c in health["components"] if c["name"] == "store")
+        assert store["status"] == "down" and store["detail"] == "ConnectionError"
+        assert "database gone" not in (await client.get("/api/v1/health")).text
+
+
 async def test_health_is_cached_briefly() -> None:
     rt = _runtime(_pipeline_ok)
     rt.settings = rt.settings.model_copy(update={"health_cache_s": 10.0})
@@ -574,7 +798,7 @@ async def test_health_is_cached_briefly() -> None:
         return await original()
 
     rt.laya.health = counting  # type: ignore[method-assign]
-    async for client in _client(rt):
+    async with _client(rt) as client:
         await client.get("/api/v1/health")
         await client.get("/api/v1/health")
         await client.get("/api/v1/health")

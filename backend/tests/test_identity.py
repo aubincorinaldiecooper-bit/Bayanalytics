@@ -96,7 +96,23 @@ def test_no_match_gives_fuzzy_candidates(resolver: InstrumentResolver) -> None:
     assert exc2.value.http_status == 422
 
 
-def test_stoplist_prevents_false_ticker(resolver: InstrumentResolver) -> None:
-    # "AI" and "CEO" are upper-case tokens but never tickers; the name resolves instead.
-    identity = resolver.resolve("Is the AI CEO of American Airlines confident?")
-    assert identity.symbol == "AAL"
+def test_stoplist_blocks_real_tickers_that_are_common_words() -> None:
+    rows = [
+        *ROWS,
+        {"cik_str": 1373715, "ticker": "NOW", "title": "ServiceNow, Inc.", "exchange": "NYSE"},
+        {"cik_str": 1577526, "ticker": "AI", "title": "C3.ai, Inc.", "exchange": "NYSE"},
+        {"cik_str": 1385157, "ticker": "CEO", "title": "CNOOC Ltd", "exchange": "NYSE"},
+    ]
+    resolver = InstrumentResolver(rows)
+    # NOW, AI and CEO are listed tickers, but as bare upper-case words they must not resolve.
+    identity = resolver.resolve("Is the AI CEO of American Airlines confident NOW?")
+    assert identity.symbol == "AAL" and identity.resolution_method == "name_match"
+    assert resolver.resolve("How is $NOW doing?").symbol == "NOW"  # a cashtag still works
+    assert resolver.resolve("Assess $ai").symbol == "AI"
+
+
+def test_resolver_has_no_directory_completeness_flag() -> None:
+    # The live SEC directory is the only ticker source: there is no partial-seed mode left.
+    resolver = InstrumentResolver(ROWS)
+    assert not hasattr(resolver, "directory_complete")
+    assert len(resolver.rows) == len(ROWS)

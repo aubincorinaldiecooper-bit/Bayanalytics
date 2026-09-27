@@ -245,6 +245,9 @@ class TestFormatting:
             (18.2, "percent", "18.2%"),
             (-7.4, "percent", "-7.4%"),
             (34.1, "ratio", "34.1\u00d7"),
+            (1.15, "coefficient", "1.15"),
+            (-0.4, "coefficient", "-0.40"),
+            (1.0, "coefficient", "1.00"),
             (6.13, "USD_per_share", "$6.13"),
             (-0.52, "USD_per_share", "-$0.52"),
             (15.3e9, "shares", "15.3B shares"),
@@ -775,7 +778,8 @@ class TestRunPack:
     def test_beta_and_drawdown_vs_market(self, all_results, evidence):
         beta = all_results["beta_1y_vs_market"]
         assert beta.status == "computed"
-        assert beta.unit == "ratio"
+        assert beta.unit == "coefficient"  # a beta is dimensionless, not a multiple
+        assert beta.display == f"{beta.value:.2f}" and "\u00d7" not in beta.display
         assert any("common sessions" in n for n in beta.notes)
         assert beta.meta["window"]["points"] >= 200
         dd = all_results["drawdown_vs_market_1y"]
@@ -927,6 +931,55 @@ class TestOperandResolver:
         resolver = OperandResolver(build_evidence(), datetime(2026, 1, 15, tzinfo=UTC))
         assert resolver.latest_fq("revenue").period_label == "Q4 FY2025"
         assert resolver.ttm("revenue").period_label == "TTM to 2025-09-27"
+
+    def test_fact_with_period_end_after_as_of_and_no_publication_date_is_invisible(self):
+        period = Period(
+            kind="fiscal_quarter",
+            fiscal_year=2027,
+            fiscal_period="Q1",
+            start=date(2026, 9, 27),
+            end=date(2026, 12, 26),
+            label="Q1 FY2027",
+        )
+        future = _fact("revenue", 999e9, period, published_at=None)
+        resolver = OperandResolver(build_evidence(facts=[*quarterly_facts(), future]), AS_OF)
+        assert resolver.latest_fq("revenue").period_label == "Q3 FY2026"
+        assert resolver.ttm("revenue").period_label == "TTM to 2026-06-27"
+
+    def test_ttm_refuses_quarters_reported_in_different_currencies(self):
+        facts = quarterly_facts()
+        latest_revenue = next(
+            f for f in facts if f.metric == "revenue" and f.period.end == date(2026, 6, 27)
+        )
+        facts[facts.index(latest_revenue)] = latest_revenue.model_copy(
+            update={"currency": "EUR", "unit": "EUR"}
+        )
+        resolver = OperandResolver(build_evidence(facts=facts), AS_OF)
+        assert resolver.ttm("revenue") is None  # never a USD+EUR sum
+        assert resolver.ttm("gross_profit") is not None
+
+    def test_year_ago_and_previous_quarter_need_the_same_unit_and_currency(self):
+        facts = quarterly_facts()
+
+        def revenue(end: date) -> NormalizedFact:
+            return next(f for f in facts if f.metric == "revenue" and f.period.end == end)
+
+        year_ago = revenue(date(2025, 6, 28))
+        previous = revenue(date(2026, 3, 28))
+        facts[facts.index(year_ago)] = year_ago.model_copy(
+            update={"currency": "EUR", "unit": "EUR"}
+        )
+        facts[facts.index(previous)] = previous.model_copy(update={"unit": "USD_per_share"})
+        resolver = OperandResolver(build_evidence(facts=facts), AS_OF)
+        latest = resolver.latest_fq("revenue")
+        assert latest.period_label == "Q3 FY2026"
+        # A EUR quarter is not "the same quarter a year ago" for a USD figure, and a per-share
+        # row is not the previous quarter of a total; neither falls back to a date window.
+        assert resolver.prior_year_quarter("revenue", latest) is None
+        assert resolver.previous_quarter("revenue", latest) is None
+        clean = OperandResolver(build_evidence(), AS_OF)
+        assert clean.prior_year_quarter("revenue", latest).period_label == "Q3 FY2025"
+        assert clean.previous_quarter("revenue", latest).period_label == "Q2 FY2026"
 
     def test_ttm_and_prior_quarter_lookups(self):
         resolver = OperandResolver(build_evidence(), AS_OF)

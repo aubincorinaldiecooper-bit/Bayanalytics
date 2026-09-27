@@ -1,4 +1,5 @@
-"""whisper.cpp CLI wrapper (with a fake ``whisper-cli``), mocks and the builder."""
+"""whisper.cpp CLI wrapper (with a fake ``whisper-cli``), the disabled/fixed transcribers and
+the builder."""
 
 from __future__ import annotations
 
@@ -11,19 +12,21 @@ import time
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from bayanalytics.config import Settings
 from bayanalytics.errors import AnalysisError
 from bayanalytics.schemas.common import ErrorCode
 from bayanalytics.whisper import (
     DisabledTranscriber,
-    MockTranscriber,
     WhisperCliTranscriber,
     build_transcriber,
     inspect_wav_bytes,
 )
 from bayanalytics.whisper.audio import write_silence_wav
 from bayanalytics.whisper.client import input_suffix, resolve_binary
+from bayanalytics.whisper.disabled import DisabledTranscriber as DisabledFromModule
+from doubles import FixedTranscriber
 
 FAKE_WHISPER_OK = """#!/bin/sh
 # fake whisper-cli: writes <outbase>.json, echoes whisper.cpp-style timings on stderr
@@ -265,7 +268,7 @@ def test_available_logic(tmp_path: Path, model_file: Path) -> None:
     assert not none_model.available()
 
     wrong_mode = WhisperCliTranscriber(
-        make_settings(tmp_path, FAKE_WHISPER_OK, model_file, whisper_mode="mock")
+        make_settings(tmp_path, FAKE_WHISPER_OK, model_file, whisper_mode="disabled")
     )
     assert not wrong_mode.available()
     assert wrong_mode.unavailable_reason() == "whisper_mode is not cli"
@@ -318,24 +321,25 @@ def test_input_suffix() -> None:
     assert input_suffix(None, "text/plain") == ".bin"
 
 
-# --- mocks and builder ----------------------------------------------------------------------
+# --- doubles and builder --------------------------------------------------------------------
 
 
-async def test_mock_transcriber(wav16k: bytes, wav44k: bytes) -> None:
-    mock = MockTranscriber()
-    assert mock.available()
-    result = await mock.transcribe(wav16k, "clip.wav", "audio/wav")
+async def test_fixed_transcriber_double(wav16k: bytes, wav44k: bytes) -> None:
+    fixed = FixedTranscriber()
+    assert fixed.available()
+    result = await fixed.transcribe(wav16k, "clip.wav", "audio/wav")
     assert result.text == "Assess Apple."
-    assert result.duration_ms == 1500
+    assert result.duration_ms == 1500  # measured from the WAV header, not configured
     assert result.transcription_ms >= 0
-    result = await mock.transcribe(wav44k, "clip.wav")
+    assert fixed.stats["duration_ms"] == 1500 and fixed.stats["input_bytes"] == len(wav16k)
+    result = await fixed.transcribe(wav44k, "clip.wav")
     assert result.duration_ms == 900
-    result = await mock.transcribe(b"definitely not audio", "clip.webm", "audio/webm")
+    result = await fixed.transcribe(b"definitely not audio", "clip.webm", "audio/webm")
     assert result.duration_ms == 0
-    assert mock.calls == 3
-    custom = MockTranscriber(text="Assess Microsoft over the next twelve months.")
+    assert fixed.calls == 3
+    custom = FixedTranscriber(text="Assess Microsoft over the next twelve months.")
     assert (await custom.transcribe(b"", "x.wav")).text.startswith("Assess Microsoft")
-    await mock.close()
+    await fixed.close()
 
 
 async def test_disabled_transcriber(wav16k: bytes) -> None:
@@ -356,10 +360,16 @@ async def test_disabled_transcriber(wav16k: bytes) -> None:
 def test_build_transcriber(tmp_path: Path, model_file: Path) -> None:
     assert isinstance(build_transcriber(Settings()), DisabledTranscriber)
     assert isinstance(build_transcriber(Settings(whisper_mode="disabled")), DisabledTranscriber)
-    assert isinstance(build_transcriber(Settings(whisper_mode="mock")), MockTranscriber)
+    assert DisabledTranscriber is DisabledFromModule
     cli = build_transcriber(make_settings(tmp_path, FAKE_WHISPER_OK, model_file))
     assert isinstance(cli, WhisperCliTranscriber) and cli.available()
     assert not build_transcriber(Settings(whisper_mode="cli")).available()  # nothing installed
+    # The product knows only cli and disabled; a double is never selectable by configuration.
+    with pytest.raises(ValidationError):
+        Settings(whisper_mode="mock")
+    import bayanalytics.whisper as whisper_pkg
+
+    assert not any("mock" in name.lower() for name in whisper_pkg.__all__)
 
 
 def test_inspect_wav_bytes(wav16k: bytes, wav44k: bytes) -> None:

@@ -1,10 +1,16 @@
-"""LlamaSparkClient / LlamaServerManager against a fake llama-server (httpx.MockTransport)."""
+"""LlamaSparkClient / LlamaServerManager against a fake llama-server (httpx.MockTransport).
+
+The fake implements ``/health``, ``/props``, ``/apply-template``, ``/tokenize`` and the
+streaming ``/v1/chat/completions``, records every request with its headers, and can demand
+an API key. Its tokenizer is the deterministic word/punctuation rule shared by the doubles.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import json
 import os
+import re
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -32,15 +38,27 @@ from bayanalytics.spark.profiles import (
 
 SENTINEL = "PROMPT-CONTENT-MUST-NOT-LEAK"
 OK_PROBE = static_probe(available_mb=6000.0, total_mb=8192.0)
+_TOKEN = re.compile(r"\w+|[^\w\s]")
+
+
+def render_prompt(messages: list[dict[str, Any]]) -> str:
+    """The fake server's chat template: role-tagged turns plus the assistant cue."""
+    return "".join(f"<|{m['role']}|>\n{m['content']}\n" for m in messages) + "<|assistant|>\n"
+
+
+def tokenize(text: str) -> list[int]:
+    """The fake server's tokenizer: one id per word or punctuation mark."""
+    return [index + 1 for index, _ in enumerate(_TOKEN.findall(text))]
 
 
 # --- fakes ------------------------------------------------------------------------------------
 
 
 class FakeProcess:
-    def __init__(self, server: FakeLlamaServer, argv: list[str]) -> None:
+    def __init__(self, server: FakeLlamaServer, argv: list[str], env: dict[str, str]) -> None:
         self.server = server
         self.argv = argv
+        self.env = dict(env)
         self.pid = os.getpid()  # a live pid so psutil RSS sampling works
         self.returncode: int | None = None
         self._exited = asyncio.Event()
@@ -88,9 +106,21 @@ class FakeLlamaServer:
         self.requests: list[dict[str, Any]] = []
         self.active = 0
         self.overlap = False
+        # authentication: when set, every protected path needs "Authorization: Bearer <key>"
+        self.api_key_required: str | None = None
+        self.protected_paths: set[str] | None = None  # None = every path
+        self.transport_error_paths: set[str] = {"/v1/chat/completions"}
+        # measured prompt size endpoints
+        self.template_status = 200
+        self.tokenize_status = 200
+        self.template_shape_ok = True
+        self.tokenize_shape_ok = True
+        self.template_requests: list[dict[str, Any]] = []
+        self.tokenize_requests: list[dict[str, Any]] = []
+        self.seen: list[tuple[str, dict[str, str]]] = []  # (path, lower-cased headers)
 
-    async def spawn(self, argv: list[str]) -> FakeProcess:
-        process = self.process_cls(self, argv)
+    async def spawn(self, argv: list[str], env: dict[str, str]) -> FakeProcess:
+        process = self.process_cls(self, argv, env)
         self.processes.append(process)
         if self.exit_on_spawn:
             process._exit(1)
@@ -100,6 +130,30 @@ class FakeLlamaServer:
 
     async def handler(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
+        self.seen.append((path, {k.lower(): v for k, v in request.headers.items()}))
+        if self.api_key_required is not None and (
+            self.protected_paths is None or path in self.protected_paths
+        ):
+            if request.headers.get("authorization") != f"Bearer {self.api_key_required}":
+                return httpx.Response(401, json={"error": {"message": "Invalid API Key"}})
+        if self.transport_error is not None and path in self.transport_error_paths:
+            raise self.transport_error("simulated", request=request)
+        if path == "/apply-template":
+            body = json.loads(request.content)
+            self.template_requests.append(body)
+            if self.template_status != 200:
+                return httpx.Response(self.template_status, json={"error": {"message": "boom"}})
+            if not self.template_shape_ok:
+                return httpx.Response(200, json={"rendered": "nope"})
+            return httpx.Response(200, json={"prompt": render_prompt(body["messages"])})
+        if path == "/tokenize":
+            body = json.loads(request.content)
+            self.tokenize_requests.append(body)
+            if self.tokenize_status != 200:
+                return httpx.Response(self.tokenize_status, json={"error": {"message": "boom"}})
+            if not self.tokenize_shape_ok:
+                return httpx.Response(200, json={"tokens": "not a list"})
+            return httpx.Response(200, json={"tokens": tokenize(body["content"])})
         if path == "/health":
             if self.healthy:
                 return httpx.Response(200, json={"status": "ok"})
@@ -117,8 +171,6 @@ class FakeLlamaServer:
             )
         if path == "/v1/chat/completions":
             self.requests.append(json.loads(request.content))
-            if self.transport_error is not None:
-                raise self.transport_error("simulated", request=request)
             if self.status != 200:
                 return httpx.Response(self.status, json={"error": {"message": "boom"}})
             return httpx.Response(
@@ -312,6 +364,14 @@ async def test_stream_tokens_stats_and_request_shape(harness: Harness, server: F
     assert harness.loading_events() == [
         {"profile": "fast", "context_ceiling": 32768, "kv_cache_type": "f16"}
     ]
+    # A managed server always runs behind a key: it reaches the child through its environment
+    # (never argv) and every request to it carries the matching bearer token.
+    key = harness.manager.api_key
+    assert isinstance(key, str) and len(key) >= 24
+    assert server.processes[0].env == {"LLAMA_API_KEY": key}
+    assert key not in " ".join(server.processes[0].argv)
+    assert {path for path, _ in server.seen} >= {"/health", "/props", "/v1/chat/completions"}
+    assert all(headers.get("authorization") == f"Bearer {key}" for _, headers in server.seen)
 
 
 async def test_truncated_when_finish_reason_is_length(harness: Harness, server: FakeLlamaServer):
@@ -321,7 +381,7 @@ async def test_truncated_when_finish_reason_is_length(harness: Harness, server: 
     assert gen.stats.finish_reason == "length"
 
 
-async def test_token_counts_estimated_without_usage(harness: Harness, server: FakeLlamaServer):
+async def test_token_counts_are_none_without_usage(harness: Harness, server: FakeLlamaServer):
     server.include_usage = False
     server.include_timings = False
     ctx = harness.ctx()
@@ -428,6 +488,171 @@ async def test_cancelled_before_start_makes_no_request(harness: Harness, server:
     assert server.processes == []
 
 
+# --- measured prompt size: the session -------------------------------------------------------
+
+
+async def test_session_measures_prompt_with_the_server_template_and_tokenizer(
+    harness: Harness, server: FakeLlamaServer
+):
+    ctx = harness.ctx()
+    msgs = messages()
+    payload = [m.model_dump() for m in msgs]
+    async with harness.client.session("fast", ctx) as session:
+        assert harness.client.busy  # the lane is held for the whole session
+        assert session.spec.context_ceiling == 32768 and session.spec.name == "fast"
+        count = await session.count_prompt_tokens(msgs)
+        # /apply-template renders with the server's own template, /tokenize counts it with the
+        # server's own tokenizer and special-token handling: the count is what a request sees.
+        rendered = render_prompt(payload)
+        assert count == len(tokenize(rendered))
+        assert server.template_requests == [{"messages": payload}]
+        assert server.tokenize_requests == [
+            {"content": rendered, "add_special": True, "parse_special": True}
+        ]
+        assert server.requests == []  # measuring sends no completion
+        shorter = await session.count_prompt_tokens(msgs[:1])
+        assert shorter == len(tokenize(render_prompt(payload[:1]))) < count
+        gen = await session.generate(msgs, harness.on_token)
+        assert gen.text == "".join(server.deltas)
+        with pytest.raises(AnalysisError) as info:
+            await session.generate(msgs, harness.on_token)
+        assert info.value.code == ErrorCode.INTERNAL_ERROR
+    assert not harness.client.busy
+    assert len(server.requests) == 1 and len(server.processes) == 1
+    assert [name for name, _ in harness.events] == ["spark.loading"]  # loaded once, up front
+    assert all(
+        headers["authorization"] == f"Bearer {harness.manager.api_key}"
+        for path, headers in server.seen
+        if path in ("/apply-template", "/tokenize")
+    )
+    # cancelled analyses measure nothing
+    cancelled = harness.ctx("an_c")
+    async with harness.client.session("fast", cancelled) as session:
+        cancelled.cancel.cancel()
+        with pytest.raises(AnalysisError) as info:
+            await session.count_prompt_tokens(msgs)
+        assert info.value.code == ErrorCode.CANCELLED
+    assert len(server.template_requests) == 2
+
+
+@pytest.mark.parametrize(
+    ("field", "status", "reason"),
+    [
+        ("template_status", 500, "apply_template_status"),
+        ("template_status", 401, "apply_template_status"),
+        ("tokenize_status", 503, "tokenize_status"),
+    ],
+)
+async def test_apply_template_and_tokenize_statuses_map_to_inference_failed(
+    harness: Harness, server: FakeLlamaServer, field: str, status: int, reason: str
+):
+    setattr(server, field, status)
+    async with harness.client.session("fast", harness.ctx()) as session:
+        with pytest.raises(AnalysisError) as info:
+            await session.count_prompt_tokens(messages())
+    err = info.value
+    assert err.code == ErrorCode.SPARK_INFERENCE_FAILED
+    assert err.details == {"reason": reason, "status": status}
+    assert SENTINEL not in json.dumps(err.details) + err.message
+    assert server.requests == [] and harness.manager.in_flight is False
+    assert not harness.client.busy
+
+
+async def test_apply_template_and_tokenize_shape_and_transport_errors(
+    harness: Harness, server: FakeLlamaServer
+):
+    server.template_shape_ok = False
+    async with harness.client.session("fast", harness.ctx()) as session:
+        with pytest.raises(AnalysisError) as info:
+            await session.count_prompt_tokens(messages())
+    assert info.value.details == {"reason": "apply_template_shape"}
+    server.template_shape_ok = True
+    server.tokenize_shape_ok = False
+    async with harness.client.session("fast", harness.ctx()) as session:
+        with pytest.raises(AnalysisError) as info:
+            await session.count_prompt_tokens(messages())
+    assert info.value.details == {"reason": "tokenize_shape"}
+    server.tokenize_shape_ok = True
+    server.transport_error = httpx.ConnectError
+    server.transport_error_paths = {"/apply-template"}
+    async with harness.client.session("fast", harness.ctx()) as session:
+        with pytest.raises(AnalysisError) as info:
+            await session.count_prompt_tokens(messages())
+    assert info.value.code == ErrorCode.SPARK_INFERENCE_FAILED
+    assert info.value.details == {"reason": "ConnectError"}
+    assert SENTINEL not in json.dumps(info.value.details)
+
+
+# --- authentication ---------------------------------------------------------------------------
+
+
+async def test_managed_server_runs_behind_a_key(settings: Settings, server: FakeLlamaServer):
+    keyed = settings.model_copy(update={"spark_api_key": "configured-spark-key"})
+    server.api_key_required = "configured-spark-key"
+    h = Harness(keyed, server)
+    try:
+        assert h.manager.api_key == "configured-spark-key"
+        assert h.manager.auth_headers == {"Authorization": "Bearer configured-spark-key"}
+        assert h.manager.child_env_extra() == {"LLAMA_API_KEY": "configured-spark-key"}
+        gen = await h.client.run("fast", messages(), h.on_token, h.ctx())
+        assert gen.text == "".join(server.deltas)
+        assert server.processes[0].env == {"LLAMA_API_KEY": "configured-spark-key"}
+        assert "configured-spark-key" not in " ".join(server.processes[0].argv)
+        assert "configured-spark-key" not in " ".join(h.manager.build_argv("deep"))
+        assert {path for path, _ in server.seen} == {"/health", "/props", "/v1/chat/completions"}
+        assert all(
+            headers["authorization"] == "Bearer configured-spark-key" for _, headers in server.seen
+        )
+    finally:
+        await h.aclose()
+    assert Settings(spark_api_key="configured-spark-key").redacted()["spark_api_key"] == "***"
+    # Without a configured key a managed server still gets one: random and per process.
+    first = LlamaServerManager(settings)
+    second = LlamaServerManager(settings)
+    try:
+        assert first.api_key and second.api_key and first.api_key != second.api_key
+        assert len(first.api_key) >= 24
+        assert first.auth_headers == {"Authorization": f"Bearer {first.api_key}"}
+        assert first.child_env_extra() == {"LLAMA_API_KEY": first.api_key}
+    finally:
+        await first.aclose()
+        await second.aclose()
+
+
+async def test_wrong_or_missing_key_is_refused(settings: Settings, server: FakeLlamaServer):
+    # Managed: the server does not accept our key, so it never passes its health check.
+    server.api_key_required = "some-other-key"
+    quick = settings.model_copy(update={"spark_start_timeout_s": 0.05})
+    h = Harness(quick, server)
+    try:
+        with pytest.raises(AnalysisError) as info:
+            await h.client.run("fast", messages(), h.on_token, h.ctx())
+        assert info.value.code == ErrorCode.SPARK_START_FAILED
+        assert info.value.details["stage"] == "health_wait"
+        assert server.requests == [] and server.processes[0].returncode is not None
+        assert "some-other-key" not in info.value.message
+    finally:
+        await h.aclose()
+    # A server that is healthy but rejects the authenticated calls: structured failures that
+    # never leak the prompt.
+    strict = FakeLlamaServer()
+    strict.api_key_required = "right-key"
+    strict.protected_paths = {"/v1/chat/completions", "/apply-template", "/tokenize"}
+    h2 = Harness(settings.model_copy(update={"spark_api_key": "wrong-key"}), strict)
+    try:
+        with pytest.raises(AnalysisError) as info:
+            await h2.client.run("fast", messages(), h2.on_token, h2.ctx())
+        assert info.value.code == ErrorCode.SPARK_INFERENCE_FAILED
+        assert info.value.details == {"reason": "http_status", "status": 401}
+        assert SENTINEL not in json.dumps(info.value.details) + info.value.message
+        async with h2.client.session("fast", h2.ctx()) as session:
+            with pytest.raises(AnalysisError) as info:
+                await session.count_prompt_tokens(messages())
+        assert info.value.details == {"reason": "apply_template_status", "status": 401}
+    finally:
+        await h2.aclose()
+
+
 # --- profile management -----------------------------------------------------------------------
 
 
@@ -516,7 +741,7 @@ async def test_process_exit_during_startup(harness: Harness, server: FakeLlamaSe
 async def test_missing_binary_maps_to_start_failed(settings: Settings, server: FakeLlamaServer):
     h = Harness(settings, server)
 
-    async def spawn(argv: list[str]) -> FakeProcess:
+    async def spawn(argv: list[str], env: dict[str, str]) -> FakeProcess:
         raise FileNotFoundError(argv[0])
 
     h.manager._spawn = spawn
@@ -684,6 +909,38 @@ async def test_external_mode_unhealthy_is_start_failed(
         await h.aclose()
 
 
+async def test_external_mode_uses_only_the_configured_key(
+    external_settings: Settings, server: FakeLlamaServer
+):
+    server.healthy = True
+    # No key configured: none is invented for a server this backend does not own.
+    unkeyed = Harness(external_settings, server)
+    try:
+        assert unkeyed.manager.api_key is None
+        assert unkeyed.manager.auth_headers == {} and unkeyed.manager.child_env_extra() == {}
+        await unkeyed.client.start()
+        assert unkeyed.client.availability("fast").available is True
+        assert server.seen and all("authorization" not in h for _, h in server.seen)
+        # ... so a server that demands one is simply not healthy for us.
+        server.api_key_required = "external-key"
+        assert await unkeyed.manager.probe_external() is False
+        assert unkeyed.client.availability("fast").code == ErrorCode.SPARK_START_FAILED
+    finally:
+        await unkeyed.aclose()
+    server.seen.clear()
+    keyed = Harness(external_settings.model_copy(update={"spark_api_key": "external-key"}), server)
+    try:
+        assert keyed.manager.child_env_extra() == {"LLAMA_API_KEY": "external-key"}
+        await keyed.client.start()
+        assert keyed.client.availability("fast").available is True
+        gen = await keyed.client.run("fast", messages(), keyed.on_token, keyed.ctx())
+        assert gen.text == "".join(server.deltas)
+        assert server.processes == []
+        assert all(h["authorization"] == "Bearer external-key" for _, h in server.seen)
+    finally:
+        await keyed.aclose()
+
+
 # --- availability rules (pure) ---------------------------------------------------------------
 
 
@@ -720,9 +977,11 @@ def test_check_availability_rules(settings: Settings):
         "deep", external, never_probed, False, False, external_healthy=True, external_n_ctx=8192
     )
     assert small.code == ErrorCode.DEEP_PROFILE_UNAVAILABLE and "8192" in (small.reason or "")
-
-    mock = settings.model_copy(update={"spark_mode": "mock"})
-    assert check_availability("deep", mock, never_probed, False, False).available is True
+    # managed and external are the only modes the product knows
+    with pytest.raises(ValueError):
+        settings.model_copy(update={"spark_mode": "mock"}).model_validate(
+            settings.model_copy(update={"spark_mode": "mock"}).model_dump()
+        )
 
 
 def test_assert_can_allocate_codes(settings: Settings):
@@ -772,7 +1031,16 @@ def test_read_lockfile_and_version_fields(settings: Settings, tmp_path: Path):
     assert read_lockfile(None) is None
     (tmp_path / "bad.json").write_text("[]")
     assert read_lockfile(tmp_path / "bad.json") is None
-    assert version_fields(None, settings)["spark_artifact"] == settings.spark_artifact
+    # The artifact is named only by a verified download record, never by configuration.
+    assert version_fields(None, settings) == {
+        "spark_artifact": None,
+        "spark_runtime": None,
+        "spark_gguf_sha256": None,
+        "spark_hf_revision": None,
+    }
+    assert version_fields({"hf_repo": "x/y"}, settings)["spark_artifact"] is None
+    assert version_fields(None, settings, "b1")["spark_runtime"] == "b1"
+    assert "spark_artifact" not in Settings.model_fields
 
 
 async def test_client_reads_lockfile_for_version_info(

@@ -1,8 +1,10 @@
-"""ResearchRunner, intents and the fixture/recording providers, all against the apple fixture."""
+"""ResearchRunner, intents and the fixture provider double, all against the apple fixture."""
 
 from __future__ import annotations
 
+import importlib.util
 import json
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -13,13 +15,8 @@ from bayanalytics.config import Settings
 from bayanalytics.context import AnalysisContext
 from bayanalytics.errors import AnalysisError
 from bayanalytics.instruments.base import InstrumentIdentity, ResearchBudget
+from bayanalytics.research.edgar import EdgarClient
 from bayanalytics.research.extract import EXCERPT_CHARS, MAX_TEXT_CHARS
-from bayanalytics.research.fixture_provider import (
-    FixtureFetcher,
-    FixtureResearchProvider,
-    RecordingFetcher,
-    RecordingProvider,
-)
 from bayanalytics.research.http_provider import HttpResearchProvider, build_research_stack
 from bayanalytics.research.intents import (
     PlannedQuery,
@@ -28,9 +25,12 @@ from bayanalytics.research.intents import (
     gap_to_intent,
     seed_plan,
 )
+from bayanalytics.research.prices import StooqPrices
 from bayanalytics.research.provider import ResearchProvider
 from bayanalytics.research.runner import ResearchRunner, RoundResult
-from bayanalytics.schemas.common import ErrorCode
+from bayanalytics.research.sources import canonical_url
+from bayanalytics.schemas.common import ErrorCode, stable_id
+from doubles import FixtureFetcher, FixtureResearchProvider, fixture_research_stack
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures" / "research" / "apple"
 AS_OF = datetime(2026, 9, 26, tzinfo=UTC)
@@ -58,17 +58,12 @@ class RecordingCtx:
 
 @pytest.fixture
 def settings() -> Settings:
-    return Settings(
-        research_provider="fixture",
-        research_fixture_dir=FIXTURE_DIR,
-        research_contact_email="dev@example.com",
-        research_min_request_interval_s=0.0,
-    )
+    return Settings(research_contact_email="dev@example.com", research_min_request_interval_s=0.0)
 
 
 @pytest.fixture
 def stack(settings: Settings):
-    return build_research_stack(settings)
+    return fixture_research_stack(settings, FIXTURE_DIR)
 
 
 def make_runner(stack, settings: Settings, **budget: Any) -> ResearchRunner:
@@ -505,13 +500,50 @@ async def test_missing_cik_is_a_note_not_an_outage(stack, settings: Settings) ->
     assert result.facts_rows == [] and "no CIK" in result.notes[0]
 
 
-async def test_cancellation_is_checked_at_boundaries(stack, settings: Settings) -> None:
+async def test_cancellation_is_checked_before_the_search_is_issued(
+    stack, settings: Settings
+) -> None:
+    provider, _edgar, _prices = stack
     runner = make_runner(stack, settings)
     rec = RecordingCtx()
     rec.ctx.cancel.cancel()
     with pytest.raises(AnalysisError) as info:
         await runner.execute(one(ResearchIntent.retrieve_recent_news), IDENTITY, AS_OF, rec.ctx)
     assert info.value.code is ErrorCode.CANCELLED
+    assert provider.queries == []  # no search was issued on a cancelled analysis
+    assert rec.events == []  # not even research.query
+    assert runner.stats.queries_issued == 0
+
+
+async def test_search_hit_dated_after_as_of_is_rejected_before_any_fetch(
+    stack, settings: Settings, tmp_path: Path
+) -> None:
+    pages = json.loads((FIXTURE_DIR / "pages.json").read_text())
+    hit = {
+        "url": "https://www.reuters.com/technology/fixture-apple-october-event-2026-10-02/",
+        "title": "[Fixture] October event recap",
+        "publishedDate": "2026-10-02T09:00:00Z",
+    }
+    (tmp_path / "pages.json").write_text(json.dumps(pages))
+    (tmp_path / "searches.json").write_text(json.dumps({"fixture": True, "searches": {"*": [hit]}}))
+    provider = FixtureResearchProvider(tmp_path, fetcher=FixtureFetcher(FIXTURE_DIR))
+    fetched: list[str] = []
+    original = provider.extract
+
+    async def spy(url: str):
+        fetched.append(url)
+        return await original(url)
+
+    provider.extract = spy  # type: ignore[method-assign]
+    runner = ResearchRunner(provider, stack[1], stack[2], settings, ResearchBudget())
+    rec = RecordingCtx()
+    result = await runner.execute(
+        one(ResearchIntent.retrieve_recent_news, "near_term"), IDENTITY, AS_OF, rec.ctx
+    )
+    assert [reason for _, reason in result.rejected] == ["published_after_as_of"]
+    assert result.rejected[0][0].extraction_method == "search_result"
+    assert fetched == [] and runner.stats.sources_fetched == 0
+    assert [e["reason"] for e in rec.named("research.source_rejected")] == ["published_after_as_of"]
 
 
 async def test_rounds_are_tracked_by_begin_round(stack, settings: Settings) -> None:
@@ -544,23 +576,54 @@ async def test_full_seed_plan_runs_on_fixture(stack, settings: Settings) -> None
     assert len(rec.named("research.source_found")) == len(sources)
 
 
+async def test_provenance_ids_are_stable_across_runs(settings: Settings) -> None:
+    async def run_plan() -> list[tuple[str, str]]:
+        provider, edgar, prices = fixture_research_stack(settings, FIXTURE_DIR)
+        runner = ResearchRunner(
+            provider,
+            edgar,
+            prices,
+            settings,
+            ResearchBudget(max_fetch_per_round=10, max_sources=24, max_rounds=4),
+        )
+        seen: list[tuple[str, str]] = []
+        for intent in seed_plan("multi_horizon"):
+            for planned in build_queries(intent, IDENTITY, "multi_horizon", AS_OF, []):
+                result = await runner.execute(planned, IDENTITY, AS_OF, RecordingCtx().ctx)
+                seen.extend((s.source_id, s.url) for s in result.sources)
+        return seen
+
+    first, second = await run_plan(), await run_plan()
+    assert first == second and len(first) == 15
+    assert len({sid for sid, _ in first}) == len(first)
+    for source_id, url in first:
+        assert source_id.startswith("src_") and len(source_id) == len("src_") + 16
+        assert source_id == stable_id("src", canonical_url(url))
+
+
 # --------------------------------------------------------------------------------------
 # providers / factory
 # --------------------------------------------------------------------------------------
 
 
-def test_build_research_stack_fixture_and_http(settings: Settings) -> None:
-    provider, edgar, prices = build_research_stack(settings)
-    assert isinstance(provider, FixtureResearchProvider)
+def test_build_research_stack_is_always_the_http_stack() -> None:
+    provider, edgar, prices = build_research_stack(
+        Settings(research_search_url="https://searx.local")
+    )
+    assert isinstance(provider, HttpResearchProvider)
     assert isinstance(provider, ResearchProvider)
-    assert edgar is not None and prices is not None
-    http_settings = Settings(research_provider="http", research_search_url="https://searx.local")
-    http_provider, _, _ = build_research_stack(http_settings)
-    assert isinstance(http_provider, HttpResearchProvider)
-    assert isinstance(http_provider, ResearchProvider)
-    assert http_provider.fetcher.user_agent == "BayAnalytics/0.1"
-    with pytest.raises(ValueError, match="research_fixture_dir"):
-        build_research_stack(Settings(research_provider="fixture"))
+    assert isinstance(edgar, EdgarClient) and isinstance(prices, StooqPrices)
+    assert provider.fetcher.user_agent == "BayAnalytics/0.1"
+    assert provider.searx.configured is True
+    # No fixture branch exists in the product: the settings model has no provider switch and
+    # the fixture modules are gone from the package.
+    for field in ("research_provider", "research_fixture_dir"):
+        assert field not in Settings.model_fields
+    for name in ("fixture_provider", "fixtures_build"):
+        assert importlib.util.find_spec(f"bayanalytics.research.{name}") is None
+    unconfigured, _, _ = build_research_stack(Settings())
+    assert isinstance(unconfigured, HttpResearchProvider)
+    assert unconfigured.searx.configured is False
 
 
 async def test_http_provider_closes_owned_client() -> None:
@@ -594,30 +657,6 @@ async def test_fixture_provider_search_matching_and_fallback(settings: Settings)
     assert record.published_at == datetime(2026, 9, 18, 12, 30, tzinfo=UTC)
 
 
-async def test_recording_provider_round_trips_into_fixture_layout(tmp_path: Path) -> None:
-    inner = FixtureResearchProvider(FIXTURE_DIR)
-    recorder = RecordingProvider(inner, tmp_path)
-    results = await recorder.search_with(
-        '"Apple Inc." earnings OR guidance OR outlook', categories="news"
-    )
-    record = await recorder.extract(results[0].url)
-    fetcher = RecordingFetcher(FixtureFetcher(FIXTURE_DIR), tmp_path)
-    page = await fetcher.open("https://data.sec.gov/submissions/CIK0000320193.json", ttl_s=10)
-    assert page.status == 200
-    replay = FixtureResearchProvider(tmp_path)
-    replayed = await replay.search('"Apple Inc." earnings OR guidance OR outlook')
-    assert [r.url for r in replayed] == [r.url for r in results]
-    assert replayed[0].published_at == results[0].published_at
-    again = await replay.extract(results[0].url)
-    assert again.content_hash == record.content_hash and again.title == record.title
-    submissions = await replay.open("https://data.sec.gov/submissions/CIK0000320193.json")
-    assert json.loads(submissions.body)["name"] == "Apple Inc."
-    pages = json.loads((tmp_path / "pages.json").read_text())
-    assert pages["fixture"] is True and len(pages["pages"]) == 2
-    searches = json.loads((tmp_path / "searches.json").read_text())
-    assert searches["fixture"] is True and len(searches["searches"]) == 1
-
-
 def test_fixture_files_are_marked_synthetic() -> None:
     for name in (
         "pages.json",
@@ -633,10 +672,33 @@ def test_fixture_files_are_marked_synthetic() -> None:
         assert 'name="bay-fixture"' in html.read_text()
 
 
-def test_fixture_csvs_regenerate_deterministically(tmp_path: Path) -> None:
-    from bayanalytics.research.fixtures_build import build
+def _fixture_builder():
+    """``tests/fixtures/research/build_apple.py`` is a script, not a package: load it by path."""
+    path = FIXTURE_DIR.parent / "build_apple.py"
+    spec = importlib.util.spec_from_file_location("build_apple", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module  # dataclasses resolve string annotations through here
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.modules.pop(spec.name, None)
+    return module
 
-    build(tmp_path)
+
+def test_fixture_csvs_regenerate_deterministically(tmp_path: Path) -> None:
+    builder = _fixture_builder()
+    written = builder.build(tmp_path)
+    assert {p.relative_to(tmp_path).as_posix() for p in written} == {
+        "prices/aapl.us.csv",
+        "prices/spx.csv",
+        "prices/xlk.us.csv",
+        "edgar/companyfacts_CIK0000320193.json",
+        "edgar/submissions_CIK0000320193.json",
+        "edgar/company_tickers.json",
+        "pages.json",
+        "searches.json",
+    }
     for name in (
         "prices/aapl.us.csv",
         "prices/spx.csv",
@@ -647,3 +709,8 @@ def test_fixture_csvs_regenerate_deterministically(tmp_path: Path) -> None:
         "searches.json",
     ):
         assert (tmp_path / name).read_bytes() == (FIXTURE_DIR / name).read_bytes(), name
+    # The script entry point writes the same files to a directory given on the command line.
+    assert builder.main([str(tmp_path / "again")]) == 0
+    assert (tmp_path / "again" / "pages.json").read_bytes() == (
+        FIXTURE_DIR / "pages.json"
+    ).read_bytes()

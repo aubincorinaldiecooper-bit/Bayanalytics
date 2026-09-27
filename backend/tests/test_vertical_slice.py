@@ -1,43 +1,64 @@
-"""Integration tests for the first engineering task (AGENT.md sections 19, 40).
+"""Integration tests for the vertical slice (AGENT.md sections 19, 40).
 
-Fixture research (synthetic Apple data) + MockLaya + MockSpark through the real runtime,
-runner, event bus, orchestrator and API. No network, no model weights.
+Fixture research (synthetic Apple data) + ``RuleLaya`` + ``ScriptedSpark`` + ``FixedTranscriber``
+through the real runtime, runner, event bus, orchestrator and API. No network, no model weights.
+The doubles are injected through ``build_runtime``; nothing in the product can select them.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import httpx
 
 from bayanalytics.config import Settings
-from bayanalytics.laya.mock import MockLaya
+from bayanalytics.errors import AnalysisError
 from bayanalytics.main import create_app
 from bayanalytics.runtime import Runtime
+from bayanalytics.schemas.common import ErrorCode
 from bayanalytics.schemas.events import AnalysisEvent
-from bayanalytics.spark.mock import MockSpark
 from bayanalytics.wiring import build_runtime
+from doubles import FixedTranscriber, RuleLaya, ScriptedSpark, fixture_research_stack
 
 FIXTURES = Path(__file__).parent / "fixtures" / "research" / "apple"
+EXECUTION = {
+    "spark_mode": "managed",
+    "whisper_mode": "disabled",
+    "deployment": "local",
+    "search_configured": False,
+}
 
 
 def _settings(**overrides: object) -> Settings:
-    base = {
-        "research_provider": "fixture",
-        "research_fixture_dir": FIXTURES,
-        "laya_mode": "mock",
-        "spark_mode": "mock",
-        "whisper_mode": "mock",
-        "log_level": "WARNING",
-    }
+    base: dict[str, Any] = {"log_level": "WARNING"}
     base.update(overrides)
     return Settings(**base)  # type: ignore[arg-type]
 
 
+def _runtime(
+    settings: Settings | None = None,
+    *,
+    laya: RuleLaya | None = None,
+    spark: ScriptedSpark | None = None,
+    transcriber: FixedTranscriber | None = None,
+) -> Runtime:
+    settings = settings or _settings()
+    return build_runtime(
+        settings,
+        laya=laya or RuleLaya(),
+        spark=spark or ScriptedSpark(),
+        transcriber=transcriber or FixedTranscriber(),
+        research=fixture_research_stack(settings, FIXTURES),
+    )
+
+
+@contextlib.asynccontextmanager
 async def _client(rt: Runtime) -> AsyncIterator[httpx.AsyncClient]:
     app = create_app(rt.settings, runtime=rt)
     async with app.router.lifespan_context(app):
@@ -66,7 +87,7 @@ def _parse_sse(raw: str) -> list[dict]:
 
 
 async def _run_to_completion(rt: Runtime, body: dict) -> tuple[str, list[dict], dict]:
-    async for client in _client(rt):
+    async with _client(rt) as client:
         created = await client.post("/api/v1/analyses", json=body)
         assert created.status_code == 202, created.text
         analysis_id = created.json()["analysis_id"]
@@ -76,14 +97,13 @@ async def _run_to_completion(rt: Runtime, body: dict) -> tuple[str, list[dict], 
         await asyncio.sleep(0.02)
         result = (await client.get(f"/api/v1/analyses/{analysis_id}")).json()
         return analysis_id, events, result
-    raise AssertionError("client context did not yield")
 
 
 # ----------------------------------------------------------------------------- full flow
 
 
 async def test_assess_apple_end_to_end() -> None:
-    rt = build_runtime(_settings())
+    rt = _runtime()
     analysis_id, events, result = await _run_to_completion(
         rt, {"query": "Assess Apple.", "profile": "fast"}
     )
@@ -122,8 +142,19 @@ async def test_assess_apple_end_to_end() -> None:
     assert positions == sorted(positions), list(zip(order, positions, strict=True))
     assert names.index("laya.started") < names.index("research.completed")  # Laya-directed loop
     assert names.index("spark.loading") < names.index("spark.started") < names.index("spark.token")
+    started = next(e["data"] for e in events if e["event"] == "analysis.started")
+    assert started["execution"] == EXECUTION
     resolved = next(e["data"] for e in events if e["event"] == "instrument.resolved")
     assert resolved["symbol"] == "AAPL" and resolved["cik"] == "0000320193"
+    # The Spark prompt size is measured by the session before generation and reported as such
+    # on spark.started, spark.completed and in telemetry; nothing is estimated.
+    spark_started = next(e["data"] for e in events if e["event"] == "spark.started")
+    spark_completed = next(e["data"] for e in events if e["event"] == "spark.completed")
+    assert "prompt_tokens_estimate" not in spark_started
+    assert isinstance(spark_started["prompt_tokens"], int) and spark_started["prompt_tokens"] > 0
+    assert spark_completed["prompt_tokens"] == spark_started["prompt_tokens"]
+    assert spark_completed["output_tokens"] is None  # the double produced no model tokens
+    assert spark_completed["tokens_per_second"] is None and spark_completed["truncated"] is False
     # Streamed text is exactly the concatenation of the token events.
     streamed = "".join(e["data"]["text"] for e in events if e["event"] == "spark.token")
     assert streamed and result["streamed_text"] == streamed
@@ -156,6 +187,10 @@ async def test_assess_apple_end_to_end() -> None:
     assert assessment["fundamentals"]["revenue_growth_yoy"]["display"].endswith("%")
     assert "market_cap" in assessment["valuation"]
     assert assessment["benchmark_context"]["benchmarks"]
+    assert (
+        "price returns exclude dividends (price return, not total return)"
+        in (assessment["uncertainties"])
+    )
     assert len(result["horizon_assessments"]) == 4
     for horizon, item in result["horizon_assessments"].items():
         assert item["stance"] in {"bullish", "neutral", "bearish", "mixed"}
@@ -174,16 +209,38 @@ async def test_assess_apple_end_to_end() -> None:
     research = telemetry["research"]
     assert research["queries_issued"] >= 5 and research["sources_fetched"] >= 10
     assert research["termination_reason"]
-    assert telemetry["versions"]["laya_schema_version"] == "finance-v1"
-    assert telemetry["versions"]["normalization_version"] == "2026.09-1"
+    # The synthetic fixture deliberately omits the primary documents of the 8-K 0000320193-26-
+    # 000050 and the 10-Q 0000320193-26-000010, so both excerpts fail to fetch; the analyzer
+    # counts them as structured failures (whether an unexcerptable filing should count as an
+    # EDGAR outage is an open product question, tracked in the migration report).
+    assert research["queries_failed"] == 0 and research["structured_failures"] == 2
+    assert sum("excerpt unavailable" in u for u in result["assessment"]["uncertainties"]) == 2
+    assert telemetry["spark_prompt_tokens"] == spark_started["prompt_tokens"]
+    # Measured or None: the doubles measure no model, no memory and no runtime.
+    for key in (
+        "spark_output_tokens",
+        "spark_tokens_per_second",
+        "spark_load_ms",
+        "spark_resident_ram_mb",
+        "laya_resident_ram_mb",
+        "laya_warm_inference_ms",
+    ):
+        assert telemetry[key] is None, key
+    versions = telemetry["versions"]
+    assert versions["laya_schema_version"] == "finance-v1"
+    assert versions["normalization_version"] == "2026.09-1"
+    assert versions["laya_package_version"] is None
+    assert versions["spark_artifact"] is None and versions["spark_runtime"] is None
+    assert versions["execution"] == EXECUTION
     assert telemetry["process_peak_rss_mb"] and telemetry["system_total_ram_mb"]
+    assert "mock" not in json.dumps(result).lower()
     # Every cited source id in the assessment exists in the source list.
     known = {s["source_id"] for s in result["sources"]}
     for bucket in ("bull_evidence", "bear_evidence", "risks", "what_changed"):
         for item in assessment[bucket]:
             assert set(item["source_ids"]) <= known
     # Reconnect replays the tail only.
-    async for client in _client(rt):
+    async with _client(rt) as client:
         async with client.stream(
             "GET",
             f"/api/v1/analyses/{analysis_id}/events",
@@ -193,9 +250,43 @@ async def test_assess_apple_end_to_end() -> None:
         assert [e["event"] for e in tail] == ["analysis.completed"]
 
 
+async def test_spark_citations_of_bundle_sources_are_recognised() -> None:
+    rt = _runtime()
+    _id, _events, result = await _run_to_completion(rt, {"query": "Assess Apple."})
+    assessment = result["assessment"]
+    # ScriptedSpark cites only ids rendered in the bundle, so none may be reported as unknown ...
+    assert not any("unknown source" in u for u in assessment["uncertainties"])
+    # ... and Spark's own horizon bullets (not the deterministic fallback) must survive.
+    for horizon in result["horizon_assessments"].values():
+        assert any("in the bundle" in e["text"] for e in horizon["key_evidence"]), horizon
+        assert horizon["synthesized"] is True
+    assert result["partial"] is False
+
+
+async def test_provenance_and_decision_ids_are_stable_across_runs() -> None:
+    as_of = datetime(2026, 9, 26, tzinfo=UTC)
+    body = {"query": "Assess Apple."}
+    first = (await _run_to_completion(_runtime(_settings(eval_as_of=as_of)), body))[2]
+    second = (await _run_to_completion(_runtime(_settings(eval_as_of=as_of)), body))[2]
+    assert first["analysis_id"] != second["analysis_id"]
+    assert first["status"] == second["status"] == "completed"
+    # Same URL -> same source id; same compacted state, stage and question -> same decision id.
+    assert [s["source_id"] for s in first["sources"]] == [s["source_id"] for s in second["sources"]]
+    assert len({s["source_id"] for s in first["sources"]}) == len(first["sources"])
+    assert [d["decision_id"] for d in first["laya_decisions"]] == [
+        d["decision_id"] for d in second["laya_decisions"]
+    ]
+    assert len({d["decision_id"] for d in first["laya_decisions"]}) == len(first["laya_decisions"])
+    segment_ids = {d["segment_id"] for d in first["laya_decisions"] if d["stage"] == "history_scan"}
+    assert segment_ids and all(s.startswith("seg_") for s in segment_ids)
+    assert segment_ids == {
+        d["segment_id"] for d in second["laya_decisions"] if d["stage"] == "history_scan"
+    }
+
+
 async def test_leakage_guard_freezes_information_set() -> None:
     as_of = datetime(2026, 6, 30, tzinfo=UTC)
-    rt = build_runtime(_settings(eval_as_of=as_of))
+    rt = _runtime(_settings(eval_as_of=as_of))
     _analysis_id, events, result = await _run_to_completion(rt, {"query": "Assess Apple."})
     assert result["status"] == "completed"
     assert result["as_of"].startswith("2026-06-30")
@@ -216,9 +307,9 @@ async def test_leakage_guard_freezes_information_set() -> None:
 async def test_cancel_mid_synthesis_preserves_partial_content() -> None:
     # httpx's ASGI transport buffers a streaming body, so the live stream is read in-process
     # through the event bus while the cancel goes through the real API.
-    spark = MockSpark(delay_s=0.02)
-    rt = build_runtime(_settings(), spark=spark)
-    async for client in _client(rt):
+    spark = ScriptedSpark(delay_s=0.02)
+    rt = _runtime(spark=spark)
+    async with _client(rt) as client:
         created = await client.post("/api/v1/analyses", json={"query": "Assess Apple."})
         analysis_id = created.json()["analysis_id"]
         events: list[AnalysisEvent] = []
@@ -245,14 +336,15 @@ async def test_cancel_mid_synthesis_preserves_partial_content() -> None:
         assert result["streamed_text"]  # preserved, but never presented as complete
         assert result["sources"] and result["calculations"]
         assert result["error"]["code"] == "CANCELLED"
+        assert spark.runs[-1]["completed"] is False
         # Cancelling again is a no-op on a terminal analysis.
         again = await client.post(f"/api/v1/analyses/{analysis_id}/cancel")
         assert again.status_code == 200 and again.json()["status"] == "cancelled"
 
 
 async def test_deep_profile_unavailable_is_a_structured_error() -> None:
-    rt = build_runtime(_settings(), spark=MockSpark(deep_available=False))
-    async for client in _client(rt):
+    rt = _runtime(spark=ScriptedSpark(deep_available=False))
+    async with _client(rt) as client:
         caps = (await client.get("/api/v1/capabilities")).json()
         assert caps["profiles"]["fast"]["available"] is True
         assert caps["profiles"]["deep"]["available"] is False
@@ -266,8 +358,8 @@ async def test_deep_profile_unavailable_is_a_structured_error() -> None:
 
 
 async def test_ambiguous_instrument_is_answered_at_post() -> None:
-    rt = build_runtime(_settings())
-    async for client in _client(rt):
+    rt = _runtime()
+    async with _client(rt) as client:
         created = await client.post(
             "/api/v1/analyses", json={"query": "Compare Apple and Microsoft."}
         )
@@ -282,11 +374,8 @@ async def test_ambiguous_instrument_is_answered_at_post() -> None:
 
 
 async def test_laya_failure_is_structured_and_keeps_sources() -> None:
-    from bayanalytics.errors import AnalysisError
-    from bayanalytics.schemas.common import ErrorCode
-
-    laya = MockLaya(raise_error=AnalysisError(ErrorCode.LAYA_INFERENCE_FAILED))
-    rt = build_runtime(_settings(), laya=laya)
+    laya = RuleLaya(raise_error=AnalysisError(ErrorCode.LAYA_INFERENCE_FAILED))
+    rt = _runtime(laya=laya)
     _id, events, result = await _run_to_completion(rt, {"query": "Assess Apple."})
     assert events[-1]["event"] == "analysis.failed"
     assert events[-1]["data"]["error"]["code"] == "LAYA_INFERENCE_FAILED"
@@ -296,7 +385,7 @@ async def test_laya_failure_is_structured_and_keeps_sources() -> None:
 
 
 async def test_explicit_instrument_and_horizon() -> None:
-    rt = build_runtime(_settings())
+    rt = _runtime()
     _id, events, result = await _run_to_completion(
         rt,
         {
@@ -313,19 +402,38 @@ async def test_explicit_instrument_and_horizon() -> None:
 
 
 async def test_stored_artifacts_and_health() -> None:
-    rt = build_runtime(_settings())
-    analysis_id, _events, _result = await _run_to_completion(rt, {"query": "Assess Apple."})
+    rt = _runtime()
+    analysis_id, _events, result = await _run_to_completion(rt, {"query": "Assess Apple."})
     job = await rt.store.get_job(analysis_id)
     assert job is not None and job.status == "completed" and job.instrument is not None
     assert job.source_ids and job.last_seq > 100
     assert job.profile == "fast" and job.normalization_version == "2026.09-1"
+    assert job.spark_artifact is None and job.spark_runtime is None  # nothing was measured
     stored_events = await rt.store.list_events(analysis_id)
     assert stored_events[-1].event == "analysis.completed"
     assert all(isinstance(e, AnalysisEvent) for e in stored_events)
-    async for client in _client(rt):
+    # Every artifact of a completed analysis is persisted, not only the result document.
+    facts = await rt.store.get_facts(analysis_id)
+    assert facts and len(facts) == result["freshness_summary"]["facts"]["total"]
+    assert {s.source_id for s in await rt.store.get_sources(analysis_id)} == {
+        s["source_id"] for s in result["sources"]
+    }
+    assert {c.calc_id for c in await rt.store.get_calculations(analysis_id)} == {
+        c["calc_id"] for c in result["calculations"]
+    }
+    assert len(await rt.store.get_decisions(analysis_id)) == len(result["laya_decisions"])
+    async with _client(rt) as client:
         health = (await client.get("/api/v1/health")).json()
-        assert health["status"] == "ok" and {c["name"] for c in health["components"]} >= {
-            "laya",
-            "spark",
-            "store",
+        assert health["status"] == "ok"
+        assert {c["name"]: c["status"] for c in health["components"]} == {
+            "laya": "ok",
+            "spark": "ok",
+            "whisper": "ok",
+            "store": "ok",
         }
+        assert health["execution"] == EXECUTION and health["active_analyses"] == 0
+        assert "mock" not in json.dumps(health).lower()
+        caps = (await client.get("/api/v1/capabilities")).json()
+        assert caps["execution"] == EXECUTION
+        assert caps["voice"] is True and caps["research"] is True
+        assert caps["profiles"]["fast"]["available"] and caps["profiles"]["deep"]["available"]

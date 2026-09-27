@@ -1,7 +1,12 @@
-"""Prompt rendering, bundle fitting, answer parsing and MockSpark."""
+"""Prompt rendering, measured bundle fitting, answer parsing and ``ScriptedSpark``.
+
+Every token count here is the test's own measurement (``count_prompt``: one token per word or
+punctuation mark over each message's content); the product never estimates.
+"""
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 import pytest
@@ -10,17 +15,15 @@ from bayanalytics.context import AnalysisContext
 from bayanalytics.errors import AnalysisError
 from bayanalytics.instruments.base import SparkEvidenceBundle
 from bayanalytics.schemas.common import ErrorCode
+from bayanalytics.spark import bundle as bundle_module
 from bayanalytics.spark.base import SparkMessage, SparkRunOptions
 from bayanalytics.spark.bundle import (
+    OUTPUT_MARGIN_TOKENS,
     OVERFLOW_TRIM,
-    bundle_tokens,
-    estimate_tokens,
+    FitResult,
     fit_bundle,
-    prompt_tokens_estimate,
     reserved_output_tokens,
-    system_tokens,
 )
-from bayanalytics.spark.mock import MockSpark
 from bayanalytics.spark.parse import (
     SECTION_KEYS,
     canonical_heading,
@@ -39,6 +42,22 @@ from bayanalytics.spark.prompt import (
     build_messages,
     render_bundle,
 )
+from doubles import ScriptedSpark
+
+_TOKEN = re.compile(r"\w+|[^\w\s]")
+
+
+def tokens(text: str) -> int:
+    return len(_TOKEN.findall(text))
+
+
+async def count_prompt(messages: list[SparkMessage]) -> int:
+    """The test's own ``PromptCounter``: measured over each message's content."""
+    return sum(tokens(m.content) for m in messages)
+
+
+def prompt_tokens(bundle: SparkEvidenceBundle, options: SparkRunOptions | None = None) -> int:
+    return sum(tokens(m.content) for m in build_messages(bundle, options))
 
 
 def make_bundle(**overrides: Any) -> SparkEvidenceBundle:
@@ -186,20 +205,51 @@ def test_build_messages_without_horizons_or_laya():
 # --- bundle fitting ---------------------------------------------------------------------------
 
 
-def test_estimate_tokens_and_reserved_output():
-    assert estimate_tokens("") == 0
-    assert estimate_tokens("a" * 35) == 10
-    assert reserved_output_tokens(SparkRunOptions(max_tokens=1000)) == 1064
-    assert reserved_output_tokens(None) == 1400 + 64
-    assert system_tokens() == estimate_tokens(SYSTEM_PROMPT)
-    assert bundle_tokens(make_bundle()) == estimate_tokens(render_bundle(make_bundle()))
+def test_reserved_output_and_no_estimators_left():
+    assert reserved_output_tokens(SparkRunOptions(max_tokens=1000)) == 1000 + OUTPUT_MARGIN_TOKENS
+    assert reserved_output_tokens(None) == 1400 + OUTPUT_MARGIN_TOKENS
+    for name in ("estimate_tokens", "bundle_tokens", "system_tokens", "prompt_tokens_estimate"):
+        assert not hasattr(bundle_module, name), name
+    overflow = FitResult(bundle=make_bundle(), trims=["x", OVERFLOW_TRIM])
+    assert overflow.overflow is True and FitResult(bundle=make_bundle()).overflow is False
 
 
-def test_fit_bundle_noop_when_it_fits():
+async def test_fit_bundle_noop_when_it_fits():
     bundle = make_bundle()
-    fitted, trims = fit_bundle(bundle, 32768, 1464, system_tokens())
-    assert trims == []
-    assert fitted == bundle
+    options = SparkRunOptions(max_tokens=1000)
+    fit = await fit_bundle(bundle, 32768, options, count_prompt)
+    assert fit.trims == [] and fit.overflow is False
+    assert fit.bundle == bundle
+    assert fit.budget == 32768 - reserved_output_tokens(options)
+    # The one measurement is of the prompt as it will be sent, not of the bundle text.
+    assert (
+        fit.prompt_tokens
+        == prompt_tokens(bundle, options)
+        == await count_prompt(build_messages(bundle, options))
+    )
+    assert fit.measurements == 1
+
+
+async def test_fit_measures_the_rendered_prompt_through_the_counter():
+    seen: list[list[SparkMessage]] = []
+
+    async def recording_counter(messages: list[SparkMessage]) -> int:
+        seen.append(list(messages))
+        return await count_prompt(messages)
+
+    bundle = make_bundle()
+    options = SparkRunOptions(max_tokens=100)
+    await fit_bundle(bundle, 100_000, options, recording_counter)
+    assert seen == [build_messages(bundle, options)]
+    assert [m.role for m in seen[0]] == ["system", "user"] and seen[0][0].content == SYSTEM_PROMPT
+    # A counter failure is the session's error and propagates untouched.
+
+    async def failing(messages: list[SparkMessage]) -> int:
+        raise AnalysisError(ErrorCode.SPARK_INFERENCE_FAILED, details={"reason": "tokenize_status"})
+
+    with pytest.raises(AnalysisError) as info:
+        await fit_bundle(bundle, 100_000, options, failing)
+    assert info.value.details == {"reason": "tokenize_status"}
 
 
 def make_big_bundle() -> SparkEvidenceBundle:
@@ -223,33 +273,42 @@ def make_big_bundle() -> SparkEvidenceBundle:
     return make_bundle(excerpts=excerpts, important_events=events, historical_analogues=analogues)
 
 
-def test_fit_bundle_stops_after_the_first_step_that_fits():
+async def test_fit_bundle_stops_after_the_first_step_that_fits():
     bundle = make_big_bundle()
+    options = SparkRunOptions(max_tokens=10)
+    reserved = reserved_output_tokens(options)
     deduped = bundle.model_copy(update={"excerpts": [bundle.excerpts[0], *bundle.excerpts[2:]]})
-    budget = prompt_tokens_estimate(deduped)
-    fitted, trims = fit_bundle(bundle, budget + 10, 10, 0)
-    assert trims == ["removed 1 duplicate excerpt(s)"]
-    assert fitted.excerpts == deduped.excerpts
-    assert fitted.important_events == bundle.important_events
+    needed = prompt_tokens(deduped, options)
+    assert prompt_tokens(bundle, options) > needed
+    fit = await fit_bundle(bundle, needed + reserved, options, count_prompt)
+    assert fit.trims == ["removed 1 duplicate excerpt(s)"]
+    assert fit.bundle.excerpts == deduped.excerpts
+    assert fit.bundle.important_events == bundle.important_events
+    assert fit.prompt_tokens == needed == fit.budget and fit.measurements == 2
 
     # Next tier: only the lowest-ranked (unverified_web) excerpts go, worst-positioned first.
     one_blog = deduped.model_copy(
         update={"excerpts": [deduped.excerpts[0], deduped.excerpts[1], deduped.excerpts[3]]}
     )
-    budget = prompt_tokens_estimate(one_blog)
-    fitted, trims = fit_bundle(bundle, budget + 10, 10, 0)
-    assert trims == [
+    needed = prompt_tokens(one_blog, options)
+    fit = await fit_bundle(bundle, needed + reserved, options, count_prompt)
+    assert fit.trims == [
         "removed 1 duplicate excerpt(s)",
         "dropped 1 excerpt(s) from low-ranked non-primary sources",
     ]
-    assert [e["source_id"] for e in fitted.excerpts] == ["src_aa11", "src_bb22", "src_cc33"]
-    assert fitted.excerpts[1]["text"].startswith("Blog ")
+    assert [e["source_id"] for e in fit.bundle.excerpts] == ["src_aa11", "src_bb22", "src_cc33"]
+    assert fit.bundle.excerpts[1]["text"].startswith("Blog ")
+    assert fit.prompt_tokens == needed and fit.overflow is False
+    # every "does it fit" was a measurement of the then-current prompt
+    assert fit.measurements >= len(fit.trims) + 1
 
 
-def test_fit_bundle_applies_policy_in_order_and_protects_sections():
+async def test_fit_bundle_applies_policy_in_order_and_protects_sections():
     bundle = make_big_bundle()
-    fitted, trims = fit_bundle(bundle, 100, 10, 0)
-    assert trims == [
+    options = SparkRunOptions(max_tokens=10)
+    fit = await fit_bundle(bundle, 100, options, count_prompt)
+    fitted = fit.bundle
+    assert fit.trims == [
         "removed 1 duplicate excerpt(s)",
         "dropped 2 excerpt(s) from low-ranked non-primary sources",
         "dropped 2 historical analogue(s) beyond the first 3",
@@ -258,6 +317,10 @@ def test_fit_bundle_applies_policy_in_order_and_protects_sections():
         "dropped 1 remaining excerpt(s) from non-primary sources",
         OVERFLOW_TRIM,
     ]
+    assert fit.overflow is True
+    assert fit.budget == 100 - reserved_output_tokens(options)
+    assert fit.prompt_tokens == prompt_tokens(fitted, options) > fit.budget
+    assert fit.measurements >= len(fit.trims) + 1
     # Primary excerpt survives, truncated; every non-primary excerpt is gone.
     assert [e["source_id"] for e in fitted.excerpts] == ["src_aa11"]
     assert len(fitted.excerpts[0]["text"]) == 300
@@ -430,7 +493,7 @@ def test_to_assessment_with_empty_sections_warns_about_summary():
     assert warnings == ["spark response has no summary section"]
 
 
-# --- MockSpark --------------------------------------------------------------------------------
+# --- ScriptedSpark ----------------------------------------------------------------------------
 
 
 class Recorder:
@@ -438,7 +501,7 @@ class Recorder:
         self.events: list[tuple[str, dict[str, Any]]] = []
         self.tokens: list[str] = []
 
-    def ctx(self, analysis_id: str = "an_mock") -> AnalysisContext:
+    def ctx(self, analysis_id: str = "an_scripted") -> AnalysisContext:
         async def emit(name: str, data: dict[str, Any]) -> None:
             self.events.append((name, data))
 
@@ -448,26 +511,35 @@ class Recorder:
         self.tokens.append(text)
 
 
-async def test_mock_round_trips_through_parser():
+async def test_scripted_round_trips_through_parser():
     bundle = make_bundle()
     msgs = build_messages(bundle)
     rec = Recorder()
-    spark = MockSpark()
+    spark = ScriptedSpark()
     ctx = rec.ctx()
     gen = await spark.run("fast", msgs, rec.on_token, ctx)
     assert "".join(rec.tokens) == gen.text
     assert len(rec.tokens) > 5
     assert gen.truncated is False
-    assert gen.stats.finish_reason == "stop"
-    assert gen.stats.output_tokens == estimate_tokens(gen.text)
-    assert gen.stats.tokens_per_second is None
-    assert gen.stats.time_to_first_token_ms is not None
+    stats = gen.stats
+    assert stats.finish_reason == "stop"
+    # Measured or None: the prompt count is the double's own tokenizer over the messages it was
+    # given; no model produced the text, so there is no output count, no throughput without a
+    # real delay, no load time, no memory and no runtime version.
+    assert stats.prompt_tokens == await count_prompt(msgs)
+    assert stats.output_tokens is None
+    assert stats.tokens_per_second is None
+    assert stats.load_ms is None and stats.runtime_version is None
+    assert stats.resident_rss_mb is None and stats.peak_rss_mb is None
+    assert stats.time_to_first_token_ms is not None and stats.total_ms >= 0
     assert ctx.timers.elapsed_ms["spark"] >= 0
-    assert "spark_ttft_ms" in ctx.diagnostics
+    assert "spark_ttft_ms" in ctx.diagnostics and ctx.diagnostics["spark_loaded_now"] is True
     assert rec.events == [
         ("spark.loading", {"profile": "fast", "context_ceiling": 32768, "kv_cache_type": "f16"})
     ]
     assert "Acme Corp (ACME)" in gen.text
+    assert "[scripted]" in gen.text and "not an assessment" in gen.text
+    assert "mock" not in gen.text.lower()
 
     sections = parse_sections(gen.text)
     expected = [SECTION_KEYS[h] for h in SECTION_HEADINGS] + [
@@ -481,17 +553,45 @@ async def test_mock_round_trips_through_parser():
     assert assessment.bull_evidence[0].source_ids
     assert horizons["near_term"].stance == "bullish"
     assert horizons["medium_term"].stance == "mixed"
+    assert all("in the bundle" in e.text for e in horizons["near_term"].key_evidence)
     assert not any("unknown source" in w for w in warnings)
 
     # Second run of the same profile: no new loading event; runs recorded.
-    await spark.run("fast", msgs, rec.on_token, rec.ctx("an_2"))
-    assert len(rec.events) == 1
+    ctx2 = rec.ctx("an_2")
+    await spark.run("fast", msgs, rec.on_token, ctx2)
+    assert len(rec.events) == 1 and ctx2.diagnostics["spark_loaded_now"] is False
     assert [r["profile"] for r in spark.runs] == ["fast", "fast"]
     assert all(r["completed"] for r in spark.runs)
 
 
-async def test_mock_deep_unavailable():
-    spark = MockSpark(deep_available=False)
+async def test_scripted_session_measures_then_generates_once():
+    spark = ScriptedSpark()
+    rec = Recorder()
+    ctx = rec.ctx()
+    msgs = build_messages(make_bundle())
+    assert spark.busy is False
+    async with spark.session("fast", ctx) as session:
+        assert spark.busy is True  # the lane is held for the whole session
+        assert session.spec.context_ceiling == 32768 and session.spec.name == "fast"
+        measured = await session.count_prompt_tokens(msgs)
+        assert measured == await count_prompt(msgs)
+        shorter = [SparkMessage(role="user", content="hi")]
+        assert await session.count_prompt_tokens(shorter) == 1
+        assert spark.runs == []  # measuring is not generating
+        gen = await session.generate(msgs, rec.on_token)
+        assert gen.stats.prompt_tokens == measured
+        with pytest.raises(AnalysisError) as info:
+            await session.generate(msgs, rec.on_token)
+        assert info.value.code == ErrorCode.INTERNAL_ERROR
+    assert spark.busy is False
+    assert spark.sessions == [{"profile": "fast", "measurements": [measured, 1]}]
+    assert [r["profile"] for r in spark.runs] == ["fast"]
+    # loading was emitted when the session opened, before any measurement
+    assert [name for name, _ in rec.events] == ["spark.loading"]
+
+
+async def test_scripted_deep_unavailable():
+    spark = ScriptedSpark(deep_available=False)
     cap = spark.availability("deep")
     assert cap.available is False
     assert cap.code == ErrorCode.DEEP_PROFILE_UNAVAILABLE
@@ -502,40 +602,60 @@ async def test_mock_deep_unavailable():
         await spark.run("deep", build_messages(make_bundle()), rec.on_token, rec.ctx())
     assert info.value.code == ErrorCode.DEEP_PROFILE_UNAVAILABLE
     assert rec.tokens == [] and rec.events == []
-    assert spark.runs == []
-    gen = await MockSpark(deep_available=True).run(
+    assert spark.runs == [] and spark.sessions == [] and spark.busy is False
+    gen = await ScriptedSpark(deep_available=True).run(
         "deep", build_messages(make_bundle()), rec.on_token, rec.ctx()
     )
     assert gen.stats.profile == "deep" and gen.stats.kv_cache_type == "q4_0"
 
 
-async def test_mock_honours_cancel_between_chunks():
-    spark = MockSpark()
+@pytest.mark.parametrize("reason", [ErrorCode.CANCELLED, ErrorCode.INTERRUPTED])
+async def test_scripted_honours_cancel_between_chunks_with_its_reason(reason: ErrorCode):
+    spark = ScriptedSpark()
     rec = Recorder()
     ctx = rec.ctx()
 
     async def on_token(text: str) -> None:
         rec.tokens.append(text)
-        ctx.cancel.cancel()
+        ctx.cancel.cancel(reason)
 
     with pytest.raises(AnalysisError) as info:
         await spark.run("fast", build_messages(make_bundle()), on_token, ctx)
-    assert info.value.code == ErrorCode.CANCELLED
+    assert info.value.code == reason  # a shutdown is reported as INTERRUPTED, not CANCELLED
     assert len(rec.tokens) == 1
     assert spark.runs[0]["completed"] is False
     assert spark.runs[0]["chunks_emitted"] == 1
+    assert spark.busy is False
+    # Cancelled before the session opens: nothing is loaded, measured or streamed.
+    early = rec.ctx("an_early")
+    early.cancel.cancel(reason)
+    with pytest.raises(AnalysisError) as info:
+        async with spark.session("fast", early):
+            raise AssertionError("unreachable")
+    assert info.value.code == reason and len(spark.sessions) == 1
 
 
-async def test_mock_text_factory_and_plain_messages():
-    spark = MockSpark(text_factory=lambda msgs: "## Summary\nCustom.\n", chunk_chars=4)
+async def test_scripted_text_factory_and_plain_messages():
+    spark = ScriptedSpark(text_factory=lambda msgs: "## Summary\nCustom.\n", chunk_chars=4)
     rec = Recorder()
     gen = await spark.run(
         "fast", [SparkMessage(role="user", content="hi")], rec.on_token, rec.ctx()
     )
     assert gen.text == "## Summary\nCustom.\n"
     assert rec.tokens == ["## S", "umma", "ry\nC", "usto", "m.\n"]
-    default = await MockSpark().run(
+    assert gen.stats.prompt_tokens == 1
+    default = await ScriptedSpark().run(
         "fast", [SparkMessage(role="user", content="no bundle here")], rec.on_token, rec.ctx()
     )
     assert "the company" in default.text
     assert "## Horizon:" not in default.text
+
+
+async def test_scripted_throughput_is_measured_only_with_a_real_delay():
+    spark = ScriptedSpark(delay_s=0.005, chunk_chars=400)
+    rec = Recorder()
+    gen = await spark.run("fast", build_messages(make_bundle()), rec.on_token, rec.ctx())
+    assert gen.stats.output_tokens is None
+    assert gen.stats.tokens_per_second is not None and gen.stats.tokens_per_second > 0
+    assert gen.stats.total_ms >= 5.0 * len(rec.tokens) * 0.5
+    assert gen.stats.time_to_first_token_ms is not None and gen.stats.time_to_first_token_ms > 0

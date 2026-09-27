@@ -19,6 +19,7 @@ from bayanalytics.store import (
     SCHEMA_VERSION,
     InMemoryStore,
     PostgresStore,
+    SchemaVersionError,
     build_ssl,
     build_store,
     parse_ssl_mode,
@@ -325,3 +326,35 @@ async def test_pg_count_active_and_list(pg_store: PostgresStore) -> None:
     job.status = "completed"
     await pg_store.update_job(job)
     assert await pg_store.count_active() == before
+
+
+@requires_postgres
+async def test_pg_refuses_a_database_from_newer_code() -> None:
+    import asyncpg
+
+    assert TEST_DSN
+    store = PostgresStore(TEST_DSN, pool_min=1, pool_max=1)
+    await store.start()
+    newer = SCHEMA_VERSION + 1
+    clean_url, mode, rootcert = parse_ssl_mode(TEST_DSN)
+    ssl_option = build_ssl(mode, cafile=rootcert)
+    connect_kwargs = {} if ssl_option is None else {"ssl": ssl_option}
+    try:
+        await store.pool.execute("INSERT INTO schema_migrations (version) VALUES ($1)", newer)
+        await store.close()
+        with pytest.raises(SchemaVersionError, match=str(newer)):
+            await store.start()
+        assert store._pool is None  # nothing left open after the refusal
+        with pytest.raises(RuntimeError):
+            _ = store.pool
+    finally:
+        # start() would refuse too, so clean up over a raw connection.
+        conn = await asyncpg.connect(clean_url, **connect_kwargs)
+        try:
+            await conn.execute("DELETE FROM schema_migrations WHERE version = $1", newer)
+        finally:
+            await conn.close()
+        await store.close()
+    await store.start()  # back to normal once the newer row is gone
+    assert store.applied_version == SCHEMA_VERSION
+    await store.close()

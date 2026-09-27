@@ -18,6 +18,7 @@ from bayanalytics.normalization.corporate_actions import (
 from bayanalytics.normalization.facts import (
     build_facts,
     classify_freshness,
+    derive_fourth_quarter_rows,
     detect_stale_mix,
     freshness_summary,
     normalize_unit,
@@ -969,11 +970,20 @@ class TestCorporateActions:
             CorporateAction(kind="fiscal_year_change", effective=date(2025, 8, 1)),
             CorporateAction(kind="share_class_change"),
             CorporateAction(kind="dividend", effective=date(2025, 9, 1)),
+            CorporateAction(
+                kind="name_change", effective=date(2025, 3, 1), detail="formerly Old Name Corp"
+            ),
         ]
         warnings = detect_identity_breaks(actions)
-        assert len(warnings) == 6
+        assert len(warnings) == 7
         assert warnings[0].startswith("merger on 2024-05-01 (with Y Corp)")
         assert any("ticker change" in w and "FB -> META" in w for w in warnings)
+        # A renamed issuer is the same reporting entity: a mild note, not an identity break.
+        (renamed,) = [w for w in warnings if w.startswith("name change on 2025-03-01")]
+        assert "formerly Old Name Corp" in renamed
+        assert "older filings and coverage appear under the former name" in renamed
+        assert "the reporting entity is unchanged" in renamed
+        assert not any("not the same" in w for w in warnings if "name change" in w)
         assert any("fiscal-year change" in w for w in warnings)
         assert any("unknown date" in w for w in warnings)
         assert not any("dividend" in w for w in warnings)
@@ -1034,3 +1044,83 @@ class TestCorporateActions:
         )
         assert note.startswith("2 dividend(s) recorded between 2026-02-01 and 2026-05-01")
         assert "price returns" in note and "total return" in note
+
+
+# ======================================================================================
+# derived fourth quarters (EDGAR never tags a Q4 duration)
+# ======================================================================================
+
+
+def _xbrl_row(
+    metric: str, value: float, start: str, end: str, fp: str, filed: str, **overrides
+) -> dict:
+    row = {
+        "concept": f"us-gaap:{metric}",
+        "metric": metric,
+        "value": value,
+        "unit": "USD",
+        "start": start,
+        "end": end,
+        "fy": 2025,
+        "fp": fp,
+        "form": "10-K" if fp == "FY" else "10-Q",
+        "filed": filed,
+        "accn": f"acc-{fp}",
+        "frame": None,
+        "source_id": "src_x",
+        "basis": "gaap",
+        "currency": "USD",
+    }
+    row.update(overrides)
+    return row
+
+
+class TestDeriveFourthQuarter:
+    def test_derived_q4_is_fy_minus_nine_month_ytd(self):
+        rows = [
+            _xbrl_row("revenue", 400.0, "2024-09-29", "2025-09-27", "FY", "2025-10-31"),
+            _xbrl_row("revenue", 290.0, "2024-09-29", "2025-06-28", "Q3", "2025-08-01"),
+        ]
+        out = derive_fourth_quarter_rows(rows)
+        assert out[:2] == rows  # inputs first, unchanged
+        (q4,) = [r for r in out if r.get("extraction_method") == "derived_q4"]
+        assert q4["value"] == 110.0 and q4["fp"] == "Q4" and q4["metric"] == "revenue"
+        assert (q4["start"], q4["end"]) == ("2025-06-29", "2025-09-27")
+        # provenance follows the 10-K, and both contributing rows are listed
+        assert q4["filed"] == "2025-10-31" and q4["accn"] == "acc-FY"
+        assert q4["source_id"] == "src_x" and q4["form"] == "10-K"
+        assert [d["accn"] for d in q4["derived_from"]] == ["acc-FY", "acc-Q3"]
+        assert q4["concept"].endswith("(derived Q4)")
+
+    def test_q4_is_never_derived_for_per_share_or_instant_metrics(self):
+        for metric in ("eps_diluted", "eps_basic", "shares_outstanding", "total_debt"):
+            rows = [
+                _xbrl_row(metric, 6.0, "2024-09-29", "2025-09-27", "FY", "2025-10-31"),
+                _xbrl_row(metric, 4.5, "2024-09-29", "2025-06-28", "Q3", "2025-08-01"),
+            ]
+            assert derive_fourth_quarter_rows(rows) == rows, metric
+
+    def test_q4_not_derived_when_an_explicit_fourth_quarter_exists(self):
+        rows = [
+            _xbrl_row("revenue", 400.0, "2024-09-29", "2025-09-27", "FY", "2025-10-31"),
+            _xbrl_row("revenue", 290.0, "2024-09-29", "2025-06-28", "Q3", "2025-08-01"),
+            _xbrl_row("revenue", 111.0, "2025-06-29", "2025-09-27", "Q4", "2025-10-31"),
+        ]
+        out = derive_fourth_quarter_rows(rows)
+        assert out == rows
+        assert [r["value"] for r in out if r["fp"] == "Q4"] == [111.0]
+
+    def test_q4_needs_matching_basis_currency_and_fiscal_year_start(self):
+        fy = _xbrl_row("revenue", 400.0, "2024-09-29", "2025-09-27", "FY", "2025-10-31")
+        ytd = _xbrl_row("revenue", 290.0, "2024-09-29", "2025-06-28", "Q3", "2025-08-01")
+        assert derive_fourth_quarter_rows([fy, {**ytd, "basis": "adjusted"}]) == [
+            fy,
+            {**ytd, "basis": "adjusted"},
+        ]
+        assert derive_fourth_quarter_rows([fy, {**ytd, "currency": "EUR"}]) == [
+            fy,
+            {**ytd, "currency": "EUR"},
+        ]
+        shifted = {**ytd, "start": "2024-10-01"}
+        assert derive_fourth_quarter_rows([fy, shifted]) == [fy, shifted]
+        assert derive_fourth_quarter_rows([]) == []

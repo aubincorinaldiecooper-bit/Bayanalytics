@@ -7,7 +7,10 @@ article is invented. JSON files carry `"fixture": true`, HTML pages carry
 
 Regenerate the generated files (CSVs, EDGAR JSON, pages.json, searches.json) with:
 
-    cd backend && .venv/bin/python -m bayanalytics.research.fixtures_build
+    cd backend && .venv/bin/python tests/fixtures/research/build_apple.py
+
+(the generator lives next to this directory, under `tests/`, never in the product package;
+`tests/test_research_runner.py` checks the committed files match its output byte for byte).
 
 Layout: `pages.json` (URL -> body file), `searches.json` (query -> SearXNG-shaped results),
 `edgar/` (submissions, companyfacts, company_tickers, tiny primary documents), `prices/`
