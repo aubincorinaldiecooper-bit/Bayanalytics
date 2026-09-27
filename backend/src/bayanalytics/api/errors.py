@@ -25,7 +25,10 @@ def _envelope(payload: ErrorPayload, status: int) -> JSONResponse:
 def install_error_handlers(app: FastAPI) -> None:
     @app.exception_handler(AnalysisError)
     async def _analysis_error(_request: Request, exc: AnalysisError) -> JSONResponse:
-        return _envelope(exc.payload(), exc.http_status)
+        response = _envelope(exc.payload(), exc.http_status)
+        if exc.code == ErrorCode.TOO_MANY_ANALYSES:
+            response.headers["Retry-After"] = "5"
+        return response
 
     @app.exception_handler(RequestValidationError)
     async def _validation_error(_request: Request, exc: RequestValidationError) -> JSONResponse:

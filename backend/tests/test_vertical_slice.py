@@ -265,15 +265,20 @@ async def test_deep_profile_unavailable_is_a_structured_error() -> None:
         assert created.json()["error"]["message"].endswith("Try Fast.")
 
 
-async def test_ambiguous_instrument_fails_with_candidates() -> None:
+async def test_ambiguous_instrument_is_answered_at_post() -> None:
     rt = build_runtime(_settings())
-    _id, events, result = await _run_to_completion(rt, {"query": "Compare Apple and Microsoft."})
-    assert events[-1]["event"] == "analysis.failed"
-    error = events[-1]["data"]["error"]
-    assert error["code"] == "AMBIGUOUS_INSTRUMENT"
-    assert {c["symbol"] for c in error["details"]["candidates"]} == {"AAPL", "MSFT"}
-    assert result["status"] == "failed" and result["error"]["code"] == "AMBIGUOUS_INSTRUMENT"
-    assert [e["event"] for e in events] == ["analysis.started", "analysis.failed"]
+    async for client in _client(rt):
+        created = await client.post(
+            "/api/v1/analyses", json={"query": "Compare Apple and Microsoft."}
+        )
+        assert created.status_code == 422
+        error = created.json()["error"]
+        assert error["code"] == "AMBIGUOUS_INSTRUMENT"
+        assert error["message"] == "Which company did you mean?"
+        assert {c["symbol"] for c in error["details"]["candidates"]} == {"AAPL", "MSFT"}
+        assert rt.runner.active_count == 0  # no orphan analysis was created
+        health = (await client.get("/api/v1/health")).json()
+        assert health["active_analyses"] == 0
 
 
 async def test_laya_failure_is_structured_and_keeps_sources() -> None:

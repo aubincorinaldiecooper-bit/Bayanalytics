@@ -67,6 +67,7 @@ class Settings(BaseModel):
     max_request_body_bytes: int = 64 * 1024
     max_upload_bytes: int = 25 * 1024 * 1024
     health_cache_s: float = 2.0
+    sse_keepalive_s: float = 15.0
 
     # --- persistence --------------------------------------------------------------------
     database_url: str | None = None

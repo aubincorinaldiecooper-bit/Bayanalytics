@@ -81,7 +81,13 @@ class AnalysisEventBus:
             terminal_already = analysis_id in self._terminal
         try:
             last = after_seq
-            for record in await self._store.list_events(analysis_id, after_seq=after_seq):
+            # Replay from one event before ``after_seq`` so a client that reconnects with the
+            # terminal event's own id (what EventSource does after the server closes) is told
+            # the stream is over instead of waiting on a queue that will never fill.
+            replay = await self._store.list_events(analysis_id, after_seq=max(after_seq - 1, 0))
+            if replay and replay[0].seq == after_seq and replay[0].terminal:
+                return
+            for record in replay:
                 if record.seq > last:
                     last = record.seq
                     yield record

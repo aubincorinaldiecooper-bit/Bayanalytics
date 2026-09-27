@@ -49,7 +49,7 @@ _DEFAULTS: dict[ErrorCode, tuple[str, bool, int]] = {
         503,
     ),
     ErrorCode.DEEP_PROFILE_UNAVAILABLE: (
-        "Deep analysis is not available on this machine right now. Try Fast.",
+        "Deep analysis isn't available on this machine right now. Try Fast.",
         True,
         503,
     ),

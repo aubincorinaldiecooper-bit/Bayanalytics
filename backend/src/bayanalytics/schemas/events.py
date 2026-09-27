@@ -28,6 +28,7 @@ EventName = Literal[
     "laya.completed",
     "calculation.started",
     "calculation.completed",
+    "spark.queued",
     "spark.loading",
     "spark.started",
     "spark.token",

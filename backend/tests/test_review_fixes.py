@@ -328,3 +328,68 @@ async def test_cancel_is_honoured_while_llama_server_is_silent(tmp_path: Path) -
     finally:
         server.release.set()
         await harness.aclose()
+
+
+# --------------------------------------------------------------- frontend-audit fixes
+
+
+async def test_reconnect_with_terminal_id_closes_immediately() -> None:
+    rt = build_runtime(_settings())
+    async for client in _client(rt):
+        created = await client.post("/api/v1/analyses", json={"query": "Assess Apple."})
+        analysis_id = created.json()["analysis_id"]
+        events = [e async for e in rt.bus.stream(analysis_id)]
+        terminal_seq = events[-1].seq
+        await asyncio.sleep(0.02)
+        # What EventSource sends after the server closes at the terminal frame.
+        started = time.perf_counter()
+        async with client.stream(
+            "GET",
+            f"/api/v1/analyses/{analysis_id}/events",
+            headers={"Last-Event-ID": str(terminal_seq)},
+        ) as resp:
+            raw = "".join([chunk async for chunk in resp.aiter_text()])
+        assert time.perf_counter() - started < 1.0
+        assert "event:" not in raw and "stream complete" in raw
+        # Beyond the end (bogus id) also closes.
+        async with client.stream(
+            "GET", f"/api/v1/analyses/{analysis_id}/events", params={"after": terminal_seq + 50}
+        ) as resp:
+            raw2 = "".join([chunk async for chunk in resp.aiter_text()])
+        assert "event:" not in raw2
+        # The bus itself also refuses to wait when handed the terminal id.
+        again = [e async for e in rt.bus.stream(analysis_id, after_seq=terminal_seq)]
+        assert again == []
+
+
+async def test_spark_queued_is_emitted_while_the_lane_is_busy() -> None:
+    rt = build_runtime(_settings(), spark=MockSpark(delay_s=0.02))
+    async for client in _client(rt):
+        first = (await client.post("/api/v1/analyses", json={"query": "Assess Apple."})).json()
+        second = (await client.post("/api/v1/analyses", json={"query": "Assess Apple."})).json()
+        ev1 = [e async for e in rt.bus.stream(first["analysis_id"])]
+        ev2 = [e async for e in rt.bus.stream(second["analysis_id"])]
+        names2 = [e.event for e in ev2]
+        assert "spark.queued" in names2
+        assert names2.index("spark.queued") < names2.index("spark.started")
+        assert ev1[-1].event == "analysis.completed" and ev2[-1].event == "analysis.completed"
+
+
+async def test_too_many_analyses_has_retry_after_and_keepalive_setting_is_used() -> None:
+    from test_core_jobs_api import _pipeline_slow, _runtime
+
+    rt = _runtime(_pipeline_slow)
+    rt.runner._max_active = 1
+    rt.settings = rt.settings.model_copy(update={"sse_keepalive_s": 0.05})
+    async for client in _client(rt):
+        first = await client.post("/api/v1/analyses", json={"query": "Assess Apple."})
+        second = await client.post("/api/v1/analyses", json={"query": "Assess Apple."})
+        assert second.status_code == 429 and second.headers["retry-after"] == "5"
+        analysis_id = first.json()["analysis_id"]
+        await asyncio.sleep(0.2)
+        await client.post(f"/api/v1/analyses/{analysis_id}/cancel")
+        async with client.stream("GET", f"/api/v1/analyses/{analysis_id}/events") as resp:
+            raw = "".join([chunk async for chunk in resp.aiter_text()])
+        # A 0.05 s keepalive against a pipeline that ticks every 10 ms yields keepalives
+        # only when nothing is published; the terminal event must still close the stream.
+        assert "event: analysis.failed" in raw

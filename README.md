@@ -113,11 +113,29 @@ Errors always use `{"error": {"code", "message", "retryable", "details?"}}` with
 `DEEP_PROFILE_UNAVAILABLE`, `MEMORY_PRESSURE`, `SPARK_START_FAILED`, `SPARK_INFERENCE_FAILED`,
 `LAYA_INFERENCE_FAILED`, `WHISPER_FAILED`, `INTERRUPTED`, `CANCELLED`, `INTERNAL_ERROR`) plus four
 HTTP-level codes (`NOT_FOUND`, `INVALID_REQUEST`, `UNAUTHORIZED`, `TOO_MANY_ANALYSES`) that never
-appear on the event stream. Notes for the client: `AMBIGUOUS_INSTRUMENT` arrives as
-`analysis.failed` (resolution runs inside the job, after `202`); a user cancel ends with
-`analysis.failed` whose `status` is `cancelled` and `error.code` is `CANCELLED`; a result with
-`partial: true` and `status: completed` means the synthesis was cut off or a horizon section is
-missing (`horizon_assessments[*].synthesized`).
+appear on the event stream.
+
+Notes for the client (from a real-HTTP simulation of the frontend reducer):
+
+- `AMBIGUOUS_INSTRUMENT` is answered synchronously by `POST /analyses` (422 with
+  `details.candidates`); no analysis is created, so the "Which company did you mean?" picker
+  runs before any stream is opened. If a live ticker refresh changes the answer, the same code
+  can still arrive as `analysis.failed`.
+- A user cancel ends with `analysis.failed` whose `status` is `cancelled` and `error.code` is
+  `CANCELLED`; branch on `status`, and treat the terminal event as authoritative (the cancel
+  response echoes the pre-cancel stage).
+- `laya.started` / `laya.decision` / `laya.completed` carry a `stage`: `research_plan` happens
+  inside the research phase, `evidence_scan`, `history_scan` and `text_evidence` are the scoring
+  phase, and `horizon` runs after the calculations. Map by stage, not by first occurrence.
+- `spark.queued` (with `active_analyses`) is emitted when the analysis is waiting for the single
+  Spark lane; `spark.loading` appears only when a model load actually happens; `spark.started`
+  arrives with the first token.
+- A result with `partial: true` and `status: completed` means the synthesis was cut off or a
+  horizon section is missing (`horizon_assessments[*].synthesized`).
+- `POST /transcriptions` takes the audio as multipart field `audio`.
+- Keepalive comments are sent every `BAY_SSE_KEEPALIVE_S` seconds (default 15); reconnecting with
+  the terminal event's id closes immediately.
+- `429 TOO_MANY_ANALYSES` carries `Retry-After: 5`.
 
 See `docs/ARCHITECTURE.md` for the event sequence, retrieval-loop termination rules, the
 evidence-only boundary and the profile/memory policy.

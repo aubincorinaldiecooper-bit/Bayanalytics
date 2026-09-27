@@ -64,7 +64,7 @@ analysis.started → instrument.resolved
 → laya.started → laya.decision × n → laya.completed        (evidence_scan, history_scan, text_evidence)
 → calculation.started → calculation.completed × n
 → laya.started → laya.decision × n → laya.completed        (horizon stances)
-→ spark.loading? → spark.started → spark.token × n → spark.completed
+→ spark.queued? → spark.loading? → spark.started → spark.token × n → spark.completed
 → analysis.completed | analysis.failed
 ```
 

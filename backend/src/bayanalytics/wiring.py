@@ -94,7 +94,11 @@ def build_runtime(
         spark=spark,
         transcriber=transcriber,
         research=research,
-        extras={"analyzer_factory": analyzer_factory, "spark_lock": spark_lock or {}},
+        extras={
+            "analyzer_factory": analyzer_factory,
+            "resolver_factory": resolver_factory,
+            "spark_lock": spark_lock or {},
+        },
     )
     runtime.runner = AnalysisRunner(
         store,

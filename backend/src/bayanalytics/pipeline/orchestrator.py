@@ -258,6 +258,12 @@ async def run_analysis(job: AnalysisJob, ctx: AnalysisContext, rt: Runtime) -> A
                 draft.streamed_text += text
                 await ctx.event("spark.token", text=text)
 
+            if _spark_busy(rt.spark):
+                await ctx.event(
+                    "spark.queued",
+                    profile=job.profile,
+                    active_analyses=rt.runner.active_count,
+                )
             generation = await rt.spark.run(job.profile, messages, on_token, ctx, options)
             await emit_started()  # an empty generation still marks the answer state
             stats = generation.stats
@@ -397,6 +403,13 @@ def _evidence_gate(evidence: NormalizedEvidence, gaps: list[str]) -> None:
             ErrorCode.STALE_EVIDENCE,
             details={"freshness": {"facts": facts_buckets, "prices": prices_fresh}},
         )
+
+
+def _spark_busy(spark: Any) -> bool:
+    """One Spark request runs at a time; report when this analysis has to wait for the lane."""
+    lock = getattr(spark, "_lock", None)
+    locked = getattr(lock, "locked", None)
+    return bool(locked()) if callable(locked) else False
 
 
 def _child_pids(rt: Runtime) -> dict[str, int]:
