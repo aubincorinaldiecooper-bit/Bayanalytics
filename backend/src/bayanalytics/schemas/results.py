@@ -156,6 +156,10 @@ class StanceChange(BaseModel):
     previous: Stance | None = None
     current: Stance | None = None
     changed: bool = False  # both known and different
+    compared_horizons: list[str] = Field(default_factory=list)
+    """``overall`` scope only: the horizons both assessments covered. The overall stance is
+    computed over these alone, so a run that covers fewer or other horizons is not reported
+    as a change of thesis."""
 
 
 class MetricChange(BaseModel):
@@ -204,6 +208,7 @@ class ThesisDiff(BaseModel):
     resolved_uncertainties: list[str] = Field(default_factory=list)
     freshness: FreshnessChange = Field(default_factory=FreshnessChange)
     stance_changed: bool = False  # the overall stance or any shared horizon stance moved
+    horizon_scope_changed: bool = False  # the runs assessed different sets of horizons
     summary: list[str] = Field(default_factory=list)  # deterministic one-line statements
 
 
