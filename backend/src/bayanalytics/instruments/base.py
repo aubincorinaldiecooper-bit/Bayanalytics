@@ -12,6 +12,7 @@ from bayanalytics.schemas.calculations import CalculationResult
 from bayanalytics.schemas.common import Profile, ResolvedHorizon
 from bayanalytics.schemas.decisions import LayaDecision, LayaQuestionSet
 from bayanalytics.schemas.evidence import NormalizedEvidence, SourceRecord
+from bayanalytics.schemas.questions import AnalyticalRequirements
 
 
 class InstrumentCandidate(BaseModel):
@@ -55,6 +56,8 @@ class AnalysisRequest(BaseModel):
     resolved_horizon: ResolvedHorizon
     as_of: datetime
     budget: ResearchBudget = Field(default_factory=ResearchBudget)
+    # What the question needs (instruments/questions.py); None until it was classified.
+    requirements: AnalyticalRequirements | None = None
 
 
 class LayaDecisions(BaseModel):
@@ -99,6 +102,9 @@ class SparkEvidenceBundle(BaseModel):
     prior_assessment: dict[str, Any] | None = None
     """Bounded, evidence-only comparison with the prior completed assessment of the same
     instrument (``pipeline.thesis.prior_assessment_block``); ``None`` when there is none."""
+    # What the analyst asked (kind, focus sentence, horizons to emphasise) and the
+    # requirements the analysis could not meet, so the synthesis addresses the question.
+    question_focus: dict[str, Any] = Field(default_factory=dict)
 
 
 class InstrumentAnalyzer(Protocol):

@@ -12,6 +12,7 @@ from bayanalytics.schemas.common import AnalysisStatus, Profile, ResolvedHorizon
 from bayanalytics.schemas.decisions import LayaDecision
 from bayanalytics.schemas.errors import ErrorPayload
 from bayanalytics.schemas.evidence import Conflict, SourceRecord
+from bayanalytics.schemas.questions import RequirementsReport
 
 
 class InstrumentView(BaseModel):
@@ -215,6 +216,9 @@ class AnalysisResult(BaseModel):
     laya_decisions: list[LayaDecision] = Field(default_factory=list)
     freshness_summary: dict[str, Any] = Field(default_factory=dict)
     thesis_diff: ThesisDiff | None = None  # None when no prior completed assessment exists
+    # How the question was classified and which of its requirements were met (None until the
+    # analysis reached the calculations).
+    requirements: RequirementsReport | None = None
     streamed_text: str = ""  # exactly what was streamed as spark.token, for recovery
     telemetry: Telemetry = Field(default_factory=Telemetry)
     error: ErrorPayload | None = None

@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 from bayanalytics.instruments.base import InstrumentIdentity
 from bayanalytics.research.dates import ensure_utc
 from bayanalytics.research.prices import to_stooq_symbol
+from bayanalytics.schemas.questions import AnalyticalRequirements
 
 QueryKind = Literal["search", "edgar_submissions", "edgar_companyfacts", "prices", "benchmarks"]
 
@@ -138,8 +139,27 @@ def gap_to_intent(gap: str) -> ResearchIntent:
     return ResearchIntent.retrieve_missing_metric
 
 
-def seed_plan(horizon: str) -> list[ResearchIntent]:
-    return list(SEED_PLANS.get(horizon, SEED_PLANS["multi_horizon"]))
+def seed_plan(
+    horizon: str, requirements: AnalyticalRequirements | None = None
+) -> list[ResearchIntent]:
+    """The first round's intents: what the question requires first, then the horizon seed.
+
+    Required intents are deduplicated against the seed and each other and ``stop_research`` is
+    never planned, so the plan is bounded by the intent set; execution is bounded by the
+    research budget (sources, rounds, time), which the loop checks after every intent. Without
+    requirements (or for ``general_assessment``, which requires nothing) the plan is exactly
+    the horizon seed.
+    """
+    base = list(SEED_PLANS.get(horizon, SEED_PLANS["multi_horizon"]))
+    if requirements is None or not requirements.required_research_intents:
+        return base
+    plan: list[ResearchIntent] = []
+    for name in [*requirements.required_research_intents, *base]:
+        intent = ResearchIntent(name)
+        if intent is ResearchIntent.stop_research or intent in plan:
+            continue
+        plan.append(intent)
+    return plan
 
 
 def _display_name(identity: InstrumentIdentity) -> str:

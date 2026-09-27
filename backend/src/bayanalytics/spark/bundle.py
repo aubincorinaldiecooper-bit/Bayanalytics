@@ -3,7 +3,7 @@
 ``fit_bundle`` applies the section-24 overflow policy in order and records every trim as a
 human-readable string the orchestrator surfaces as an uncertainty. Protected sections are never
 touched: ``calculated_metrics``, ``conflicts``, ``uncertainties``, ``laya_assessments``,
-``current_metrics``, ``freshness``.
+``current_metrics``, ``freshness``, ``question_focus``.
 
 Every token count is **measured**: ``fit_bundle`` renders the candidate prompt and asks the
 Spark session for the number of tokens the server will see (its own chat template and

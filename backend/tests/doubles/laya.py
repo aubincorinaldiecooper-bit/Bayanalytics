@@ -3,7 +3,8 @@
 No subprocess, no model. Answers are derived from a handful of well-known state keys
 (``revenue_growth_yoy``, ``operating_margin_change_bp``, ``price_return_1m``,
 ``volatility_30d_annualized``, ``pe_5y_percentile``, ``evidence_gaps``, ``sources_count``,
-``freshness``, ``guidance_hint``, ``sentiment_hint``, ...) with stable defaults when they are
+``freshness``, ``guidance_hint``, ``sentiment_hint``, ``rule_candidates``, ``question``, ...)
+with stable defaults when they are
 missing, so orchestration code sees plausible, repeatable decisions. Every choice answer
 returns a probability for every option summing to one; every call is recorded in ``calls``.
 
@@ -204,6 +205,20 @@ def _rule_research_intent(state: Mapping[str, Any], q: LayaQuestion) -> ChoiceAn
     return _choice_answer(q, "stop_research", 0.8)
 
 
+def _rule_question_kind(state: Mapping[str, Any], q: LayaQuestion) -> ChoiceAnswer:
+    """The rules' leading candidate when the state names one, else a general assessment."""
+    keys = [str(k) for k in (q.criteria or {})]
+    candidates = state.get("rule_candidates")
+    if isinstance(candidates, (list, tuple)):
+        for candidate in candidates:
+            if str(candidate) in keys:
+                return _choice_answer(q, str(candidate), 0.6)
+    return _choice_answer(q, "general_assessment", 0.5)
+
+
+_RECENT_PERIOD_WORDS = ("latest", "last quarter", "after earnings", "recent", "this quarter")
+
+
 def _rule_calculation_pack(state: Mapping[str, Any], q: LayaQuestion) -> ChoiceAnswer:
     has_growth = _num(state, "revenue_growth_yoy", "operating_margin_change_bp") is not None
     has_valuation = _num(state, "pe_5y_percentile", "pe_ratio") is not None
@@ -368,6 +383,8 @@ class RuleLaya:
     def _choice(self, key: str, q: LayaQuestion, state: Mapping[str, Any]) -> ChoiceAnswer:
         if key == "research_intent":
             return _rule_research_intent(state, q)
+        if key == "question_kind":
+            return _rule_question_kind(state, q)
         if key == "calculation_pack":
             return _rule_calculation_pack(state, q)
         if key == "guidance_trend":
@@ -480,4 +497,7 @@ class RuleLaya:
         if key == "stale_evidence_matters":
             freshness = _text(state, "freshness")
             return 0.7 if freshness in {"stale", "unknown"} else 0.25
+        if key == "recent_period_focus":
+            question = _text(state, "question", "query")
+            return 0.7 if any(word in question for word in _RECENT_PERIOD_WORDS) else 0.3
         return 0.5

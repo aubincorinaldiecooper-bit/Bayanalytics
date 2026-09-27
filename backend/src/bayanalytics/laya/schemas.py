@@ -14,10 +14,12 @@ from collections.abc import Iterable
 from bayanalytics.laya.compaction import validate_questions
 from bayanalytics.schemas.common import SINGLE_HORIZONS
 from bayanalytics.schemas.decisions import LayaQuestion
+from bayanalytics.schemas.questions import QUESTION_KIND_DESCRIPTIONS, QUESTION_KINDS
 
 LAYA_SCHEMA_VERSION = "finance-v1"
 
 # Stage names recorded on LayaDecision.stage.
+STAGE_QUESTION_SCAN = "question_scan"
 STAGE_RESEARCH_PLAN = "research_plan"
 STAGE_EVIDENCE_SCAN = "evidence_scan"
 STAGE_HISTORY_SCAN = "history_scan"
@@ -90,6 +92,19 @@ def _score(instructions: str, levels: Iterable[str]) -> LayaQuestion:
 def _noul(instructions: str) -> LayaQuestion:
     return LayaQuestion(type="noul", instructions=instructions)
 
+
+# ---- question scan (the bounded fallback of the deterministic classifier) ------------------
+
+# Eleven described options, kept as terse as the research intents so the head fits with margin.
+# Laya only picks the kind; the requirements table and the research plan are ordinary code.
+QUESTION_KIND = _choice(
+    "Which kind of question is the analyst asking about the company?",
+    {kind: QUESTION_KIND_DESCRIPTIONS[kind] for kind in QUESTION_KINDS},
+)
+RECENT_PERIOD_FOCUS = _noul(
+    "Does the question ask about a specific recent period, such as the latest quarter or the "
+    "last earnings report?"
+)
 
 # ---- research planning (section 21) --------------------------------------------------------
 
@@ -241,6 +256,8 @@ def horizon_stance_key(horizon: str) -> str:
 
 
 ALL_QUESTIONS: dict[str, LayaQuestion] = {
+    "question_kind": QUESTION_KIND,
+    "recent_period_focus": RECENT_PERIOD_FOCUS,
     "research_intent": RESEARCH_INTENT,
     "evidence_sufficient": EVIDENCE_SUFFICIENT,
     "stale_evidence_matters": STALE_EVIDENCE_MATTERS,
@@ -268,6 +285,17 @@ def _batch(*keys: str) -> dict[str, LayaQuestion]:
 
 
 # ---- builders: one batch per shared state -------------------------------------------------
+
+
+def question_kind_questions() -> dict[str, LayaQuestion]:
+    """Classify the analyst's question when the deterministic rules could not (stage
+    ``question_scan``): one bounded choice over the question kinds plus whether the question
+    asks about a specific recent period.
+
+    State: instrument, the question text, the horizon, the rules' candidate kinds and cues.
+    Asked only when the rules are unclear or low-confidence; Laya never plans research.
+    """
+    return _batch("question_kind", "recent_period_focus")
 
 
 def research_plan_questions() -> dict[str, LayaQuestion]:
@@ -382,6 +410,7 @@ def horizon_context_questions(horizons: Iterable[str]) -> dict[str, LayaQuestion
 
 
 BUILDERS = (
+    question_kind_questions,
     research_plan_questions,
     evidence_scan_questions,
     history_segment_questions,

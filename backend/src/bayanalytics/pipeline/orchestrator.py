@@ -26,6 +26,7 @@ from bayanalytics.instruments.equity import EquityAnalyzer
 from bayanalytics.jobs.models import AnalysisJob
 from bayanalytics.pipeline.assemble import finalize_assessment, merge_horizons
 from bayanalytics.pipeline.horizon import horizons_for
+from bayanalytics.pipeline.questions import resolve_requirements
 from bayanalytics.pipeline.thesis import (
     diff_assessments,
     find_prior_assessment,
@@ -38,6 +39,7 @@ from bayanalytics.runtime import Runtime
 from bayanalytics.schemas.common import ErrorCode, utcnow
 from bayanalytics.schemas.decisions import LayaDecision
 from bayanalytics.schemas.evidence import NormalizedEvidence, SourceRecord
+from bayanalytics.schemas.questions import RequirementsReport
 from bayanalytics.schemas.results import (
     AnalysisResult,
     Assessment,
@@ -76,6 +78,7 @@ class _Draft:
         self.partial_synthesis = False
         self.prior: AnalysisResult | None = None  # the last completed assessment, if any
         self.thesis_diff: ThesisDiff | None = None
+        self.requirements: RequirementsReport | None = None
 
     def instrument_view(self) -> InstrumentView | None:
         if self.identity is None:
@@ -106,6 +109,7 @@ class _Draft:
             laya_decisions=self.decisions.decisions,
             freshness_summary=self.freshness_summary,
             thesis_diff=self.thesis_diff,
+            requirements=self.requirements,
             streamed_text=self.streamed_text,
             telemetry=self.telemetry,
             error=error.payload() if error else None,
@@ -159,6 +163,13 @@ async def run_analysis(job: AnalysisJob, ctx: AnalysisContext, rt: Runtime) -> A
             )
             # 2. research ---------------------------------------------------------------
             await _set_status(rt, job, "researching")
+            # 2a. what the question requires: rules, or one bounded Laya choice
+            # (question_scan) when the rules are unclear; the plan is built from it.
+            requirements, question_decisions = await resolve_requirements(
+                job.query, job.resolved_horizon, analyzer.laya, ctx, instrument=identity.symbol
+            )
+            draft.decisions.decisions.extend(question_decisions)
+            request = request.model_copy(update={"requirements": requirements})
             sources = await analyzer.retrieve(identity, request, ctx)
             draft.sources = sources
             draft.decisions.decisions.extend(analyzer.research_decisions)
@@ -204,6 +215,11 @@ async def run_analysis(job: AnalysisJob, ctx: AnalysisContext, rt: Runtime) -> A
             for calc in calculations.calculations:
                 await ctx.event("calculation.completed", **calc.event_view())
             await rt.store.save_calculations(job.analysis_id, calculations.calculations)
+            # 5a. required-operand validation: unmet requirements are uncertainties (for the
+            # result and for Spark), never a failure.
+            draft.requirements = analyzer.validate_requirements(evidence, calculations)
+            if draft.requirements is not None:
+                draft.extra_uncertainties.extend(draft.requirements.uncertainties)
             # 5b. horizon stances (Laya, with calculations in state) ----------------------
             horizon_sets = analyzer.build_horizon_questions(
                 evidence, draft.decisions, calculations, request, horizons
@@ -397,6 +413,10 @@ async def _salvage(rt: Runtime, job: AnalysisJob, draft: _Draft, analyzer: Equit
         draft.decisions.decisions.extend(analyzer.research_decisions)
     if draft.identity is None and analyzer.identity is not None:
         draft.identity = analyzer.identity
+    if draft.requirements is None and analyzer.requirements is not None:
+        # The classification happened even if the calculations did not: report it, with
+        # every requirement the analysis never reached listed as unmet.
+        draft.requirements = analyzer.validate_requirements(draft.evidence, draft.calculations)
     try:
         if draft.sources:
             await rt.store.save_sources(job.analysis_id, draft.sources)

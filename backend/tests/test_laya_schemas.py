@@ -75,6 +75,7 @@ def head_tokens(question: LayaQuestion) -> int:
 @pytest.mark.parametrize(
     "builder",
     [
+        schemas.question_kind_questions,
         schemas.research_plan_questions,
         schemas.evidence_scan_questions,
         schemas.history_segment_questions,

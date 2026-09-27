@@ -31,8 +31,8 @@ backend/
   src/bayanalytics/
     api/            FastAPI routes: analyses, SSE events, cancel, transcriptions, health, capabilities
     jobs/           asyncio job runner (admission control), per-analysis event bus, durable job model
-    pipeline/       orchestrator (the vertical slice), horizon resolution, result assembly
-    instruments/    InstrumentAnalyzer boundary, identity resolution, EquityAnalyzer
+    pipeline/       orchestrator (the vertical slice), horizon resolution, question classification stage, result assembly
+    instruments/    InstrumentAnalyzer boundary, identity resolution, question kinds + analytical requirements, EquityAnalyzer
     research/       ResearchProvider boundary, SearXNG search, fetch (SSRF gate)/extract/dedup, SEC EDGAR, prices, intents
     normalization/  units, fiscal periods, market sessions, facts + conflicts + freshness, corporate actions (EDGAR name history)
     laya/           Node worker (@receptron/laya@0.1.2, NDJSON), Python client, finance question schemas, measured compaction
@@ -159,9 +159,21 @@ Notes for the client (from a real-HTTP simulation of the frontend reducer):
 - A user cancel ends with `analysis.failed` whose `status` is `cancelled` and `error.code` is
   `CANCELLED`; branch on `status`, and treat the terminal event as authoritative (the cancel
   response echoes the pre-cancel stage). A backend stop or crash is `INTERRUPTED`, never `CANCELLED`.
-- `laya.started` / `laya.decision` / `laya.completed` carry a `stage`: `research_plan` happens
-  inside the research phase, `evidence_scan`, `history_scan` and `text_evidence` are the scoring
-  phase, and `horizon` runs after the calculations. Map by stage, not by first occurrence.
+- `laya.started` / `laya.decision` / `laya.completed` carry a `stage`: `question_scan` (only
+  when the deterministic question classifier was unclear) and `research_plan` happen inside the
+  research phase, `evidence_scan`, `history_scan` and `text_evidence` are the scoring phase, and
+  `horizon` runs after the calculations. Map by stage, not by first occurrence.
+- The question is classified before research starts (see "Question classification" in
+  `docs/ARCHITECTURE.md`). Every `research.started` carries `question_kind` (one of
+  `general_assessment`, `thesis_change`, `valuation`, `growth`, `profitability_margins`,
+  `relative_performance`, `risk_volatility`, `guidance_outlook`, `earnings_reaction`,
+  `balance_sheet_liquidity`, `dividends_capital_return`), `classification_source` (`rules` or
+  `laya`) and `confidence`. The result's `requirements` field holds the `classification`
+  (`kind`, `confidence`, `source`, `cues`, `recent_period`, `decision_id`, `note`), the
+  `focus` sentence Spark was given, `horizons_emphasis`, and for research intents,
+  calculations and operands the `required_*` / `satisfied_*` / `missing_*` lists plus the
+  `uncertainties` those gaps produced (also merged into `assessment.uncertainties`). Unmet
+  requirements never fail an analysis; `INSUFFICIENT_EVIDENCE` keeps its meaning.
 - `spark.queued` (with `active_analyses`) is emitted when the analysis is waiting for the single
   Spark lane; `spark.loading` appears only when a model load actually happens; `spark.started`
   arrives with the first token and carries the measured `prompt_tokens`.

@@ -8,7 +8,11 @@ typed query / microphone
         ↓ (Whisper Tiny, voice only)
 instrument identification            instruments/identity.py
         ↓
+question classification              instruments/questions.py + pipeline/questions.py
+   deterministic rules  →  bounded Laya choice only when unclear  →  analytical requirements
+        ↓
 active retrieval loop                instruments/equity.py + research/*
+   required intents first, then the horizon seed; required operands become evidence gaps;
    Laya picks a bounded intent  →  deterministic query template  →  search / EDGAR / prices
         ↓
 normalization + provenance           normalization/*  (facts, periods, sessions, conflicts)
@@ -16,10 +20,14 @@ normalization + provenance           normalization/*  (facts, periods, sessions,
 Laya finance wrapper                 laya/*  (question schemas, compaction, worker client)
         ↓
 deterministic calculations           calculations/*  (registry, packs, reconciliation, formatting)
+   the Laya-chosen pack plus every calculation the question requires
+        ↓
+required-operand validation          instruments/questions.py::check_requirements
+   unmet requirements → uncertainties + AnalysisResult.requirements (never a failure)
         ↓
 prior assessment + thesis diff       pipeline/thesis.py  (store lookup, structured comparison)
         ↓
-structured evidence bundle           instruments/equity.py::build_spark_bundle (+ prior block)
+structured evidence bundle           instruments/equity.py::build_spark_bundle (+ question_focus, prior block)
         ↓
 Spark X2.5 1.7B Q4_K_M (llama.cpp)   spark/*  (profiles, manager, streaming client, parser)
         ↓
@@ -49,7 +57,7 @@ product: test doubles live under `backend/tests/doubles`, are injected through
 
 | Model | Role | Runtime | Boundary |
 | --- | --- | --- | --- |
-| Laya (`@receptron/laya@0.1.2`) | fast bounded decisions: research intent, materiality, trends, stances, calculation pack | ONNX Runtime CPU in a persistent Node 20+ worker | `laya/worker/worker.mjs` exposes only `load`, `system_one`, `count_tokens`, `health`, `close` |
+| Laya (`@receptron/laya@0.1.2`) | fast bounded decisions: question kind (only when the rules are unclear), research intent, materiality, trends, stances, calculation pack | ONNX Runtime CPU in a persistent Node 20+ worker | `laya/worker/worker.mjs` exposes only `load`, `system_one`, `count_tokens`, `health`, `close` |
 | Spark X2.5 1.7B Q4_K_M | synthesis and explanation over the compact evidence bundle | llama.cpp `llama-server` ≥ b10828 | `spark/manager.py` owns Fast/Deep restarts under the Spark lock |
 | Whisper Tiny | speech-to-text only | whisper.cpp `whisper-cli` | `whisper/client.py`; never auto-submits an analysis |
 
@@ -144,8 +152,11 @@ The SSE stream (`GET /api/v1/analyses/{id}/events`) carries only recorded system
 
 ```
 analysis.started → instrument.resolved
+→ laya.started → laya.decision × 2 → laya.completed        (question_scan; only when the rules
+                                                            could not classify the question)
 → research.started / research.query / research.source_found / research.source_rejected
-  (per round; then laya.started → laya.decision × n → laya.completed for the research_plan
+  (per round; research.started carries question_kind, classification_source and confidence;
+  then laya.started → laya.decision × n → laya.completed for the research_plan
   stage, which chooses the next bounded intent)
 → research.completed → normalization.completed
 → laya.started → laya.decision × n → laya.completed        (evidence_scan, history_scan, text_evidence)
@@ -162,14 +173,60 @@ that llama-server separates into `reasoning_content` is dropped. Inline reasonin
 `content`, if the model ever produces any, is not filtered (to be verified on the reference
 machine).
 
+## Question classification and analytical requirements
+
+The analyst's question shapes the analysis before any retrieval:
+
+```
+user query
+  ↓ classify_question: deterministic keyword/regex rules with a confidence and the matched cues
+  ↓ question_scan: one bounded Laya choice over the same kinds, only when the rules are unclear
+  ↓ AnalyticalRequirements: required research intents, calculations, operands, focus, horizons
+  ↓ seed_plan(horizon, requirements): required intents first, then the horizon seed (deduplicated)
+  ↓ compute_gaps: required operands missing from the retrieval state are evidence gaps
+  ↓ calculate: the Laya-chosen pack plus every required calculation
+  ↓ check_requirements: what was met, what was not → uncertainties + result.requirements
+  ↓ Spark bundle question_focus → rendered in the instructions, outside the evidence block
+```
+
+The kinds are a closed set (`general_assessment`, `thesis_change`, `valuation`, `growth`,
+`profitability_margins`, `relative_performance`, `risk_volatility`, `guidance_outlook`,
+`earnings_reaction`, `balance_sheet_liquidity`, `dividends_capital_return`). Each rule adds its
+weight to one kind. `general_assessment` cues ("assess", "analyze", "should I buy") are framing:
+they win only when no specific kind scored, so "Assess Apple's valuation" is a valuation
+question, and they never count as a competitor. Among the rest the leading kind wins with
+`0.5 + 0.2 × margin − 0.15 × [a competing kind scored]`, capped at 0.95, so one plain cue is
+0.7, a decisive phrase 0.9 and a one-point lead over a competing kind 0.55. Below 0.6, or when
+nothing fired or two kinds tied, Laya answers
+`question_kind_questions` (a choice over the kinds plus a `recent_period_focus` noul) over a
+compact state holding the question, the horizon and the rules' candidates; the decision is
+recorded like every other one (stage `question_scan`). Laya's pick below 0.4 confidence is not
+trusted to narrow the analysis: a general assessment runs and the result says so. Laya only
+picks the kind; the requirements are a table lookup (`instruments/questions.py::REQUIREMENTS`,
+validated against the intent set, the calculation registry and the canonical metric names at
+import time) and the plan is ordinary code. `general_assessment` requires nothing beyond the
+horizon seed plan and the Laya-chosen pack, so "Assess X." behaves exactly as before.
+
+Required operands that the structured sources did not carry surface as gaps under their metric
+name (`gap_to_intent` maps them to `retrieve_earnings_history`, and once that was executed the
+loop escalates to one `retrieve_missing_metric` search whose template spells the metric out);
+the termination rules below are unchanged. After the calculations `check_requirements` lists
+each required calculation and operand as satisfied or missing (with the missing inputs or the
+reason the formula had no meaningful value) and each required intent the budget did not reach;
+every gap is one sentence such as "the question asks about valuation but the trailing P/E could
+not be computed: missing eps_ttm", added to the assessment's uncertainties and shown to Spark
+as "evidence the question needs that could not be retrieved or computed". Nothing here fails an
+analysis: `INSUFFICIENT_EVIDENCE` remains the evidence gate's verdict on facts and primary
+sources.
+
 ## Retrieval loop termination
 
-`EquityAnalyzer.retrieve` runs a horizon-specific seed plan, then asks Laya for the next bounded
-intent, an `evidence_sufficient` probability and a `stale_evidence_matters` probability after
-every round. It stops when evidence is sufficient (≥ 0.7), Laya chooses `stop_research` and no
-untried gap remains, the chosen intent was already executed, `max_sources` is reached,
-`max_rounds` is reached, the research budget timeout (`BAY_RESEARCH_TIMEOUT_S`) expires, or the
-user cancels. When Laya judges the evidence stale enough to matter, one `retrieve_recent_news`
+`EquityAnalyzer.retrieve` runs the seed plan (the question's required intents, then the
+horizon's), then asks Laya for the next bounded intent, an `evidence_sufficient` probability
+and a `stale_evidence_matters` probability after every round. It stops when evidence is
+sufficient (≥ 0.7), Laya chooses `stop_research` and no untried gap remains, the chosen intent
+was already executed, `max_sources` is reached, `max_rounds` is reached, the research budget
+timeout (`BAY_RESEARCH_TIMEOUT_S`) expires, or the user cancels. When Laya judges the evidence stale enough to matter, one `retrieve_recent_news`
 refresh is forced before stopping. The counters `search_rounds, queries_issued, queries_failed,
 structured_failures, sources_fetched, sources_rejected, duplicate_sources_removed,
 evidence_gaps_remaining, retrieval_total_ms` are returned in `telemetry.research`; provider

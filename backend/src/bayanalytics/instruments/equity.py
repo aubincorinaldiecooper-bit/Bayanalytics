@@ -29,6 +29,7 @@ from bayanalytics.instruments.base import (
     SparkEvidenceBundle,
 )
 from bayanalytics.instruments.identity import InstrumentResolver
+from bayanalytics.instruments.questions import check_requirements, operand_gaps
 from bayanalytics.laya.schemas import (
     history_segment_questions,
     horizon_context_questions,
@@ -68,6 +69,7 @@ from bayanalytics.schemas.evidence import (
     PriceSeries,
     SourceRecord,
 )
+from bayanalytics.schemas.questions import AnalyticalRequirements, RequirementsReport
 from bayanalytics.schemas.requests import InstrumentRef
 from bayanalytics.schemas.results import ResearchStats
 
@@ -147,6 +149,11 @@ class EquityAnalyzer:
         self.research_decisions: list[LayaDecision] = []
         self.request_as_of: datetime = datetime.now(tz=UTC)
         self._submissions: Any = None
+        # What the question requires (set from the request in retrieve) and, after the
+        # calculations, which of it was met.
+        self.requirements: AnalyticalRequirements | None = None
+        self.requirements_report: RequirementsReport | None = None
+        self.operand_gaps: list[str] = []
 
     # ------------------------------------------------------------------ identify
     async def identify(self, user_input: str, ctx: AnalysisContext) -> InstrumentIdentity:
@@ -182,8 +189,9 @@ class EquityAnalyzer:
     ) -> list[SourceRecord]:
         budget = request.budget
         self.request_as_of = request.as_of
+        self.requirements = request.requirements
         runner = ResearchRunner(self.provider, self.edgar, self.prices, self.settings, budget)
-        plan: list[ResearchIntent] = list(seed_plan(request.resolved_horizon))
+        plan: list[ResearchIntent] = list(seed_plan(request.resolved_horizon, request.requirements))
         gaps: list[str] = []
         with ctx.timers.span("retrieval"):
             try:
@@ -223,12 +231,20 @@ class EquityAnalyzer:
                     round=round_no,
                     intents=[str(i) for i in plan],
                     evidence_gaps=gaps,
+                    **_classification_view(request.requirements),
                 )
                 for intent in plan:
                     if intent == ResearchIntent.stop_research:
                         continue
+                    query_gaps = gaps
+                    if intent == ResearchIntent.retrieve_missing_metric and self.operand_gaps:
+                        # A metric search spells the gap out: the operands the question needs
+                        # go first, ahead of the loop's coverage labels.
+                        query_gaps = [g for g in gaps if g in self.operand_gaps] + [
+                            g for g in gaps if g not in self.operand_gaps
+                        ]
                     for planned in build_queries(
-                        intent, identity, request.resolved_horizon, request.as_of, gaps
+                        intent, identity, request.resolved_horizon, request.as_of, query_gaps
                     ):
                         ctx.check_cancelled()
                         await self._execute(runner, planned, identity, request, ctx, round_no)
@@ -315,6 +331,17 @@ class EquityAnalyzer:
             "transcript" in s.title.lower() or "call" in s.title.lower() for s in self.state.sources
         ):
             gaps.append("management_commentary")
+        # Operands the question requires and the retrieval state does not hold yet (metric
+        # names, or the labels above for prices / benchmarks); nothing for general_assessment.
+        self.operand_gaps = operand_gaps(
+            self.requirements,
+            self.state.rows,
+            self.state.price_series,
+            self.state.benchmark_series,
+        )
+        for gap in self.operand_gaps:
+            if gap not in gaps:
+                gaps.append(gap)
         return gaps
 
     async def _plan_next(
@@ -401,6 +428,13 @@ class EquityAnalyzer:
             candidate = gap_to_intent(gap)
             if str(candidate) not in self.state.executed:
                 return candidate, sufficient
+        # A required operand the structured sources did not carry: one metric search before
+        # stopping (the intent the schema reserves for "a metric a calculation needs").
+        if (
+            any(gap in self.operand_gaps for gap in gaps)
+            and str(ResearchIntent.retrieve_missing_metric) not in self.state.executed
+        ):
+            return ResearchIntent.retrieve_missing_metric, sufficient
         return ResearchIntent.stop_research, sufficient
 
     # ------------------------------------------------------------------ normalize
@@ -683,8 +717,42 @@ class EquityAnalyzer:
                         continue
                     seen.add(calc.name)
                     results.append(calc)
+            # The question's required calculations always run, whichever pack Laya chose;
+            # they come from their own packs so the records stay identical to a pack run.
+            required = [
+                name
+                for name in (self.requirements.required_calculations if self.requirements else [])
+                if name not in seen
+            ]
+            added: list[str] = []
+            for pack_name, names in CALCULATION_PACKS.items():
+                wanted = [n for n in required if n in names and n not in seen]
+                if pack_name == "all_standard" or not wanted:
+                    continue
+                for calc in run_pack(pack_name, evidence, evidence.as_of):
+                    if calc.name in wanted and calc.name not in seen:
+                        seen.add(calc.name)
+                        results.append(calc)
+                        added.append(calc.name)
         ctx.diagnostics["calculation_pack"] = pack
+        if added:
+            ctx.diagnostics["required_calculations_added"] = added
         return CalculatedMetrics(calculations=results)
+
+    def validate_requirements(
+        self, evidence: NormalizedEvidence | None, calculations: CalculatedMetrics
+    ) -> RequirementsReport | None:
+        """Which of the question's requirements the analysis met (None when unclassified).
+
+        Unmet requirements are uncertainties for the result and the Spark bundle; they never
+        fail the analysis and leave ``INSUFFICIENT_EVIDENCE`` to the evidence gate.
+        """
+        if self.requirements is None:
+            return None
+        self.requirements_report = check_requirements(
+            self.requirements, evidence, calculations, self.state.executed
+        )
+        return self.requirements_report
 
     # ------------------------------------------------------------------ spark bundle
     def build_spark_bundle(
@@ -769,6 +837,17 @@ class EquityAnalyzer:
         sources = [
             {**s.public_view(), "rank": s.rank} for s in evidence.sources if not s.rejected_reason
         ]
+        requirements = request.requirements or self.requirements
+        question_focus: dict[str, Any] = {}
+        if requirements is not None:
+            report = self.requirements_report
+            question_focus = {
+                "kind": requirements.question_kind,
+                "focus": requirements.focus,
+                "horizons_emphasis": list(requirements.horizons_emphasis),
+                "recent_period": requirements.recent_period,
+                "unmet_requirements": list(report.uncertainties) if report else [],
+            }
         return SparkEvidenceBundle(
             instrument={
                 "symbol": self.identity.symbol,
@@ -782,6 +861,7 @@ class EquityAnalyzer:
                 "profile": request.profile,
                 "horizon": request.resolved_horizon,
                 "as_of": request.as_of.isoformat(),
+                "question_kind": requirements.question_kind if requirements else None,
             },
             current_metrics=self._latest_metrics(evidence),
             historical_metrics={
@@ -801,6 +881,7 @@ class EquityAnalyzer:
             uncertainties=list(evidence.uncertainties),
             freshness=evidence.freshness_summary,
             horizons=horizons,
+            question_focus=question_focus,
         )
 
     # ------------------------------------------------------------------ helpers
@@ -847,6 +928,17 @@ def _dedupe(items: list[str]) -> list[str]:
             seen.add(item)
             out.append(item)
     return out
+
+
+def _classification_view(requirements: AnalyticalRequirements | None) -> dict[str, Any]:
+    """The classification fields ``research.started`` carries (None before classification)."""
+    if requirements is None:
+        return {"question_kind": None, "classification_source": None, "confidence": None}
+    return {
+        "question_kind": requirements.question_kind,
+        "classification_source": requirements.source,
+        "confidence": round(requirements.confidence, 3),
+    }
 
 
 def _segment_volatility(prices: PriceSeries | None, period: Period) -> float | None:
