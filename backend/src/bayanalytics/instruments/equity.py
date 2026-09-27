@@ -55,7 +55,7 @@ from bayanalytics.research.intents import (
     seed_plan,
 )
 from bayanalytics.research.provider import EvidenceRecord, ResearchProviderError
-from bayanalytics.research.runner import ResearchRunner, RoundResult
+from bayanalytics.research.runner import REASON_SEARCH_FAILED, ResearchRunner, RoundResult
 from bayanalytics.schemas.common import ErrorCode, source_rank, stable_id
 from bayanalytics.schemas.decisions import ChoiceAnswer, LayaDecision, LayaQuestionSet, NoulAnswer
 from bayanalytics.schemas.evidence import (
@@ -120,7 +120,7 @@ class RetrievalState:
             if note not in self.notes:
                 self.notes.append(note)
             lowered = note.lower()
-            if lowered.startswith("search failed"):
+            if lowered.startswith(REASON_SEARCH_FAILED):
                 self.queries_failed += 1
             elif "unavailable" in lowered or "failed" in lowered:
                 self.structured_failures += 1
@@ -171,8 +171,7 @@ class EquityAnalyzer:
         exchanges = getattr(submissions, "exchanges", None) or []
         if not identity.exchange and exchanges:
             identity.exchange = str(exchanges[0]).upper()
-        former = getattr(submissions, "former_names", None) or []
-        identity.ticker_history = [str(n) for n in former][:6]
+        identity.ticker_history = list(submissions.name_history)[:6]
         if getattr(submissions, "name", None):
             identity.name = submissions.name
         self._submissions = submissions

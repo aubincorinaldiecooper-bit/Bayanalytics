@@ -150,14 +150,6 @@ def test_retrieval_state_absorbs_notes_once_and_counts_failures() -> None:
     assert merged.evidence_gaps_remaining == 1
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "src defect: the runner records a failed search as 'search_failed: <label>' but "
-        "RetrievalState.absorb matches 'search failed' (space), so search outages are counted "
-        "as structured failures; see the proposed diff in the migration report"
-    ),
-)
 def test_retrieval_state_counts_a_failed_search_as_a_query_failure() -> None:
     state = RetrievalState()
     state.absorb(
@@ -321,13 +313,6 @@ async def test_normalize_wires_name_changes_and_the_dividend_caveat() -> None:
     assert not any("exclude dividends" in u for u in bare.uncertainties)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "src defect: EquityAnalyzer.enrich_identity stores str(dict) of each EDGAR formerNames "
-        "entry in identity.ticker_history instead of the names (submissions.name_history)"
-    ),
-)
 async def test_enrich_identity_records_former_names_not_dict_reprs() -> None:
     analyzer = _analyzer()
     identity = IDENTITY.model_copy()
