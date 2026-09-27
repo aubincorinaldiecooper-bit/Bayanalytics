@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -160,6 +160,42 @@ async def check_job_round_trip(store: Any) -> None:
     assert await store.get_job("an_does_not_exist") is None
 
 
+async def check_list_jobs_keyset_paging(store: Any) -> None:
+    # Back-dated, and every page here is read through a cursor that sits just above them, so
+    # the check is unaffected by rows other tests left in a shared database.
+    base = datetime(2026, 9, 1, 12, tzinfo=UTC)
+    prefix = f"an_page_{new_id('x')[-6:]}_"
+    # The two middle jobs share a timestamp: the analysis_id half of the key is what keeps
+    # paging from skipping or repeating one of them.
+    ids = [f"{prefix}{suffix}" for suffix in ("a", "b", "c", "d")]
+    stamps = (
+        base,
+        base + timedelta(minutes=1),
+        base + timedelta(minutes=1),
+        base + timedelta(minutes=2),
+    )
+    for analysis_id, created_at in zip(ids, stamps, strict=True):
+        await store.create_job(make_job(analysis_id, created_at=created_at, updated_at=created_at))
+
+    # Walk pages of two, following the cursor the way the API does, starting just above the
+    # newest of these jobs. Other rows may be interleaved, so the assertion is about these
+    # four: each is seen exactly once, newest first, and no row is repeated across pages.
+    cursor: tuple[datetime, str] | None = (base + timedelta(minutes=3), "an_")
+    seen: list[str] = []
+    for _ in range(20):
+        page = await store.list_jobs(2, before=cursor)
+        if not page:
+            break
+        seen.extend(job.analysis_id for job in page)
+        last = page[-1]
+        cursor = (last.created_at, last.analysis_id)
+        if set(ids) <= set(seen):
+            break
+
+    assert len(seen) == len(set(seen))
+    assert [analysis_id for analysis_id in seen if analysis_id in ids] == list(reversed(ids))
+
+
 async def check_deep_copy_isolation(store: Any) -> None:
     job = make_job()
     await store.create_job(job)
@@ -310,6 +346,10 @@ async def store() -> InMemoryStore:
 
 async def test_job_round_trip(store: InMemoryStore) -> None:
     await check_job_round_trip(store)
+
+
+async def test_list_jobs_keyset_paging(store: InMemoryStore) -> None:
+    await check_list_jobs_keyset_paging(store)
 
 
 async def test_deep_copy_isolation(store: InMemoryStore) -> None:

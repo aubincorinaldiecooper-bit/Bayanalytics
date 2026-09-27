@@ -128,6 +128,7 @@ instance itself has not been connected to yet. The Postgres tests run when
 | Method | Path | Purpose |
 | --- | --- | --- |
 | POST | `/analyses` | create an analysis `{query, instrument?, profile: fast\|deep, horizon}` → `202 {analysis_id, status, profile, resolved_horizon}` |
+| GET | `/analyses` | history for the sidebar: `?limit=1..100&cursor=` → `{analyses: [summary], next_cursor}`, newest first |
 | GET | `/analyses/{id}/events` | SSE stream of recorded system state (`Last-Event-ID` replay supported) |
 | GET | `/analyses/{id}` | the structured result (or the persisted artifacts so far while running or after an interruption) |
 | POST | `/analyses/{id}/cancel` | best-effort cancellation |
