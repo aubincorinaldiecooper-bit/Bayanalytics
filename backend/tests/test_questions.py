@@ -12,6 +12,7 @@ is covered in ``test_spark_client.py``.
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import os
@@ -459,36 +460,141 @@ async def test_unusable_output_falls_back_to_a_general_assessment() -> None:
 
 
 class _FailingUnderstanding(ScriptedSpark):
-    """Pass 1 fails with a Spark runtime error; the synthesis would run normally."""
+    """Pass 1 fails with ``code``; the synthesis runs normally, or fails with
+    ``synthesis_code`` when one is given. Every generation attempt is recorded."""
 
-    def __init__(self, code: ErrorCode) -> None:
+    def __init__(self, code: ErrorCode, synthesis_code: ErrorCode | None = None) -> None:
         super().__init__()
         self.code = code
+        self.synthesis_code = synthesis_code
+        self.attempts: list[str] = []
 
     async def _generate(self, profile, spec, messages, on_token, ctx, opts):  # type: ignore[no-untyped-def]
         if opts.json_schema is not None:
+            self.attempts.append("understanding")
             raise AnalysisError(self.code, details={"reason": "scripted"})
+        self.attempts.append("synthesis")
+        if self.synthesis_code is not None:
+            raise AnalysisError(self.synthesis_code, details={"reason": "scripted"})
         return await super()._generate(profile, spec, messages, on_token, ctx, opts)
 
 
-@pytest.mark.parametrize(
-    "code",
-    [
-        ErrorCode.SPARK_START_FAILED,
-        ErrorCode.MEMORY_PRESSURE,
-        ErrorCode.SPARK_INFERENCE_FAILED,
-        ErrorCode.CANCELLED,
-        ErrorCode.INTERRUPTED,
-    ],
-)
-async def test_spark_runtime_errors_in_pass_one_fail_the_analysis(code: ErrorCode) -> None:
+RUNTIME_FAILURES = [
+    ErrorCode.SPARK_START_FAILED,
+    ErrorCode.MEMORY_PRESSURE,
+    ErrorCode.SPARK_INFERENCE_FAILED,
+]
+
+
+@pytest.mark.parametrize("code", RUNTIME_FAILURES)
+async def test_a_runtime_failure_in_pass_one_falls_back_to_the_broad_interpretation(
+    code: ErrorCode,
+) -> None:
+    spark = _FailingUnderstanding(code)
+    rec = Recorder()
+    understood = await understand_question(
+        VALUATION_Q, IDENTITY, "multi_horizon", spark, "fast", rec.ctx, Settings()
+    )
+    assert understood.source == "fallback"
+    assert understood.understanding == QueryUnderstanding.broad()  # nothing specific invented
+    assert understood.notes == [FALLBACK_NOTE]
+    assert understood.stats.wall_ms >= 0 and understood.stats.generation_ms is None
+    assert understood.stats.wait_ms is not None  # the session was entered before it failed
+    assert rec.ctx.diagnostics["query_understanding_fallback"] == f"spark_error:{code.value}"
+    assert spark.busy is False and spark.attempts == ["understanding"]
+
+
+@pytest.mark.parametrize("code", RUNTIME_FAILURES)
+async def test_the_analysis_continues_after_a_pass_one_runtime_failure(code: ErrorCode) -> None:
+    """Query understanding fails -> fallback plan -> research runs -> the calculations run ->
+    the final synthesis is still attempted (and here it succeeds)."""
+    laya = RuleLaya()
+    spark = _FailingUnderstanding(code)
+    _id, events, result = await _run_to_completion(
+        _runtime(laya=laya, spark=spark), {"query": VALUATION_Q}
+    )
+    assert result["status"] == "completed", result["error"]
+    names = [e["event"] for e in events]
+    started = next(e["data"] for e in events if e["event"] == "research.started")
+    assert started["interpretation_source"] == "fallback"
+    assert started["question_intent"] == "General assessment" and started["requirements"] == []
+    assert started["intents"] == [str(i) for i in seed_plan("multi_horizon")]  # the broad plan
+    assert _validation_calls(laya) == []  # nothing was proposed, so nothing to validate
+    assert "research.completed" in names and result["sources"]
+    assert result["calculations"] and any(c["status"] == "computed" for c in result["calculations"])
+    assert spark.attempts == ["understanding", "synthesis"]
+    assert names.index("research.completed") < names.index("spark.started")
+    requirements = _requirements_of(result)
+    assert requirements["interpretation_source"] == "fallback"
+    assert requirements["requirements"] == [] and requirements["required_calculations"] == []
+    assert FALLBACK_NOTE in result["assessment"]["uncertainties"]
+    telemetry = result["telemetry"]
+    assert telemetry["query_understanding_ms"] is not None
+    assert telemetry["query_understanding_generation_ms"] is None  # nothing was generated
+
+
+async def test_research_and_calculations_survive_when_the_synthesis_fails_too() -> None:
+    spark = _FailingUnderstanding(
+        ErrorCode.SPARK_INFERENCE_FAILED, synthesis_code=ErrorCode.SPARK_INFERENCE_FAILED
+    )
+    _id, events, result = await _run_to_completion(_runtime(spark=spark), {"query": VALUATION_Q})
+    names = [e["event"] for e in events]
+    assert names[-1] == "analysis.failed" and result["status"] == "failed"
+    assert result["error"]["code"] == "SPARK_INFERENCE_FAILED"
+    assert spark.attempts == ["understanding", "synthesis"]  # the synthesis was attempted
+    assert "research.completed" in names and result["sources"]  # collected artifacts kept
+    assert result["calculations"] and result["partial"] is True
+    assert _requirements_of(result)["interpretation_source"] == "fallback"
+
+
+async def test_pass_one_says_it_is_waiting_only_when_the_lane_is_busy() -> None:
+    spark = ScriptedSpark()
+    rt = _runtime(spark=spark)
+    _id, events, _result = await _run_to_completion(rt, {"query": VALUATION_Q})
+    assert "spark.queued" not in [e["event"] for e in events]  # an instant turn adds nothing
+
+    queued = asyncio.Event()
+    publish = rt.bus.publish
+
+    async def recording_publish(analysis_id: str, event: str, data: dict[str, Any]) -> Any:
+        if event == "spark.queued":
+            queued.set()
+        return await publish(analysis_id, event, data)
+
+    rt.bus.publish = recording_publish  # type: ignore[method-assign]
+    holding, release = asyncio.Event(), asyncio.Event()
+
+    async def hold() -> None:  # another analysis's Spark turn
+        async with spark.session("fast", Recorder().ctx):
+            holding.set()
+            await release.wait()
+
+    holder = asyncio.create_task(hold())
+    await holding.wait()
+    run = asyncio.create_task(_run_to_completion(rt, {"query": VALUATION_Q}))
+    await asyncio.wait_for(queued.wait(), timeout=10)
+    release.set()
+    _id, events, result = await run
+    await holder
+    assert result["status"] == "completed", result["error"]
+    names = [e["event"] for e in events]
+    waits = [e["data"] for e in events if e["event"] == "spark.queued"]
+    assert waits[0]["stage"] == "query_understanding" and waits[0]["profile"] == "fast"
+    assert names.index("spark.queued") < names.index("research.started")
+    assert result["telemetry"]["query_understanding_wait_ms"] > 0
+    assert _requirements_of(result)["interpretation_source"] == "spark"
+
+
+@pytest.mark.parametrize("code", [ErrorCode.CANCELLED, ErrorCode.INTERRUPTED])
+async def test_cancellation_and_shutdown_in_pass_one_still_stop_the_analysis(
+    code: ErrorCode,
+) -> None:
     spark = _FailingUnderstanding(code)
     with pytest.raises(AnalysisError) as info:
         await understand_question(
             VALUATION_Q, IDENTITY, "multi_horizon", spark, "fast", Recorder().ctx, Settings()
         )
     assert info.value.code == code and spark.busy is False
-    # end to end: the analysis stops before research with that error
     laya = RuleLaya()
     _id, events, result = await _run_to_completion(
         _runtime(laya=laya, spark=_FailingUnderstanding(code)), {"query": VALUATION_Q}
@@ -498,6 +604,9 @@ async def test_spark_runtime_errors_in_pass_one_fail_the_analysis(code: ErrorCod
     assert result["status"] == ("cancelled" if code == ErrorCode.CANCELLED else "failed")
     assert "research.started" not in names and "spark.started" not in names
     assert result["requirements"] is None and laya.calls == []
+
+
+async def test_an_unavailable_profile_in_pass_one_still_fails_the_analysis() -> None:
     with pytest.raises(AnalysisError) as info:
         await understand_question(
             VALUATION_Q,
@@ -509,6 +618,18 @@ async def test_spark_runtime_errors_in_pass_one_fail_the_analysis(code: ErrorCod
             Settings(),
         )
     assert info.value.code == ErrorCode.DEEP_PROFILE_UNAVAILABLE
+    for code in (ErrorCode.FAST_PROFILE_UNAVAILABLE, ErrorCode.DEEP_PROFILE_UNAVAILABLE):
+        with pytest.raises(AnalysisError) as info:
+            await understand_question(
+                VALUATION_Q,
+                IDENTITY,
+                "multi_horizon",
+                _FailingUnderstanding(code),
+                "fast",
+                Recorder().ctx,
+                Settings(),
+            )
+        assert info.value.code == code
 
 
 # ------------------------------------------------------------------ the requirements builder

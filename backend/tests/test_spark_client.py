@@ -704,13 +704,54 @@ async def test_pass_one_token_counts_are_none_without_usage(
     assert understood.stats.wall_ms > 0
 
 
-async def test_pass_one_runtime_errors_propagate(
+async def test_pass_one_runtime_errors_fall_back_and_release_the_lane(
     harness: Harness, server: FakeLlamaServer, settings: Settings
 ):
     server.status = 500
-    with pytest.raises(AnalysisError) as info:
-        await _understand(harness, harness.ctx(), settings)
-    assert info.value.code == ErrorCode.SPARK_INFERENCE_FAILED
+    understood = await _understand(harness, harness.ctx(), settings)
+    assert understood.source == "fallback"
+    assert understood.understanding == QueryUnderstanding.broad()
+    assert understood.notes == [UNDERSTANDING_FALLBACK_NOTE]
+    assert understood.stats.generation_ms is None and understood.stats.wait_ms is not None
+    assert harness.client.busy is False
+    # the lane is free and the runtime is tried again by the next request (the synthesis)
+    server.status = 200
+    await harness.client.run("fast", messages(), harness.on_token, harness.ctx("an_2"))
+    assert harness.tokens == server.deltas
+
+
+async def test_the_spark_lane_serves_waiters_in_arrival_order(harness: Harness):
+    """One lane, first come first served: a query-understanding pass does not overtake a
+    synthesis already waiting, and a request arriving during a hand-off queues at the end."""
+    order: list[str] = []
+    release = asyncio.Event()
+    holding = asyncio.Event()
+
+    async def turn(name: str, hold: bool = False) -> None:
+        async with harness.client.session("fast", harness.ctx(name)):
+            order.append(name)
+            if hold:
+                holding.set()
+                await release.wait()
+
+    first = asyncio.create_task(turn("synthesis_a", hold=True))
+    await holding.wait()
+    waiting = []
+    for name in ("synthesis_b", "understanding_c", "synthesis_d", "understanding_e"):
+        waiting.append(asyncio.create_task(turn(name)))
+        await asyncio.sleep(0)  # each reaches the lane before the next arrives
+    assert harness.client.busy is True
+    release.set()
+    late = asyncio.create_task(turn("understanding_late"))  # arrives while the lane is handed over
+    await asyncio.gather(first, *waiting, late)
+    assert order == [
+        "synthesis_a",
+        "synthesis_b",
+        "understanding_c",
+        "synthesis_d",
+        "understanding_e",
+        "understanding_late",
+    ]
     assert harness.client.busy is False
 
 

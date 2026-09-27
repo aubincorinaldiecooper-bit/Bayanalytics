@@ -37,8 +37,13 @@ from bayanalytics.pipeline.thesis import (
     snapshot_of_assembled,
     snapshot_of_draft,
 )
+from bayanalytics.pipeline.understanding import (
+    QUERY_UNDERSTANDING_STAGE,
+    SYNTHESIS_STAGE,
+    Understanding,
+    understand_question,
+)
 from bayanalytics.pipeline.understanding import TIMER_NAME as UNDERSTANDING_TIMER
-from bayanalytics.pipeline.understanding import Understanding, understand_question
 from bayanalytics.runtime import Runtime
 from bayanalytics.schemas.common import ErrorCode, utcnow
 from bayanalytics.schemas.decisions import LayaDecision
@@ -172,6 +177,15 @@ async def run_analysis(job: AnalysisJob, ctx: AnalysisContext, rt: Runtime) -> A
             # reading on its own Spark session, lock released before research), Laya confirms
             # or drops each proposed requirement (question_validation), and the requirements
             # builder turns what survives into intents, calculations, operands and checks.
+            # Pass 1 takes its turn on the one Spark lane like any other request (first come,
+            # first served); a client is told only when it actually has to wait.
+            if _spark_busy(rt.spark):
+                await ctx.event(
+                    "spark.queued",
+                    profile=job.profile,
+                    stage=QUERY_UNDERSTANDING_STAGE,
+                    active_analyses=rt.runner.active_count,
+                )
             draft.understanding = await understand_question(
                 job.query,
                 identity,
@@ -312,6 +326,7 @@ async def run_analysis(job: AnalysisJob, ctx: AnalysisContext, rt: Runtime) -> A
                 await ctx.event(
                     "spark.queued",
                     profile=job.profile,
+                    stage=SYNTHESIS_STAGE,
                     active_analyses=rt.runner.active_count,
                 )
             async with rt.spark.session(job.profile, ctx) as session:

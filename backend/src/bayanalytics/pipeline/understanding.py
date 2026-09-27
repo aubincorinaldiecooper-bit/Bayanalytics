@@ -20,8 +20,13 @@ Outcomes:
 - malformed or empty output, an out-of-vocabulary intent, or a generation cut off by the token
   limit: the broad interpretation (a general assessment, no requirements), source ``fallback``,
   with the uncertainty ``FALLBACK_NOTE``;
-- a Spark runtime failure (start, memory, inference, cancel, shutdown) propagates: the final
-  synthesis could not run either.
+- a Spark runtime failure in this pass (the server did not start, memory pressure, a failed or
+  timed-out generation): the same broad fallback. Research, the calculations and the final
+  synthesis still run; the synthesis tries the runtime again and fails the analysis only if it
+  fails there too (with the research and calculations preserved);
+- the requested profile genuinely unavailable (``FAST_PROFILE_UNAVAILABLE`` /
+  ``DEEP_PROFILE_UNAVAILABLE``), a cancellation or a shutdown: propagates, because the analysis
+  cannot complete or was stopped. Anything unexpected also propagates (a bug is not hidden).
 
 Latency is measured separately (``query_understanding_*`` telemetry and the ``understanding``
 stage timer): the wall clock, and within it the wait for the Spark lane, any model load and the
@@ -39,8 +44,9 @@ from pydantic import BaseModel, Field, ValidationError
 
 from bayanalytics.config import Settings
 from bayanalytics.context import AnalysisContext
+from bayanalytics.errors import AnalysisError
 from bayanalytics.instruments.base import InstrumentIdentity
-from bayanalytics.schemas.common import HORIZON_LABELS, Profile
+from bayanalytics.schemas.common import HORIZON_LABELS, ErrorCode, Profile
 from bayanalytics.schemas.questions import (
     COMPARISON_FOCI,
     COMPARISON_FOCUS_DESCRIPTIONS,
@@ -60,6 +66,15 @@ from bayanalytics.spark.prompt import clean_text
 log = logging.getLogger(__name__)
 
 TIMER_NAME = "understanding"
+QUERY_UNDERSTANDING_STAGE = "query_understanding"
+"""``spark.queued`` ``stage`` when pass 1 waits for the Spark lane (a client shows "Thinking")."""
+SYNTHESIS_STAGE = "synthesis"
+"""``spark.queued`` ``stage`` when the final synthesis waits for the lane."""
+FALLBACK_ERRORS: frozenset[ErrorCode] = frozenset(
+    {ErrorCode.SPARK_START_FAILED, ErrorCode.MEMORY_PRESSURE, ErrorCode.SPARK_INFERENCE_FAILED}
+)
+"""Spark runtime failures after which the analysis continues with the broad interpretation;
+every other error (profile unavailable, cancelled, interrupted, unexpected) propagates."""
 QUESTION_MAX_CHARS = 300
 NAME_MAX_CHARS = 120
 
@@ -205,6 +220,25 @@ def parse_understanding(
     return understanding, [OUT_OF_VOCABULARY_NOTE] if dropped else [], None
 
 
+def _runtime_fallback(
+    code: ErrorCode, started: float, entered: float | None, ctx: AnalysisContext
+) -> Understanding:
+    """Pass 1 hit a Spark runtime failure: continue as a general assessment. Only what was
+    measured is reported (the wait, when the session was entered; never a generation)."""
+    now = time.perf_counter()
+    log.warning("query understanding failed (%s); continuing with a general assessment", code.value)
+    ctx.diagnostics["query_understanding_fallback"] = f"spark_error:{code.value}"
+    return Understanding(
+        understanding=QueryUnderstanding.broad(),
+        source="fallback",
+        notes=[FALLBACK_NOTE],
+        stats=UnderstandingStats(
+            wall_ms=round((now - started) * 1000.0, 3),
+            wait_ms=None if entered is None else round((entered - started) * 1000.0, 3),
+        ),
+    )
+
+
 async def _discard(_text: str) -> None:
     """Pass 1 is internal: nothing it generates is streamed to the client."""
     return None
@@ -223,11 +257,17 @@ async def understand_question(
     messages = understanding_messages(query, identity, resolved_horizon)
     options = understanding_options(settings)
     started = time.perf_counter()
-    with ctx.timers.span(TIMER_NAME):
-        async with spark.session(profile, ctx) as session:
-            entered = time.perf_counter()
-            generation = await session.generate(messages, _discard, options)
-            generated = time.perf_counter()
+    entered: float | None = None
+    try:
+        with ctx.timers.span(TIMER_NAME):
+            async with spark.session(profile, ctx) as session:
+                entered = time.perf_counter()
+                generation = await session.generate(messages, _discard, options)
+                generated = time.perf_counter()
+    except AnalysisError as exc:
+        if exc.code not in FALLBACK_ERRORS:
+            raise
+        return _runtime_fallback(exc.code, started, entered, ctx)
     wall_ms = (time.perf_counter() - started) * 1000.0
     load_ms = generation.stats.load_ms
     # Entering the session is the wait for the lane plus any model load it triggered.

@@ -167,6 +167,8 @@ The SSE stream (`GET /api/v1/analyses/{id}/events`) carries only recorded system
 
 ```
 analysis.started → instrument.resolved
+→ spark.queued?                                             (stage query_understanding; only when
+                                                            the Spark lane is busy)
 → spark.loading?                                            (only when Spark pass 1 loads the
                                                             model; pass 1 streams nothing else)
 → laya.started → laya.decision × (n + 1) → laya.completed  (question_validation; only when pass 1
@@ -179,7 +181,7 @@ analysis.started → instrument.resolved
 → laya.started → laya.decision × n → laya.completed        (evidence_scan, history_scan, text_evidence)
 → calculation.started → calculation.completed × n
 → laya.started → laya.decision × n → laya.completed        (horizon stances)
-→ spark.queued? → spark.loading? → spark.started → spark.token × n → spark.completed
+→ spark.queued? (stage synthesis) → spark.loading? → spark.started → spark.token × n → spark.completed
 → analysis.completed | analysis.failed
 ```
 
@@ -330,8 +332,23 @@ when this pass loaded the profile; the synthesis's `spark_load_ms` is then `null
 `query_understanding_generation_ms` (prompt processing and decoding: the cost of the semantic
 step itself) and the `understanding` stage timer; each is `null` when not reported. Its latency on the 8 GB reference
 machine has not been measured yet and must be before any optimisation (prompt caching, a warm
-profile, a smaller prompt). While another analysis holds the Spark lane, pass 1 waits for it
-without an event; `spark.queued` is still emitted only before pass 2.
+profile, a smaller prompt).
+
+**Waiting.** Pass 1 and pass 2 take turns on the one Spark lane in arrival order
+(`asyncio.Lock` is fair and nothing reorders waiters), so a query-understanding pass never
+overtakes a synthesis already waiting and no request starves. When the lane is busy at the
+moment an analysis needs it, `spark.queued` is emitted with `stage: "query_understanding"` or
+`stage: "synthesis"`; an instant turn emits nothing. A client presents both as its ordinary
+"thinking" state; the scheduler is not a product concept.
+
+**Failure.** A Spark runtime failure in pass 1 (`SPARK_START_FAILED`, `MEMORY_PRESSURE`,
+`SPARK_INFERENCE_FAILED`) makes the interpretation the broad fallback: source `fallback`, no
+requirements, one uncertainty, the horizon's seed plan. Research, normalization, the
+calculations and the stances run as for any general assessment, and the synthesis tries the
+runtime again; if it fails there too, the analysis fails with that code and keeps its sources
+and calculations (`partial: true`). An unavailable profile (`FAST_PROFILE_UNAVAILABLE`,
+`DEEP_PROFILE_UNAVAILABLE`), a cancellation or a shutdown propagates, and so does anything
+unexpected.
 
 ## Retrieval loop termination
 

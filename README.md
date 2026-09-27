@@ -187,13 +187,18 @@ Notes for the client (from a real-HTTP simulation of the frontend reducer):
 - Spark pass 1 is internal and emits no `spark.started` / `spark.token` / `spark.completed`,
   but a model load it triggers emits `spark.loading`: the first analysis after a start (or a
   profile switch) shows `spark.loading` between `instrument.resolved` and `research.started`,
-  and the synthesis then normally shows none. A Spark runtime error in pass 1 fails the
-  analysis with that code before research starts.
-- `spark.queued` (with `active_analyses`) is emitted when the analysis is waiting for the single
-  Spark lane before its synthesis; `spark.loading` appears only when a model load actually
-  happens; `spark.started` arrives with the first token and carries the measured
-  `prompt_tokens`. While another analysis synthesizes, pass 1 of a new analysis waits for the
-  lane without an event.
+  and the synthesis then normally shows none. A Spark runtime failure in pass 1
+  (`SPARK_START_FAILED`, `MEMORY_PRESSURE`, `SPARK_INFERENCE_FAILED`) does not stop the
+  analysis: it continues as a general assessment (`interpretation_source: "fallback"`, no
+  requirements, an uncertainty), research and the calculations run, and the synthesis tries
+  the runtime again; only if that also fails does the analysis fail, with its research and
+  calculations preserved. An unavailable profile, a cancellation or a shutdown still stops it.
+- `spark.queued` (with `profile`, `stage` and `active_analyses`) is emitted only when the
+  analysis actually has to wait for the single Spark lane: `stage` is `query_understanding`
+  before pass 1 (between `instrument.resolved` and `research.started`) or `synthesis` before
+  pass 2. The lane serves requests first come, first served; no stage has priority, so nothing
+  starves. `spark.loading` appears only when a model load actually happens; `spark.started`
+  arrives with the first token and carries the measured `prompt_tokens`.
 - `telemetry` adds `query_understanding_ms` (wall clock of pass 1, lock wait included),
   `query_understanding_prompt_tokens` / `query_understanding_output_tokens` (llama-server
   usage), `query_understanding_load_ms` (only when pass 1 loaded the model; `spark_load_ms`

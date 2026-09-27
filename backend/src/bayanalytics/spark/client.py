@@ -128,7 +128,13 @@ class LlamaSparkClient:
 
     @contextlib.asynccontextmanager
     async def session(self, profile: Profile, ctx: AnalysisContext) -> AsyncIterator[_Session]:
-        """Exclusive turn with ``profile`` resident: prompt measurement, then one generation."""
+        """Exclusive turn with ``profile`` resident: prompt measurement, then one generation.
+
+        Turns are granted first come, first served: ``asyncio.Lock`` is fair (the task that
+        started waiting first proceeds first) and nothing here reorders waiters, so no stage
+        has priority. A query-understanding pass queues behind a synthesis already waiting and
+        a synthesis behind a pass already waiting; every waiter is served in arrival order,
+        so none starves."""
         ctx.check_cancelled()
         self._waiting += 1
         try:
