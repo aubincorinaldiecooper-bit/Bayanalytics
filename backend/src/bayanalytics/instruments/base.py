@@ -96,6 +96,9 @@ class SparkEvidenceBundle(BaseModel):
     uncertainties: list[str] = Field(default_factory=list)
     freshness: dict[str, Any] = Field(default_factory=dict)
     horizons: list[str] = Field(default_factory=list)
+    prior_assessment: dict[str, Any] | None = None
+    """Bounded, evidence-only comparison with the prior completed assessment of the same
+    instrument (``pipeline.thesis.prior_assessment_block``); ``None`` when there is none."""
 
 
 class InstrumentAnalyzer(Protocol):

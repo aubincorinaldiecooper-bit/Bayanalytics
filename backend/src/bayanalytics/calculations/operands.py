@@ -350,6 +350,41 @@ class OperandResolver:
         window = ttm_window(f.period for f in facts)
         if window is None:
             return None
+        return self._ttm_from_window(metric, facts, window)
+
+    def ttm_ending_near(
+        self, metric: str, target_end: date, tolerance_days: int = 20
+    ) -> Operand | None:
+        """The TTM whose last fiscal quarter ends within ``tolerance_days`` of ``target_end``
+        (the quarter closest to it wins), made of that quarter and the three consecutive
+        quarters before it; ``None`` when no such window exists. This is how "the same
+        trailing period one or three years earlier" is located for period-over-period
+        comparisons: by end date, never by assuming a calendar."""
+        facts = self.facts(metric, "fiscal_quarter")
+        unique: dict[str, Period] = {}
+        for fact in facts:
+            if fact.period.end is not None:
+                unique.setdefault(fact.period.key(), fact.period)
+        ordered = sorted(unique.values(), key=lambda p: p.end)  # type: ignore[arg-type, return-value]
+        candidates = [
+            p
+            for p in ordered
+            if abs((p.end - target_end).days) <= tolerance_days  # type: ignore[operator]
+        ]
+        if not candidates:
+            return None
+        last = min(candidates, key=lambda p: (abs((p.end - target_end).days), p.end))  # type: ignore[operator]
+        index = ordered.index(last)
+        if index < 3:
+            return None
+        window = ordered[index - 3 : index + 1]
+        if not all(is_consecutive_quarters(a, b) for a, b in pairwise(window)):
+            return None
+        return self._ttm_from_window(metric, facts, window)
+
+    def _ttm_from_window(
+        self, metric: str, facts: list[NormalizedFact], window: Sequence[Period]
+    ) -> Operand | None:
         chosen: list[NormalizedFact] = []
         notes: list[str] = []
         for period in window:
@@ -649,12 +684,14 @@ class OperandResolver:
             ),
         )
 
-    def pe_history(self, years: int = 5) -> tuple[list[dict[str, Any]], list[str]]:
-        """Trailing P/E at each historical fiscal-quarter end within ``years`` of as_of.
+    def pe_history(self, years: int | None = 5) -> tuple[list[dict[str, Any]], list[str]]:
+        """Trailing P/E at each historical fiscal-quarter end within ``years`` of as_of, or at
+        every quarter end the retrieved EPS and price history cover when ``years`` is ``None``.
 
         Each point uses the close on or before the quarter end (at most 10 days earlier) and
         the TTM diluted EPS made of that quarter and the three consecutive quarters before it.
-        Quarters with non-positive TTM EPS are skipped (no meaningful multiple).
+        Quarters with non-positive TTM EPS are skipped (no meaningful multiple). The window
+        is therefore exactly what the sources provide: no point is interpolated or extended.
         """
         series = self.evidence.prices
         notes: list[str] = []
@@ -667,7 +704,7 @@ class OperandResolver:
             if key not in unique or _fact_sort_key(fact) < _fact_sort_key(unique[key]):
                 unique[key] = fact
         ordered = sorted(unique.values(), key=lambda f: f.period.end or date.min)
-        cutoff = shift_months(self.as_of_date, -12 * years)
+        cutoff = shift_months(self.as_of_date, -12 * years) if years is not None else None
         history: list[dict[str, Any]] = []
         for index in range(3, len(ordered)):
             window = ordered[index - 3 : index + 1]
@@ -677,7 +714,9 @@ class OperandResolver:
             ):
                 continue
             quarter_end = window[-1].period.end
-            if quarter_end is None or quarter_end < cutoff or quarter_end > self.as_of_date:
+            if quarter_end is None or quarter_end > self.as_of_date:
+                continue
+            if cutoff is not None and quarter_end < cutoff:
                 continue
             eps_ttm = float(sum(f.value for f in window))
             point = self.close_on_or_before(series, quarter_end)

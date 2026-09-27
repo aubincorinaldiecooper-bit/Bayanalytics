@@ -12,6 +12,19 @@ from bayanalytics.schemas.events import AnalysisEvent
 from bayanalytics.schemas.evidence import NormalizedFact, SourceRecord
 from bayanalytics.schemas.results import AnalysisResult
 
+OWNER_SCOPE_UNSUPPORTED = (
+    "owner-scoped lookups are not supported: analyses do not carry ownership yet (scoping by "
+    "owner needs an owner_id recorded on each analysis); pass owner_id=None for today's "
+    "single-tenant behaviour"
+)
+
+
+def refuse_owner_scope(owner_id: str | None) -> None:
+    """Raise for any owner filter: jobs carry no owner, so a filter would be silently
+    ignored, and a caller must never believe a lookup was scoped to a user when it was not."""
+    if owner_id is not None:
+        raise NotImplementedError(OWNER_SCOPE_UNSUPPORTED)
+
 
 class AnalysisStore(Protocol):
     async def start(self) -> None: ...
@@ -51,6 +64,29 @@ class AnalysisStore(Protocol):
     async def save_result(self, result: AnalysisResult) -> None: ...
 
     async def get_result(self, analysis_id: str) -> AnalysisResult | None: ...
+
+    async def latest_completed_result(
+        self,
+        symbol: str,
+        *,
+        before: datetime | None = None,
+        owner_id: str | None = None,
+    ) -> AnalysisResult | None:
+        """The newest ``completed`` result whose job resolved to instrument ``symbol``
+        (case-insensitive), or ``None``.
+
+        Newest is by the job's ``(created_at, analysis_id)``; ``before`` is an exclusive
+        upper bound on ``created_at`` so an analysis can ask for the assessment that
+        preceded it and never see itself or a later run.
+
+        Ownership: jobs carry no owner yet, so this lookup spans every analysis in the store,
+        which is only correct for a single-user deployment. ``owner_id`` is the seam for
+        scoping it: it must be ``None`` today, and every implementation raises
+        ``NotImplementedError`` for any other value (owner scoping needs an ``owner_id``
+        column on analyses), so no caller can believe it filtered by user. A multi-user
+        deployment must scope this lookup by owner before enabling it.
+        """
+        ...
 
     async def mark_interrupted(self) -> list[str]:
         """Mark every non-terminal job as failed/INTERRUPTED. Returns the affected ids."""

@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 
 from bayanalytics.errors import default_message
+from bayanalytics.instruments.base import InstrumentIdentity
 from bayanalytics.jobs.models import AnalysisJob
 from bayanalytics.schemas.calculations import CalculationInput, CalculationResult
 from bayanalytics.schemas.common import ErrorCode, new_id, utcnow
@@ -265,6 +266,66 @@ async def check_result_round_trip(store: Any) -> None:
     assert again is not None and again.status == "failed" and again.partial is True
 
 
+async def check_latest_completed_result(store: Any) -> None:
+    # Unique symbol and ids per run so a shared database never interferes; back-dated so the
+    # ``before`` bound is exercised against known timestamps.
+    base = datetime(2026, 9, 2, 12, tzinfo=UTC)
+    tag = new_id("x")[-6:]
+    symbol = f"ZZ{tag[:4].upper()}"
+    other_symbol = f"YY{tag[:4].upper()}"
+
+    def job_for(suffix: str, created_at: datetime, status: str, sym: str = symbol) -> AnalysisJob:
+        return make_job(
+            f"an_prior_{tag}_{suffix}",
+            status=status,
+            created_at=created_at,
+            updated_at=created_at,
+            instrument=InstrumentIdentity(symbol=sym, name=f"{sym} Corp"),
+        )
+
+    oldest = job_for("a", base, "completed")
+    tie_low = job_for("b", base + timedelta(minutes=1), "completed")
+    tie_high = job_for("c", base + timedelta(minutes=1), "completed")  # same second, later id
+    failed = job_for("d", base + timedelta(minutes=2), "failed")
+    other = job_for("e", base + timedelta(minutes=3), "completed", sym=other_symbol)
+    running = job_for("f", base + timedelta(minutes=4), "researching")  # no result yet
+    for job in (oldest, tie_low, tie_high, failed, other, running):
+        await store.create_job(job)
+    for job in (oldest, tie_low, tie_high, other):
+        await store.save_result(make_result(job, "completed"))
+    await store.save_result(make_result(failed, "failed"))
+
+    latest = await store.latest_completed_result(symbol)
+    assert latest is not None and latest.analysis_id == tie_high.analysis_id
+    assert latest.status == "completed" and latest.completed_at is not None
+    lowered = await store.latest_completed_result(symbol.lower())  # symbols compare case-free
+    assert lowered is not None and lowered.analysis_id == tie_high.analysis_id
+    # ``before`` is exclusive on the job's created_at: the tie pair is skipped entirely.
+    earlier = await store.latest_completed_result(symbol, before=tie_high.created_at)
+    assert earlier is not None and earlier.analysis_id == oldest.analysis_id
+    assert await store.latest_completed_result(symbol, before=oldest.created_at) is None
+    # Another instrument, an unknown one, and a failed-only history all give nothing.
+    found_other = await store.latest_completed_result(other_symbol)
+    assert found_other is not None and found_other.analysis_id == other.analysis_id
+    assert await store.latest_completed_result(f"QQ{tag}") is None
+    assert (
+        await store.latest_completed_result(symbol, before=failed.created_at + timedelta(minutes=1))
+    ).analysis_id == tie_high.analysis_id
+    # Returned objects are copies: mutating one never changes the stored assessment.
+    latest.assessment.uncertainties.append("mutated")
+    again = await store.latest_completed_result(symbol)
+    assert again is not None and "mutated" not in again.assessment.uncertainties
+    # Owner seam: None is today's single-tenant lookup; any owner filter is refused loudly,
+    # never ignored (analyses carry no owner yet).
+    explicit = await store.latest_completed_result(symbol, owner_id=None)
+    assert explicit is not None and explicit.analysis_id == tie_high.analysis_id
+    for owner in ("user_1", ""):
+        with pytest.raises(NotImplementedError, match="analyses do not carry ownership yet"):
+            await store.latest_completed_result(symbol, owner_id=owner)
+    with pytest.raises(NotImplementedError, match="owner_id=None"):
+        await store.latest_completed_result(symbol, before=tie_high.created_at, owner_id="u")
+
+
 async def check_records_round_trip(store: Any) -> None:
     job = make_job()
     await store.create_job(job)
@@ -370,6 +431,10 @@ async def test_result_round_trip(store: InMemoryStore) -> None:
 
 async def test_records_round_trip(store: InMemoryStore) -> None:
     await check_records_round_trip(store)
+
+
+async def test_latest_completed_result(store: InMemoryStore) -> None:
+    await check_latest_completed_result(store)
 
 
 async def test_mark_interrupted(store: InMemoryStore) -> None:

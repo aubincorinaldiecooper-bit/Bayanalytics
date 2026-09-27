@@ -20,6 +20,7 @@ from bayanalytics.schemas.errors import ErrorPayload
 from bayanalytics.schemas.events import AnalysisEvent
 from bayanalytics.schemas.evidence import NormalizedFact, SourceRecord
 from bayanalytics.schemas.results import AnalysisResult
+from bayanalytics.store.base import refuse_owner_scope
 
 
 def interrupted_payload() -> ErrorPayload:
@@ -191,6 +192,34 @@ class InMemoryStore:
         async with self._lock:
             result = self._results.get(analysis_id)
             return result.model_copy(deep=True) if result is not None else None
+
+    async def latest_completed_result(
+        self,
+        symbol: str,
+        *,
+        before: datetime | None = None,
+        owner_id: str | None = None,
+    ) -> AnalysisResult | None:
+        """Newest completed result for ``symbol`` by the job's ``(created_at, analysis_id)``,
+        optionally created strictly before ``before``. ``owner_id`` must be ``None`` (no
+        owner is recorded; see ``AnalysisStore.latest_completed_result``)."""
+        refuse_owner_scope(owner_id)
+        wanted = symbol.strip().upper()
+        async with self._lock:
+            candidates: list[tuple[datetime, str, AnalysisResult]] = []
+            for analysis_id, result in self._results.items():
+                job = self._jobs.get(analysis_id)
+                if job is None or result.status != "completed":
+                    continue
+                if job.instrument is None or job.instrument.symbol.upper() != wanted:
+                    continue
+                if before is not None and job.created_at >= before:
+                    continue
+                candidates.append((job.created_at, analysis_id, result))
+            if not candidates:
+                return None
+            candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+            return candidates[0][2].model_copy(deep=True)
 
     # --- startup recovery -------------------------------------------------------------
 
