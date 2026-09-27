@@ -15,9 +15,11 @@ normalization + provenance           normalization/*  (facts, periods, sessions,
         ↓
 Laya finance wrapper                 laya/*  (question schemas, compaction, worker client)
         ↓
-deterministic calculations           calculations/*  (registry, packs, formatting)
+deterministic calculations           calculations/*  (registry, packs, reconciliation, formatting)
         ↓
-structured evidence bundle           instruments/equity.py::build_spark_bundle
+prior assessment + thesis diff       pipeline/thesis.py  (store lookup, structured comparison)
+        ↓
+structured evidence bundle           instruments/equity.py::build_spark_bundle (+ prior block)
         ↓
 Spark X2.5 1.7B Q4_K_M (llama.cpp)   spark/*  (profiles, manager, streaming client, parser)
         ↓
@@ -55,6 +57,62 @@ Deterministic Python code does every calculation. Laya chooses the pack and cons
 results; Spark receives them as given and is instructed never to recompute or invent numbers.
 Spark's citations are validated against the known sources and uncited items are dropped from
 the structured lists; there is no automated numeric check of Spark's free prose.
+
+Two calculation families answer "what is the market paying for" without a model:
+
+- **Valuation-vs-fundamentals reconciliation** (`calculations/reconciliation.py`). With the
+  window's price return `R` and the growth `g` of trailing diluted EPS over the same window,
+  the implied change in the multiple is `m = (1 + R) / (1 + g) - 1`, and `R = g + m + g·m`
+  gives the contributions. Per window of N = 1 and 3 years every number is its own
+  `CalculationResult`: `reconciliation_price_return_Ny`, `reconciliation_eps_growth_Ny`,
+  `reconciliation_revenue_growth_Ny` and the headline `valuation_reconciliation_Ny` (value
+  `m` in percent), each with formula, recorded operands, period labels and named missing
+  inputs. The headline's `meta.reconciliation` holds the contributions, the shares of the
+  move, revenue growth, the P/E's historical percentile and the verdict with `verdict_rule`
+  and `thresholds`; its note is one quotable sentence. The verdict is the first match in a
+  fixed table over R, g and m in percentage points (`VERDICT_RULES`: below 0.5 point a
+  component is flat, same-sign components within 1.0 point contributed equally, the sign of
+  R at 0.5 point separates "despite" from "offset"), so it is a function of the recorded
+  values only; Spark gets it under `calculated_metrics.reconciliation` with an instruction to
+  restate it as given. EPS pairs are the latest
+  TTM against the TTM that was current one (three) year(s) earlier, located by quarter-end
+  date, or the fiscal-year pair when quarters are missing (labelled, never mixed); the
+  price/EPS lag is recorded. Non-positive EPS at either end makes the record unavailable
+  (`not_meaningful`); a missing close or EPS names the operand in `missing_inputs`.
+- **Historical P/E window**: `pe_history_percentile` ranks the current trailing P/E within
+  every quarter-end trailing P/E the retrieved EPS and price history can form (no year cap,
+  at least eight points), and its period label states the window ("over 19 available
+  quarters, Q3 FY2021 to Q2 FY2026"); `pe_5y_percentile` keeps the five-year cap with the
+  same reporting.
+
+## Prior assessment and thesis diff
+
+"Did the latest quarter change the thesis?" is answered against the assessment this backend
+produced last time, not inferred. After the horizon stances the orchestrator asks the store
+for the newest completed result of the same instrument created before the current job
+(`AnalysisStore.latest_completed_result(symbol, before=job.created_at)`; Postgres joins
+`results` with the job's resolved symbol and uses `analyses_instrument_symbol_idx`, schema
+version 2). `pipeline/thesis.py::diff_assessments` compares structured fields only: the
+overall and per-horizon stances (previous, current, changed; the overall stance only over
+the horizons both runs assessed, so a narrower or different scope is not a change of thesis
+and `horizon_scope_changed` records it), every calculation in
+`THESIS_METRICS` that both runs computed (value then, value now, delta), conflicts and
+uncertainties that appeared or went away, and the freshness change (new quarter, newer
+prices). The result carries it as `thesis_diff` (recomputed once the final stances and
+uncertainties are assembled) and Spark's bundle carries `prior_assessment`, a bounded
+(≤ 40 lines) evidence-only block rendered inside `<EVIDENCE>` with the previous stances, the
+deltas and the prior `as_of`; the instructions ask Spark to state under "What changed"
+whether stances and metrics moved against it. Without a prior assessment `thesis_diff` is
+`null`, the bundle says none was found and an uncertainty records it. The earlier run's
+narrative is never fed back.
+
+The lookup is single-tenant by construction: jobs carry no owner, so it spans every analysis
+in the store. `latest_completed_result(symbol, *, before=None, owner_id=None)` is the seam
+for multi-user scoping: the orchestrator passes `owner_id=None` explicitly and both stores
+raise `NotImplementedError` ("analyses do not carry ownership yet") for any other value, so
+no caller can believe the lookup was filtered by user. A multi-user deployment must record
+an owner on analyses and scope this lookup by it before enabling it; nothing else (history
+listing, routes, schema) anticipates ownership yet.
 
 ## Measured token accounting
 
@@ -131,7 +189,8 @@ calls only originate from application logic and Laya's bounded choices.
 ## Persistence
 
 Postgres (Railway project `bayanalytics`) holds `analyses`, `analysis_events`, `sources`,
-`facts`, `laya_decisions`, `calculations`, `results` and `schema_migrations`. Without
+`facts`, `laya_decisions`, `calculations`, `results` and `schema_migrations` (version 2 adds
+the expression index on the job's resolved symbol for the prior-assessment lookup). Without
 `DATABASE_URL` the in-memory store is used (development and tests; finished analyses are
 evicted beyond a cap). On startup every non-terminal job left by a previous process is marked
 `failed` / `INTERRUPTED` and receives a terminal `analysis.failed` event; nothing is resumed

@@ -33,6 +33,7 @@ from test_store_memory import (
     check_duplicate_seq_rejected,
     check_events,
     check_job_round_trip,
+    check_latest_completed_result,
     check_list_jobs_keyset_paging,
     check_mark_interrupted,
     check_records_round_trip,
@@ -93,10 +94,16 @@ def test_schema_sql_tables_indexes_and_version() -> None:
     assert "analyses (status)" in normalised
     assert "analyses (created_at desc)" in normalised
     assert "sources (content_hash)" in normalised
+    # Version 2: the prior-assessment lookup filters on the job's resolved symbol.
+    symbol_index = next(s for s in statements if "analyses_instrument_symbol_idx" in s)
+    assert "upper(job->'instrument'->>'symbol')" in symbol_index
+    assert "created_at DESC" in symbol_index
     inserts = [s for s in statements if s.upper().startswith("INSERT INTO SCHEMA_MIGRATIONS")]
     assert len(inserts) == 1
-    versions = [int(v) for v in re.findall(r"VALUES\s*\(\s*(\d+)\s*\)", inserts[0])]
-    assert versions == [SCHEMA_VERSION]
+    values = re.search(r"VALUES\s*(.+?)\s*ON CONFLICT", inserts[0], re.S)
+    assert values is not None
+    versions = [int(v) for v in re.findall(r"\(\s*(\d+)\s*\)", values.group(1))]
+    assert versions == list(range(1, SCHEMA_VERSION + 1))  # every migration is recorded
     # every child table cascades from analyses
     for statement in statements:
         m = re.match(r"CREATE TABLE IF NOT EXISTS (\w+)", statement, re.IGNORECASE)
@@ -140,6 +147,14 @@ def test_sql_constants_parameter_counts() -> None:
     assert _placeholders(pg._LIST_JOBS_BEFORE) == {1, 2, 3}
     for sql in (pg._LIST_JOBS, pg._LIST_JOBS_BEFORE):
         assert "ORDER BY created_at DESC, analysis_id DESC" in " ".join(sql.split())
+    assert _placeholders(pg._LATEST_COMPLETED_RESULT) == {1}
+    assert _placeholders(pg._LATEST_COMPLETED_RESULT_BEFORE) == {1, 2}
+    for sql in (pg._LATEST_COMPLETED_RESULT, pg._LATEST_COMPLETED_RESULT_BEFORE):
+        flat = " ".join(sql.split())
+        assert "r.status = 'completed'" in flat
+        assert "upper(a.job->'instrument'->>'symbol') = upper($1)" in flat
+        assert "ORDER BY a.created_at DESC, a.analysis_id DESC LIMIT 1" in flat
+    assert "a.created_at < $2" in pg._LATEST_COMPLETED_RESULT_BEFORE
 
 
 # --- always-on: DSN helpers ----------------------------------------------------------------
@@ -239,6 +254,17 @@ def test_build_store_selects_backend() -> None:
         PostgresStore("")
 
 
+async def test_owner_scoped_prior_lookup_is_refused_before_any_query() -> None:
+    # Not started: a query would raise RuntimeError("start() has not been called"), so the
+    # NotImplementedError proves the owner filter is refused before the database is touched.
+    store = PostgresStore("postgresql://u@127.0.0.1:1/db?sslmode=disable")
+    with pytest.raises(NotImplementedError, match="analyses do not carry ownership yet"):
+        await store.latest_completed_result("AAPL", owner_id="user_1")
+    with pytest.raises(RuntimeError, match="start"):
+        await store.latest_completed_result("AAPL", owner_id=None)
+    assert "owner" not in pg.SCHEMA_PATH.read_text(encoding="utf-8").lower()
+
+
 def test_migrate_cli_requires_url(capsys: pytest.CaptureFixture[str]) -> None:
     assert resolve_database_url({}) is None
     assert resolve_database_url({"DATABASE_URL": "a"}) == "a"
@@ -318,6 +344,11 @@ async def test_pg_result_round_trip(pg_store: PostgresStore) -> None:
 @requires_postgres
 async def test_pg_records_round_trip(pg_store: PostgresStore) -> None:
     await check_records_round_trip(pg_store)
+
+
+@requires_postgres
+async def test_pg_latest_completed_result(pg_store: PostgresStore) -> None:
+    await check_latest_completed_result(pg_store)
 
 
 @requires_postgres

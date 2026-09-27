@@ -95,9 +95,14 @@ def build_structured_sections(
         "ev_ebitda_ttm",
         "fcf_yield_ttm",
         "pe_5y_percentile",
+        "pe_history_percentile",
+        "valuation_reconciliation_1y",
+        "valuation_reconciliation_3y",
     ):
         if name in by_name:
             valuation[name] = _calc_view(by_name[name])
+            if name.startswith("valuation_reconciliation_"):
+                valuation[name]["reconciliation"] = by_name[name].meta.get("reconciliation")
     if (
         d := horizon_stage.get("valuation_extremeness") or scan.get("valuation_extremeness")
     ) is not None:

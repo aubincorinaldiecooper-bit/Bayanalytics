@@ -13,6 +13,7 @@ import logging
 from collections.abc import Callable
 from typing import Any
 
+from bayanalytics.calculations.reconciliation import bundle_view as reconciliation_bundle_view
 from bayanalytics.context import AnalysisContext
 from bayanalytics.errors import AnalysisError
 from bayanalytics.instruments.base import (
@@ -25,6 +26,14 @@ from bayanalytics.instruments.equity import EquityAnalyzer
 from bayanalytics.jobs.models import AnalysisJob
 from bayanalytics.pipeline.assemble import finalize_assessment, merge_horizons
 from bayanalytics.pipeline.horizon import horizons_for
+from bayanalytics.pipeline.thesis import (
+    diff_assessments,
+    find_prior_assessment,
+    no_prior_assessment_note,
+    prior_assessment_block,
+    snapshot_of_assembled,
+    snapshot_of_draft,
+)
 from bayanalytics.runtime import Runtime
 from bayanalytics.schemas.common import ErrorCode, utcnow
 from bayanalytics.schemas.decisions import LayaDecision
@@ -34,6 +43,7 @@ from bayanalytics.schemas.results import (
     Assessment,
     InstrumentView,
     Telemetry,
+    ThesisDiff,
     VersionInfo,
 )
 from bayanalytics.spark.base import SparkMessage, SparkRunOptions
@@ -64,6 +74,8 @@ class _Draft:
         self.extra_uncertainties: list[str] = []
         self.freshness_summary: dict[str, Any] = {}
         self.partial_synthesis = False
+        self.prior: AnalysisResult | None = None  # the last completed assessment, if any
+        self.thesis_diff: ThesisDiff | None = None
 
     def instrument_view(self) -> InstrumentView | None:
         if self.identity is None:
@@ -93,6 +105,7 @@ class _Draft:
             calculations=self.calculations.calculations,
             laya_decisions=self.decisions.decisions,
             freshness_summary=self.freshness_summary,
+            thesis_diff=self.thesis_diff,
             streamed_text=self.streamed_text,
             telemetry=self.telemetry,
             error=error.payload() if error else None,
@@ -206,6 +219,19 @@ async def run_analysis(job: AnalysisJob, ctx: AnalysisContext, rt: Runtime) -> A
             draft.decisions.decisions.extend(horizon_decisions)
             await ctx.event("laya.completed", stage="horizon", decisions=len(horizon_decisions))
             await rt.store.save_decisions(job.analysis_id, draft.decisions.decisions)
+            # 5c. prior assessment: the thesis diff against the last completed run ---------
+            # Single-user seam: no owner is recorded on jobs, so the lookup is unscoped and
+            # says so explicitly (the store refuses any owner filter it cannot honour).
+            draft.prior = await find_prior_assessment(
+                rt.store, identity.symbol, before=job.created_at, owner_id=None
+            )
+            if draft.prior is None:
+                draft.extra_uncertainties.append(no_prior_assessment_note(identity.symbol))
+            else:
+                current = snapshot_of_draft(
+                    evidence, draft.decisions, calculations, horizons, draft.extra_uncertainties
+                )
+                draft.thesis_diff = diff_assessments(draft.prior, current)
             # 6. Spark synthesis --------------------------------------------------------
             await _set_status(rt, job, "synthesizing")
             options = SparkRunOptions(
@@ -213,6 +239,12 @@ async def run_analysis(job: AnalysisJob, ctx: AnalysisContext, rt: Runtime) -> A
                 temperature=rt.settings.spark_temperature,
             )
             bundle = analyzer.build_spark_bundle(evidence, draft.decisions, calculations, request)
+            if draft.thesis_diff is not None:
+                bundle.prior_assessment = prior_assessment_block(draft.thesis_diff)
+            else:
+                bundle.uncertainties.append(no_prior_assessment_note(identity.symbol))
+            if reconciled := reconciliation_bundle_view(calculations.calculations):
+                bundle.calculated_metrics["reconciliation"] = reconciled
             started = False
             prompt_tokens: int | None = None
 
@@ -311,6 +343,19 @@ async def run_analysis(job: AnalysisJob, ctx: AnalysisContext, rt: Runtime) -> A
                 if note not in draft.assessment.uncertainties:
                     draft.assessment.uncertainties.append(note)
             draft.freshness_summary = dict(evidence.freshness_summary)
+            if draft.prior is not None:
+                # Re-diff against the assembled result so the stored diff reflects the final
+                # stances, conflicts and uncertainties (same rule set as the pre-Spark diff).
+                draft.thesis_diff = diff_assessments(
+                    draft.prior,
+                    snapshot_of_assembled(
+                        draft.horizon_assessments,
+                        calculations,
+                        draft.assessment.conflicts,
+                        draft.assessment.uncertainties,
+                        draft.freshness_summary,
+                    ),
+                )
             # A cut-off synthesis or a missing horizon section is reported, never passed off
             # as a complete assessment (section 24).
             draft.partial_synthesis = generation.truncated or not all(

@@ -37,18 +37,21 @@ fractions and the conversion (``x 100``) is part of the recorded formula.
 
 from __future__ import annotations
 
+import functools
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any
 
 from bayanalytics.calculations import primitives as prim
+from bayanalytics.calculations import reconciliation
 from bayanalytics.calculations.formatting import UNAVAILABLE, format_value
 from bayanalytics.calculations.operands import (
     Aligned,
     Operand,
     OperandResolver,
     SeriesOperand,
+    shift_months,
 )
 from bayanalytics.errors import AnalysisError
 from bayanalytics.schemas.calculations import CalculationInput, CalculationResult
@@ -100,6 +103,9 @@ class CalculationSpec:
     fn: Callable[..., Any]
     percent_from_fraction: bool = False
     explain_none: Callable[[dict[str, Any]], str | None] | None = None
+    detail: Callable[[dict[str, Any]], tuple[dict[str, Any], list[str]]] | None = None
+    """Optional: called with the resolved operand values after a computed value, returning
+    extra ``meta`` entries and notes (a decomposition, a verdict) recorded on the result."""
 
 
 class _LabelMap(dict):
@@ -403,19 +409,110 @@ _spec(
     CalculationSpec(
         name="pe_5y_percentile",
         formula="percentile_rank(price[{price}] / eps_diluted[{eps_ttm}], trailing P/E at each "
-        "fiscal-quarter end over the last 5 years)",
+        "fiscal-quarter end over the last 5 years[{pe_history}])",
         required_inputs=("price", "eps_ttm", "pe_history"),
         optional_inputs=(),
         unit="percentile",
         description="Where today's trailing P/E sits within its own five-year history of "
-        "quarter-end trailing P/Es (mid-rank percentile, 0-100). Unavailable with fewer than "
-        f"{PE_HISTORY_MIN_POINTS} history points.",
+        "quarter-end trailing P/Es (mid-rank percentile, 0-100); the period label reports the "
+        f"window actually available. Unavailable with fewer than {PE_HISTORY_MIN_POINTS} "
+        "history points.",
         fn=lambda price, eps_ttm, pe_history: prim.percentile_rank(
             prim.price_to_earnings(price, eps_ttm), list(pe_history.closes)
         ),
         explain_none=_not_positive("eps_ttm", "negative earnings"),
     )
 )
+_spec(
+    CalculationSpec(
+        name="pe_history_percentile",
+        formula="percentile_rank(price[{price}] / eps_diluted[{eps_ttm}], trailing P/E at every "
+        "fiscal-quarter end the retrieved EPS and price history cover[{pe_history}])",
+        required_inputs=("price", "eps_ttm", "pe_history"),
+        optional_inputs=(),
+        unit="percentile",
+        description="Where today's trailing P/E sits within every quarter-end trailing P/E the "
+        "retrieved XBRL EPS and price history can produce (mid-rank percentile, 0-100); the "
+        "period label reports the window used, e.g. 'over 19 available quarters, Q3 FY2021 "
+        f"to Q2 FY2026'. Unavailable with fewer than {PE_HISTORY_MIN_POINTS} history points.",
+        fn=lambda price, eps_ttm, pe_history: prim.percentile_rank(
+            prim.price_to_earnings(price, eps_ttm), list(pe_history.closes)
+        ),
+        explain_none=_not_positive("eps_ttm", "negative earnings"),
+    )
+)
+for _years in reconciliation.WINDOW_YEARS:
+    # Components first, each its own record, then the headline built from the same operands.
+    _spec(
+        CalculationSpec(
+            name=reconciliation.component_name("price_return", _years),
+            formula="(close[{end_close}] / close[{start_close}] - 1) x 100",
+            required_inputs=("start_close", "end_close"),
+            optional_inputs=(),
+            unit="percent",
+            description=f"Price return R of the {_years}-year valuation reconciliation: last "
+            "close on or before the window start to the latest completed close (dividends "
+            "excluded).",
+            fn=lambda start_close, end_close: prim.period_return([start_close, end_close]),
+            percent_from_fraction=True,
+            explain_none=reconciliation.explain_unavailable,
+        )
+    )
+    _spec(
+        CalculationSpec(
+            name=reconciliation.component_name("eps_growth", _years),
+            formula="(eps_diluted[{eps_current}] / eps_diluted[{eps_previous}] - 1) x 100",
+            required_inputs=("eps_current", "eps_previous"),
+            optional_inputs=(),
+            unit="percent",
+            description=f"EPS growth g of the {_years}-year valuation reconciliation: "
+            "trailing-twelve-month diluted EPS now against the TTM current "
+            f"{_years} year(s) earlier (fiscal-year pair when quarters are missing, labelled). "
+            "A plain ratio: unavailable when either EPS is zero or negative.",
+            fn=reconciliation.eps_ratio_growth,
+            percent_from_fraction=True,
+            explain_none=reconciliation.explain_unavailable,
+        )
+    )
+    _spec(
+        CalculationSpec(
+            name=reconciliation.component_name("revenue_growth", _years),
+            formula="(revenue[{revenue_current}] - revenue[{revenue_previous}]) "
+            "/ |revenue[{revenue_previous}]| x 100",
+            required_inputs=("revenue_current", "revenue_previous"),
+            optional_inputs=(),
+            unit="percent",
+            description=f"Revenue growth over the {_years}-year valuation reconciliation's "
+            "periods (context for the verdict; it does not enter the decomposition).",
+            fn=lambda revenue_current, revenue_previous: prim.growth_rate(
+                revenue_current, revenue_previous
+            ),
+            percent_from_fraction=True,
+            explain_none=reconciliation.explain_unavailable,
+        )
+    )
+    _spec(
+        CalculationSpec(
+            name=reconciliation.headline_name(_years),
+            formula="(1 + price_return) / (1 + eps_growth) - 1, x 100, with price_return = "
+            "close[{end_close}] / close[{start_close}] - 1 and eps_growth = "
+            "eps_diluted[{eps_current}] / eps_diluted[{eps_previous}] - 1",
+            required_inputs=("start_close", "end_close", "eps_current", "eps_previous"),
+            optional_inputs=("revenue_current", "revenue_previous", "pe_percentile"),
+            unit="percent",
+            description=f"Change in the trailing multiple implied over {_years} year(s) by "
+            "(1 + price return) = (1 + EPS growth) x (1 + multiple change): the part of the "
+            "price change that is multiple expansion (+) or contraction (-) rather than "
+            "earnings. meta.reconciliation carries the contributions, the verdict with the "
+            "rule and thresholds that produced it, revenue growth and the P/E's historical "
+            "percentile; the component records of the same window hold R, g and revenue "
+            "growth.",
+            fn=reconciliation.multiple_change_from_operands,
+            percent_from_fraction=True,
+            explain_none=reconciliation.explain_unavailable,
+            detail=reconciliation.detail_for(_years),
+        )
+    )
 
 # ------------------------------------------------------------------ returns ----------------
 
@@ -573,6 +670,15 @@ CALCULATION_PACKS: dict[str, list[str]] = {
         "ev_ebitda_ttm",
         "fcf_yield_ttm",
         "pe_5y_percentile",
+        "pe_history_percentile",
+        *(
+            name
+            for years in reconciliation.WINDOW_YEARS
+            for name in (
+                *(reconciliation.component_name(c, years) for c in reconciliation.COMPONENT_NAMES),
+                reconciliation.headline_name(years),
+            )
+        ),
     ],
     "returns_vs_benchmark": [
         "price_return_1m",
@@ -709,6 +815,12 @@ def compute(
         value = value * 100.0
     result.value = value
     result.display = format_value(value, spec.unit)
+    if spec.detail is not None:
+        extra_meta, extra_notes = spec.detail(values)
+        result.meta.update(extra_meta)
+        for note in extra_notes:
+            if note not in result.notes:
+                result.notes.append(note)
     return result
 
 
@@ -993,37 +1105,181 @@ def _resolve_fcf_yield(resolver: OperandResolver) -> _Resolved:
     )
 
 
-def _resolve_pe_percentile(resolver: OperandResolver) -> _Resolved:
+def _history_window_label(history: list[dict[str, Any]]) -> str | None:
+    """``over 19 available quarters, Q3 FY2021 to Q2 FY2026``: the window actually used."""
+    if not history:
+        return None
+    first, last = history[0], history[-1]
+    count = len(history)
+    noun = "quarter" if count == 1 else "quarters"
+    return f"over {count} available {noun}, {first['period_label']} to {last['period_label']}"
+
+
+def _pe_history_series(
+    resolver: OperandResolver, history: list[dict[str, Any]]
+) -> SeriesOperand | None:
+    if len(history) < PE_HISTORY_MIN_POINTS:
+        return None
+    return SeriesOperand(
+        name="pe_history",
+        closes=tuple(point["pe"] for point in history),
+        dates=tuple(datetime.fromisoformat(point["quarter_end"]).date() for point in history),
+        source_id=resolver.evidence.prices.source_id if resolver.evidence.prices else None,
+        symbol=resolver.evidence.symbol,
+        notes=(f"{len(history)} quarter-end trailing P/E points",),
+    )
+
+
+def _resolve_pe_percentile(resolver: OperandResolver, years: int | None) -> _Resolved:
     price = resolver.latest_close()
     eps = resolver.ttm("eps_diluted")
-    history, history_notes = resolver.pe_history(PE_HISTORY_YEARS)
+    history, history_notes = resolver.pe_history(years)
     notes = [*_notes_of(price, eps), *history_notes]
-    series: SeriesOperand | None = None
-    if len(history) >= PE_HISTORY_MIN_POINTS:
-        series = SeriesOperand(
-            name="pe_history",
-            closes=tuple(point["pe"] for point in history),
-            dates=tuple(datetime.fromisoformat(point["quarter_end"]).date() for point in history),
-            source_id=resolver.evidence.prices.source_id if resolver.evidence.prices else None,
-            symbol=resolver.evidence.symbol,
-            notes=(f"{len(history)} quarter-end trailing P/E points",),
-        )
-    else:
+    series = _pe_history_series(resolver, history)
+    window_label = _history_window_label(history)
+    if series is None:
         notes.append(
             f"P/E history has {len(history)} points; at least {PE_HISTORY_MIN_POINTS} are required"
         )
+    period_label: str | None = None
+    if price and eps:
+        period_label = f"{price.period_label}; EPS {eps.period_label}"
+        if window_label:
+            period_label += f"; {window_label}"
     return _Resolved(
         inputs={
             "price": _op_input("price", price),
             "eps_ttm": _op_input("eps_ttm", eps),
             "pe_history": series,
         },
-        period_label=f"{price.period_label}; EPS {eps.period_label}" if price and eps else None,
+        period_label=period_label,
         notes=notes,
         meta={
             "operands": _provenance(price=price, eps_ttm=eps),
             "history": history,
-            "window": {"years": PE_HISTORY_YEARS, "points": len(history)},
+            "window": {
+                "years": years,
+                "points": len(history),
+                "label": window_label,
+                "first_quarter_end": history[0]["quarter_end"] if history else None,
+                "last_quarter_end": history[-1]["quarter_end"] if history else None,
+                "cutoff": shift_months(resolver.as_of_date, -12 * years).isoformat()
+                if years is not None
+                else None,
+            },
+        },
+    )
+
+
+def _pe_percentile_input(
+    resolver: OperandResolver,
+) -> tuple[CalculationInput | None, list[str], dict[str, Any]]:
+    """The current trailing P/E's percentile within its full available history, as a context
+    operand for the reconciliation (the same computation as ``pe_history_percentile``)."""
+    resolved = _resolve_pe_percentile(resolver, None)
+    result = compute("pe_history_percentile", resolved.inputs, period_label=resolved.period_label)
+    window = (resolved.meta or {}).get("window", {})
+    if result.status != "computed":
+        return None, list(result.notes), {"available": False, **window}
+    price = resolved.inputs["price"]
+    operand = CalculationInput(
+        name="pe_percentile",
+        value=result.value,
+        unit="percentile",
+        source_id=price.source_id if isinstance(price, CalculationInput) else None,
+        period_label=window.get("label"),
+    )
+    return operand, [], {"available": True, "value": result.value, **window}
+
+
+def _reconciliation_prices(
+    resolver: OperandResolver, years: int
+) -> tuple[dict[str, InputValue], SeriesOperand | None, list[str]]:
+    series = resolver.price_series()
+    inputs, window, notes = _return_inputs(resolver, series, "", months=12 * years)
+    if series is None or not series.points:
+        notes.append("no price series")
+    elif window is None:
+        notes.append(f"price series does not reach back {years} year(s)")
+    return inputs, window, notes
+
+
+def _resolve_reconciliation_pair(resolver: OperandResolver, years: int, metric: str) -> _Resolved:
+    """A reconciliation component over two matching trailing periods (EPS or revenue)."""
+    prefix = "eps" if metric == "eps_diluted" else metric
+    pair = reconciliation.trailing_pair(resolver, metric, years)
+    return _Resolved(
+        inputs={
+            f"{prefix}_current": _op_input(f"{prefix}_current", pair.current),
+            f"{prefix}_previous": _op_input(f"{prefix}_previous", pair.previous),
+        },
+        period_label=pair.period_label,
+        notes=[*pair.notes, *_notes_of(pair.current, pair.previous)],
+        meta={
+            "operands": _provenance(current=pair.current, previous=pair.previous),
+            "basis": pair.basis,
+            "window": {"years": years},
+            "reconciliation": reconciliation.headline_name(years),
+        },
+    )
+
+
+def _resolve_reconciliation_price(resolver: OperandResolver, years: int) -> _Resolved:
+    inputs, window, notes = _reconciliation_prices(resolver, years)
+    return _Resolved(
+        inputs=inputs,
+        period_label=window.period_label if window else None,
+        notes=notes,
+        meta={
+            **_window_meta(window, name=f"{years}y"),
+            "reconciliation": reconciliation.headline_name(years),
+        },
+    )
+
+
+def _resolve_reconciliation(resolver: OperandResolver, years: int) -> _Resolved:
+    inputs, window, notes = _reconciliation_prices(resolver, years)
+    eps = reconciliation.trailing_pair(resolver, "eps_diluted", years)
+    revenue = reconciliation.trailing_pair(resolver, "revenue", years)
+    percentile, percentile_notes, percentile_meta = _pe_percentile_input(resolver)
+    inputs.update(
+        {
+            "eps_current": _op_input("eps_current", eps.current),
+            "eps_previous": _op_input("eps_previous", eps.previous),
+            "revenue_current": _op_input("revenue_current", revenue.current),
+            "revenue_previous": _op_input("revenue_previous", revenue.previous),
+            "pe_percentile": percentile,
+        }
+    )
+    notes.extend(eps.notes)
+    notes.extend(revenue.notes)
+    notes.extend(_notes_of(eps.current, eps.previous, revenue.current, revenue.previous))
+    notes.extend(percentile_notes)
+    if window is not None and eps.current is not None and eps.current.period_end is not None:
+        lag = (window.end - eps.current.period_end).days  # type: ignore[operator]
+        notes.append(
+            f"price window ends {window.end.isoformat()}, EPS window ends "  # type: ignore[union-attr]
+            f"{eps.current.period_end.isoformat()} ({lag} days earlier: fundamentals lag the "
+            "latest close)"
+        )
+    period_label: str | None = None
+    if window is not None and eps.period_label:
+        period_label = f"{window.period_label}; EPS {eps.period_label}"
+    return _Resolved(
+        inputs=inputs,
+        period_label=period_label,
+        notes=notes,
+        meta={
+            **_window_meta(window, name=f"{years}y"),
+            "operands": _provenance(
+                eps_current=eps.current,
+                eps_previous=eps.previous,
+                revenue_current=revenue.current,
+                revenue_previous=revenue.previous,
+            ),
+            "eps_basis": eps.basis,
+            "revenue_basis": revenue.basis,
+            "pe_percentile": percentile_meta,
         },
     )
 
@@ -1226,7 +1482,30 @@ _RESOLVERS: dict[str, Callable[[OperandResolver], _Resolved]] = {
     "ps_ttm": _resolve_ps,
     "ev_ebitda_ttm": _resolve_ev_ebitda,
     "fcf_yield_ttm": _resolve_fcf_yield,
-    "pe_5y_percentile": _resolve_pe_percentile,
+    "pe_5y_percentile": lambda r: _resolve_pe_percentile(r, PE_HISTORY_YEARS),
+    "pe_history_percentile": lambda r: _resolve_pe_percentile(r, None),
+    **{
+        name: resolve
+        for years in reconciliation.WINDOW_YEARS
+        for name, resolve in (
+            (
+                reconciliation.component_name("price_return", years),
+                functools.partial(_resolve_reconciliation_price, years=years),
+            ),
+            (
+                reconciliation.component_name("eps_growth", years),
+                functools.partial(_resolve_reconciliation_pair, years=years, metric="eps_diluted"),
+            ),
+            (
+                reconciliation.component_name("revenue_growth", years),
+                functools.partial(_resolve_reconciliation_pair, years=years, metric="revenue"),
+            ),
+            (
+                reconciliation.headline_name(years),
+                functools.partial(_resolve_reconciliation, years=years),
+            ),
+        )
+    },
     "price_return_1m": lambda r: _resolve_price_return(r, "1m"),
     "price_return_3m": lambda r: _resolve_price_return(r, "3m"),
     "price_return_6m": lambda r: _resolve_price_return(r, "6m"),

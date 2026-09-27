@@ -40,11 +40,12 @@ from bayanalytics.schemas.decisions import LayaDecision
 from bayanalytics.schemas.events import AnalysisEvent
 from bayanalytics.schemas.evidence import NormalizedFact, SourceRecord
 from bayanalytics.schemas.results import AnalysisResult
+from bayanalytics.store.base import refuse_owner_scope
 from bayanalytics.store.memory import interrupted_payload
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 SCHEMA_PATH = Path(__file__).resolve().parent / "schema.sql"
 
 _TERMINAL_SQL = "('completed', 'failed', 'cancelled')"
@@ -303,6 +304,28 @@ ON CONFLICT (analysis_id) DO UPDATE SET
 """
 
 _SELECT_RESULT = "SELECT result FROM results WHERE analysis_id = $1"
+
+# The prior assessment of an instrument: the newest completed result whose job resolved to
+# the symbol, by the same (created_at, analysis_id) order the history listing uses. The
+# symbol lives on the job document; analyses_instrument_symbol_idx indexes that expression.
+_LATEST_COMPLETED_RESULT = """
+SELECT r.result FROM results r
+JOIN analyses a ON a.analysis_id = r.analysis_id
+WHERE r.status = 'completed'
+  AND upper(a.job->'instrument'->>'symbol') = upper($1)
+ORDER BY a.created_at DESC, a.analysis_id DESC
+LIMIT 1
+"""
+
+_LATEST_COMPLETED_RESULT_BEFORE = """
+SELECT r.result FROM results r
+JOIN analyses a ON a.analysis_id = r.analysis_id
+WHERE r.status = 'completed'
+  AND upper(a.job->'instrument'->>'symbol') = upper($1)
+  AND a.created_at < $2
+ORDER BY a.created_at DESC, a.analysis_id DESC
+LIMIT 1
+"""
 
 _SELECT_RECORDS = "SELECT record FROM {table} WHERE analysis_id = $1 ORDER BY {order}"
 
@@ -613,6 +636,25 @@ class PostgresStore:
     async def get_result(self, analysis_id: str) -> AnalysisResult | None:
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(_SELECT_RESULT, analysis_id)
+        return AnalysisResult.model_validate(row["result"]) if row is not None else None
+
+    async def latest_completed_result(
+        self,
+        symbol: str,
+        *,
+        before: datetime | None = None,
+        owner_id: str | None = None,
+    ) -> AnalysisResult | None:
+        """See ``AnalysisStore.latest_completed_result``: spans every analysis (no owner
+        column yet); ``owner_id`` must be ``None`` and is refused before any query runs."""
+        refuse_owner_scope(owner_id)
+        async with self.pool.acquire() as conn:
+            if before is None:
+                row = await conn.fetchrow(_LATEST_COMPLETED_RESULT, symbol.strip())
+            else:
+                row = await conn.fetchrow(
+                    _LATEST_COMPLETED_RESULT_BEFORE, symbol.strip(), _aware(before)
+                )
         return AnalysisResult.model_validate(row["result"]) if row is not None else None
 
     # --- startup recovery -------------------------------------------------------------

@@ -29,6 +29,11 @@ CREATE INDEX IF NOT EXISTS analyses_status_idx ON analyses (status);
 
 CREATE INDEX IF NOT EXISTS analyses_created_at_idx ON analyses (created_at DESC);
 
+-- Version 2: the prior-assessment lookup (latest completed result per instrument) filters on
+-- the resolved symbol stored in the job document and orders by creation time.
+CREATE INDEX IF NOT EXISTS analyses_instrument_symbol_idx
+    ON analyses ((upper(job->'instrument'->>'symbol')), created_at DESC);
+
 CREATE TABLE IF NOT EXISTS analysis_events (
     analysis_id  text NOT NULL REFERENCES analyses (analysis_id) ON DELETE CASCADE,
     seq          integer NOT NULL,
@@ -97,4 +102,4 @@ CREATE TABLE IF NOT EXISTS results (
     result        jsonb NOT NULL
 );
 
-INSERT INTO schema_migrations (version) VALUES (1) ON CONFLICT (version) DO NOTHING;
+INSERT INTO schema_migrations (version) VALUES (1), (2) ON CONFLICT (version) DO NOTHING;

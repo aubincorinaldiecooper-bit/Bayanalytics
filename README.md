@@ -115,7 +115,9 @@ from the dashboard values (service `Postgres` → Variables → `POSTGRES_USER`,
 DATABASE_URL=postgresql://postgres:<POSTGRES_PASSWORD>@altaria.proxy.rlwy.net:14222/railway?sslmode=require
 ```
 
-`BAY_DATABASE_URL` is honoured as well. The image uses a self-signed certificate, so
+`BAY_DATABASE_URL` is honoured as well. Schema version 2 adds the index the prior-assessment
+lookup uses (`analyses_instrument_symbol_idx`); `bayanalytics migrate` applies it in place. The
+image uses a self-signed certificate, so
 `sslmode=require` encrypts without verifying the CA (`verify-full` needs the CA via
 `?sslrootcert=`). Without a database URL the backend uses an in-memory store (development only;
 finished analyses are evicted after 200). The Postgres store, migrations and the INTERRUPTED
@@ -166,6 +168,43 @@ Notes for the client (from a real-HTTP simulation of the frontend reducer):
 - A result with `partial: true` and `status: completed` means the synthesis was cut off or a
   horizon section is missing (`horizon_assessments[*].synthesized`).
 - `POST /transcriptions` takes the audio as multipart field `audio`.
+- `thesis_diff` (additive, on the result): when the store holds an earlier completed analysis
+  of the same instrument (`AnalysisStore.latest_completed_result`, created before this one),
+  the result carries a structured comparison with it: `previous_analysis_id`, `previous_as_of`,
+  `previous_created_at`, `previous_horizon`, `overall` and `horizons` (`scope`, `previous`,
+  `current`, `changed`), `metrics` (each calculation both runs computed: `previous_value`,
+  `current_value`, `delta`, displays, period labels, calc ids), `new_conflicts` /
+  `resolved_conflicts`, `new_uncertainties` / `resolved_uncertainties`, `freshness`
+  (`new_quarter`, `newer_prices` with both dates), `stance_changed`, `horizon_scope_changed`
+  and a deterministic `summary` list. The overall stance is compared over the horizons both
+  runs assessed (`overall.compared_horizons`), so a run that covers fewer or other horizons
+  is not reported as a change of thesis. It is `null` when no prior assessment exists, and `assessment.uncertainties`
+  then says so. Only structured fields are compared; the earlier narrative is never reused.
+  Spark receives the same comparison as a bounded "Prior assessment" block in its evidence.
+  The lookup is single-tenant: analyses carry no owner yet, so it spans the whole store;
+  `latest_completed_result(..., owner_id=None)` is the seam for scoping it per user and
+  raises `NotImplementedError` for any non-null `owner_id` rather than ignoring it. A
+  multi-user deployment must scope this lookup by owner before enabling it.
+- Calculations added to the `valuation_vs_history` pack, per window of 1 and 3 years: the
+  component records `reconciliation_price_return_Ny` (R), `reconciliation_eps_growth_Ny` (g,
+  TTM diluted EPS now vs the TTM current N years earlier, fiscal-year pair when quarters are
+  missing) and `reconciliation_revenue_growth_Ny`, and the headline
+  `valuation_reconciliation_Ny`, whose value is the implied multiple change
+  `m = (1 + R) / (1 + g) - 1` in percent. Its `meta.reconciliation` carries `price_return_pct`,
+  `eps_growth_pct`, `contributions_pct` (earnings, multiple, interaction), `shares_of_move`,
+  `revenue_growth_pct`, `pe_percentile`, `component_calcs`, and the verdict with the rule
+  and thresholds that produced it (`verdict`, `verdict_rule`, `thresholds`). Verdicts come
+  from a fixed rule table over R, g and m in percentage points (a component below 0.5 point
+  is flat; same-sign components within 1.0 point contributed equally, otherwise the larger
+  one is what the move "mostly" was; the sign of R, at the same 0.5-point threshold, decides
+  "de-rating despite growth" vs "earnings growth offset by de-rating"); the full table is in
+  `calculations/reconciliation.py`. Spark receives the verdicts under
+  `calculated_metrics.reconciliation` and is told to restate them as given.
+  `pe_history_percentile` ranks the current trailing P/E within every quarter-end trailing
+  P/E the retrieved XBRL EPS and price history can produce; its period label states the
+  window used ("over 19 available quarters, Q3 FY2021 to Q2 FY2026"), and `pe_5y_percentile`
+  (five-year cap) is kept with the same labelling.
+  As everywhere, a missing operand makes the record `unavailable` with `missing_inputs` named.
 - Keepalive comments are sent every `BAY_SSE_KEEPALIVE_S` seconds (default 15); reconnecting with
   the terminal event's id closes immediately.
 - `429 TOO_MANY_ANALYSES` carries `Retry-After: 5`.
@@ -188,7 +227,8 @@ SearXNG instance, the Railway database or the reference machine.
 | API contract, SSE replay (`Last-Event-ID`), cancellation, INTERRUPTED marking, API-key gate, body limits, admission control (including the store-await race) | `bayanalytics migrate` twice, schema-version refusal, every table populated by real analyses, INTERRUPTED recovery after SIGKILL, JSONB/typed column agreement, no DSN or path leaks | Loading the real `@receptron/laya` ONNX bundle: load time, resident RAM, `systemOne` latency, calibration on finance states |
 | Laya worker NDJSON protocol (`load`, `system_one`, `count_tokens`, `health`, `close`) with the real `worker.mjs` and a stub model, one controlled restart per process lifetime | Real uvicorn: health, capabilities, 202/SSE/GET, cancel, reconnect edge cases, 413/411/401 envelopes, SIGTERM and SIGKILL behaviour, process hygiene | Building llama-server b10828, GGUF download and sha256, a real generation, TTFT, tokens/s, KV precision, whether 128K allocates on 8 GB |
 | Spark streaming client, Fast/Deep restart command lines, `/apply-template` + `/tokenize` prompt measurement, memory-pressure and Deep-unavailable errors, cancel-while-silent (fake llama-server) | The real worker answering `load`/`health`/`system_one`/`close` with a bogus model directory (fails fast, no orphan) | A real `whisper-cli` run (tests use a fake shell script) |
-| Deterministic calculations (reproducibility, units, formatting), derived Q4 (direct unit tests) | | End-to-end "Assess Apple." with live SEC EDGAR, Stooq and SearXNG retrieval and real models, with telemetry |
+| Deterministic calculations (reproducibility, units, formatting), derived Q4, valuation-vs-fundamentals reconciliation, historical P/E window reporting (direct unit tests) | | End-to-end "Assess Apple." with live SEC EDGAR, Stooq and SearXNG retrieval and real models, with telemetry |
+| Prior-assessment lookup and thesis diff: two runs on the fixture, the second carrying `thesis_diff` and the Spark prompt the prior block (in-memory store) | `latest_completed_result` against a local PostgreSQL 16 | |
 | Normalization: periods, sessions (no exchange-holiday calendar), restatements, conflicts, freshness, leakage guard, corporate actions from EDGAR name history | | The Railway Postgres instance (`bayanalytics migrate` against it) |
 | Fetcher target policy (loopback, link-local, private and every redirect hop refused), DOM depth cap, keyword-only rejection reasons, cache policy | | |
 | End-to-end "Assess Apple." with the synthetic fixture, `RuleLaya` and `ScriptedSpark` doubles | | |

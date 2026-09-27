@@ -140,6 +140,69 @@ class Telemetry(BaseModel):
     versions: VersionInfo = Field(default_factory=VersionInfo)
 
 
+class StanceChange(BaseModel):
+    """One stance compared with the prior assessment (``scope`` is ``overall`` or a horizon)."""
+
+    scope: str
+    previous: Stance | None = None
+    current: Stance | None = None
+    changed: bool = False  # both known and different
+    compared_horizons: list[str] = Field(default_factory=list)
+    """``overall`` scope only: the horizons both assessments covered. The overall stance is
+    computed over these alone, so a run that covers fewer or other horizons is not reported
+    as a change of thesis."""
+
+
+class MetricChange(BaseModel):
+    """A deterministic calculation present in both assessments: value then, value now."""
+
+    name: str
+    unit: str
+    previous_value: float | None = None
+    current_value: float | None = None
+    delta: float | None = None  # current - previous, in the calculation's unit
+    previous_display: str = ""
+    current_display: str = ""
+    previous_period: str | None = None
+    current_period: str | None = None
+    previous_calc_id: str | None = None
+    current_calc_id: str | None = None
+
+
+class FreshnessChange(BaseModel):
+    """Did the information set move on since the prior assessment (new quarter, newer close)?"""
+
+    previous_latest_quarter_end: str | None = None
+    current_latest_quarter_end: str | None = None
+    new_quarter: bool = False
+    previous_price_date: str | None = None
+    current_price_date: str | None = None
+    newer_prices: bool = False
+
+
+class ThesisDiff(BaseModel):
+    """Structured comparison with the latest earlier completed assessment of the same
+    instrument (AGENT.md section 12 "what changed"). Only structured fields are compared:
+    stances, deterministic calculation values, conflicts, uncertainties and freshness; the
+    prior narrative is never reused."""
+
+    previous_analysis_id: str
+    previous_as_of: datetime
+    previous_created_at: datetime
+    previous_horizon: ResolvedHorizon
+    overall: StanceChange
+    horizons: list[StanceChange] = Field(default_factory=list)
+    metrics: list[MetricChange] = Field(default_factory=list)
+    new_conflicts: list[str] = Field(default_factory=list)
+    resolved_conflicts: list[str] = Field(default_factory=list)
+    new_uncertainties: list[str] = Field(default_factory=list)
+    resolved_uncertainties: list[str] = Field(default_factory=list)
+    freshness: FreshnessChange = Field(default_factory=FreshnessChange)
+    stance_changed: bool = False  # the overall stance or any shared horizon stance moved
+    horizon_scope_changed: bool = False  # the runs assessed different sets of horizons
+    summary: list[str] = Field(default_factory=list)  # deterministic one-line statements
+
+
 class AnalysisResult(BaseModel):
     analysis_id: str
     status: AnalysisStatus
@@ -156,6 +219,7 @@ class AnalysisResult(BaseModel):
     calculations: list[CalculationResult] = Field(default_factory=list)
     laya_decisions: list[LayaDecision] = Field(default_factory=list)
     freshness_summary: dict[str, Any] = Field(default_factory=dict)
+    thesis_diff: ThesisDiff | None = None  # None when no prior completed assessment exists
     streamed_text: str = ""  # exactly what was streamed as spark.token, for recovery
     telemetry: Telemetry = Field(default_factory=Telemetry)
     error: ErrorPayload | None = None
