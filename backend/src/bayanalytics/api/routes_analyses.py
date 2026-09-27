@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 from collections.abc import AsyncIterator
+from datetime import datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Header, Query
@@ -12,10 +15,13 @@ from bayanalytics.api.deps import RuntimeDep
 from bayanalytics.api.sse import event_stream, parse_after_seq, sse_response
 from bayanalytics.errors import AnalysisError
 from bayanalytics.instruments.base import ResearchBudget
+from bayanalytics.jobs.models import AnalysisJob
 from bayanalytics.pipeline.horizon import resolve_horizon
 from bayanalytics.schemas.common import ErrorCode
 from bayanalytics.schemas.events import sse_comment
 from bayanalytics.schemas.requests import (
+    AnalysisListResponse,
+    AnalysisSummary,
     CancelAnalysisResponse,
     CreateAnalysisRequest,
     CreateAnalysisResponse,
@@ -23,6 +29,26 @@ from bayanalytics.schemas.requests import (
 from bayanalytics.schemas.results import AnalysisResult, InstrumentView
 
 router = APIRouter(prefix="/analyses", tags=["analyses"])
+
+
+def encode_cursor(created_at: datetime, analysis_id: str) -> str:
+    """Opaque page cursor. The payload is the keyset the store orders by; base64 keeps it out
+    of the frontend's business so the ordering key can change without a contract change."""
+    raw = f"{created_at.isoformat()}|{analysis_id}".encode()
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def decode_cursor(cursor: str | None) -> tuple[datetime, str] | None:
+    if not cursor:
+        return None
+    try:
+        padded = cursor + "=" * (-len(cursor) % 4)
+        timestamp, _, analysis_id = base64.urlsafe_b64decode(padded).decode().partition("|")
+        if not analysis_id:
+            raise ValueError("cursor is missing the analysis id")
+        return datetime.fromisoformat(timestamp), analysis_id
+    except (ValueError, binascii.Error, UnicodeDecodeError) as exc:
+        raise AnalysisError(ErrorCode.INVALID_REQUEST, "The history cursor is not valid.") from exc
 
 
 @router.post("", response_model=CreateAnalysisResponse, status_code=202)
@@ -65,6 +91,53 @@ async def create_analysis(body: CreateAnalysisRequest, rt: RuntimeDep) -> Create
     )
 
 
+@router.get("", response_model=AnalysisListResponse)
+async def list_analyses(
+    rt: RuntimeDep,
+    limit: Annotated[int, Query(ge=1, le=100)] = 50,
+    cursor: Annotated[str | None, Query(max_length=256)] = None,
+) -> AnalysisListResponse:
+    """History for the sidebar: a page of analyses, newest first.
+
+    Reads only the job rows the store already keeps, so a page costs one query regardless of
+    how much evidence each analysis produced.
+    """
+    before = decode_cursor(cursor)
+    # One extra row answers "is there another page?" without a second count query.
+    jobs = await rt.store.list_jobs(limit + 1, before=before)
+    has_more = len(jobs) > limit
+    page = jobs[:limit]
+    next_cursor = encode_cursor(page[-1].created_at, page[-1].analysis_id) if has_more else None
+    return AnalysisListResponse(analyses=[_summary(job) for job in page], next_cursor=next_cursor)
+
+
+def _summary(job: AnalysisJob) -> AnalysisSummary:
+    return AnalysisSummary(
+        analysis_id=job.analysis_id,
+        query=job.query,
+        instrument=_instrument_view(job),
+        profile=job.profile,
+        horizon=job.resolved_horizon,
+        status=job.status,
+        created_at=job.created_at,
+        updated_at=job.updated_at,
+        completed_at=job.finished_at,
+        error_code=job.error.code if job.error else None,
+    )
+
+
+def _instrument_view(job: AnalysisJob) -> InstrumentView | None:
+    if job.instrument is None:
+        return None
+    return InstrumentView(
+        symbol=job.instrument.symbol,
+        exchange=job.instrument.exchange,
+        name=job.instrument.name,
+        cik=job.instrument.cik,
+        sector=job.instrument.sector,
+    )
+
+
 @router.get("/{analysis_id}/events")
 async def stream_events(
     analysis_id: str,
@@ -96,17 +169,7 @@ async def get_analysis(analysis_id: str, rt: RuntimeDep) -> AnalysisResult:
     job = await rt.store.get_job(analysis_id)
     if job is None:
         raise AnalysisError(ErrorCode.NOT_FOUND)
-    instrument = (
-        InstrumentView(
-            symbol=job.instrument.symbol,
-            exchange=job.instrument.exchange,
-            name=job.instrument.name,
-            cik=job.instrument.cik,
-            sector=job.instrument.sector,
-        )
-        if job.instrument
-        else None
-    )
+    instrument = _instrument_view(job)
     # Running (or failed-before-result) analysis: return the durable artifacts persisted so
     # far, so a client recovering from a dropped stream sees sources and calculations.
     sources = await _optional(rt.store, "get_sources", analysis_id)

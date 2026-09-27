@@ -213,7 +213,16 @@ ON CONFLICT (analysis_id) DO UPDATE SET
 
 _SELECT_JOB = "SELECT job FROM analyses WHERE analysis_id = $1"
 
-_LIST_JOBS = "SELECT job FROM analyses ORDER BY created_at DESC LIMIT $1"
+_LIST_JOBS = "SELECT job FROM analyses ORDER BY created_at DESC, analysis_id DESC LIMIT $1"
+
+# Keyset pagination: (created_at, analysis_id) is a total order, so a page boundary is stable
+# even when several analyses share a timestamp.
+_LIST_JOBS_BEFORE = """
+SELECT job FROM analyses
+WHERE (created_at, analysis_id) < ($2, $3)
+ORDER BY created_at DESC, analysis_id DESC
+LIMIT $1
+"""
 
 _COUNT_ACTIVE = f"SELECT count(*) FROM analyses WHERE status NOT IN {_TERMINAL_SQL}"
 
@@ -437,9 +446,17 @@ class PostgresStore:
             row = await conn.fetchrow(_SELECT_JOB, analysis_id)
         return AnalysisJob.model_validate(row["job"]) if row is not None else None
 
-    async def list_jobs(self, limit: int = 50) -> list[AnalysisJob]:
+    async def list_jobs(
+        self,
+        limit: int = 50,
+        *,
+        before: tuple[datetime, str] | None = None,
+    ) -> list[AnalysisJob]:
         async with self.pool.acquire() as conn:
-            rows = await conn.fetch(_LIST_JOBS, limit)
+            if before is None:
+                rows = await conn.fetch(_LIST_JOBS, limit)
+            else:
+                rows = await conn.fetch(_LIST_JOBS_BEFORE, limit, _aware(before[0]), before[1])
         return [AnalysisJob.model_validate(row["job"]) for row in rows]
 
     async def count_active(self) -> int:

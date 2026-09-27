@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from collections.abc import AsyncIterator
+from datetime import datetime, timedelta
 from typing import Any
 
 import httpx
@@ -52,6 +53,14 @@ class FakeStore:
     async def get_job(self, analysis_id: str) -> AnalysisJob | None:
         job = self.jobs.get(analysis_id)
         return job.model_copy(deep=True) if job else None
+
+    async def list_jobs(
+        self, limit: int = 50, *, before: tuple[datetime, str] | None = None
+    ) -> list[AnalysisJob]:
+        jobs = sorted(self.jobs.values(), key=lambda j: (j.created_at, j.analysis_id), reverse=True)
+        if before is not None:
+            jobs = [j for j in jobs if (j.created_at, j.analysis_id) < before]
+        return [job.model_copy(deep=True) for job in jobs[:limit]]
 
     async def append_event(self, event: AnalysisEvent) -> None:
         self.events.setdefault(event.analysis_id, []).append(event)
@@ -482,6 +491,59 @@ async def test_api_create_stream_get_cancel() -> None:
         assert missing.status_code == 404 and missing.json()["error"]["code"] == "NOT_FOUND"
         missing_ev = await client.get("/api/v1/analyses/an_missing/events")
         assert missing_ev.status_code == 404
+
+
+async def test_api_list_analyses_paginates_newest_first() -> None:
+    rt = _runtime(_pipeline_ok)
+    base = utcnow()
+    for i in range(3):
+        await rt.store.create_job(
+            AnalysisJob(
+                analysis_id=f"an_{i}",
+                created_at=base + timedelta(seconds=i),
+                updated_at=base + timedelta(seconds=i),
+                finished_at=base + timedelta(seconds=i) if i == 0 else None,
+                query=f"query {i}",
+                profile="fast",
+                requested_horizon="auto",
+                resolved_horizon="multi_horizon",
+                status="completed" if i == 0 else "researching",
+            )
+        )
+    async with _client(rt) as client:
+        first = await client.get("/api/v1/analyses", params={"limit": 2})
+        assert first.status_code == 200, first.text
+        page = first.json()
+        assert [a["analysis_id"] for a in page["analyses"]] == ["an_2", "an_1"]
+        assert page["analyses"][0]["query"] == "query 2"
+        assert page["analyses"][0]["profile"] == "fast"
+        assert page["analyses"][0]["horizon"] == "multi_horizon"
+        assert page["analyses"][0]["instrument"] is None
+        assert page["analyses"][0]["completed_at"] is None
+        assert page["next_cursor"]
+
+        second = await client.get(
+            "/api/v1/analyses", params={"limit": 2, "cursor": page["next_cursor"]}
+        )
+        tail = second.json()
+        assert [a["analysis_id"] for a in tail["analyses"]] == ["an_0"]
+        assert tail["analyses"][0]["status"] == "completed"
+        assert tail["analyses"][0]["completed_at"] is not None
+        # Last page ends the walk instead of looping on an empty page.
+        assert tail["next_cursor"] is None
+
+        bad = await client.get("/api/v1/analyses", params={"cursor": "!!not-base64!!"})
+        assert bad.status_code == 422 and bad.json()["error"]["code"] == "INVALID_REQUEST"
+
+
+async def test_api_list_analyses_empty_and_limit_bounds() -> None:
+    rt = _runtime(_pipeline_ok)
+    async with _client(rt) as client:
+        empty = await client.get("/api/v1/analyses")
+        assert empty.status_code == 200
+        assert empty.json() == {"analyses": [], "next_cursor": None}
+        assert (await client.get("/api/v1/analyses", params={"limit": 0})).status_code == 422
+        assert (await client.get("/api/v1/analyses", params={"limit": 101})).status_code == 422
 
 
 async def test_api_deep_unavailable_is_structured() -> None:

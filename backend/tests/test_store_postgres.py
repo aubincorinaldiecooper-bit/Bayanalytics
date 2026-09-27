@@ -33,6 +33,7 @@ from test_store_memory import (
     check_duplicate_seq_rejected,
     check_events,
     check_job_round_trip,
+    check_list_jobs_keyset_paging,
     check_mark_interrupted,
     check_records_round_trip,
     check_result_round_trip,
@@ -135,6 +136,10 @@ def test_sql_constants_parameter_counts() -> None:
     assert _placeholders(pg._SELECT_JOB) == {1}
     assert _placeholders(pg._SELECT_RESULT) == {1}
     assert _placeholders(pg._COUNT_ACTIVE) == set()
+    assert _placeholders(pg._LIST_JOBS) == {1}
+    assert _placeholders(pg._LIST_JOBS_BEFORE) == {1, 2, 3}
+    for sql in (pg._LIST_JOBS, pg._LIST_JOBS_BEFORE):
+        assert "ORDER BY created_at DESC, analysis_id DESC" in " ".join(sql.split())
 
 
 # --- always-on: DSN helpers ----------------------------------------------------------------
@@ -288,6 +293,11 @@ async def test_pg_job_round_trip(pg_store: PostgresStore) -> None:
 @requires_postgres
 async def test_pg_isolation(pg_store: PostgresStore) -> None:
     await check_deep_copy_isolation(pg_store)
+
+
+@requires_postgres
+async def test_pg_list_jobs_keyset_paging(pg_store: PostgresStore) -> None:
+    await check_list_jobs_keyset_paging(pg_store)
 
 
 @requires_postgres

@@ -9,6 +9,7 @@ and deployed there.
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime
 
 from bayanalytics.errors import default_message
 from bayanalytics.jobs.models import AnalysisJob
@@ -94,11 +95,24 @@ class InMemoryStore:
             job = self._jobs.get(analysis_id)
             return job.model_copy(deep=True) if job is not None else None
 
-    async def list_jobs(self) -> list[AnalysisJob]:
-        """All jobs, newest first (helper for diagnostics; not part of the protocol)."""
+    async def list_jobs(
+        self,
+        limit: int = 50,
+        *,
+        before: tuple[datetime, str] | None = None,
+    ) -> list[AnalysisJob]:
+        """Jobs newest first, ordered by ``(created_at, analysis_id)`` descending.
+
+        ``before`` is that same key from the last row of the previous page, so paging is
+        stable when several analyses share a timestamp.
+        """
         async with self._lock:
-            jobs = sorted(self._jobs.values(), key=lambda j: j.created_at, reverse=True)
-            return [job.model_copy(deep=True) for job in jobs]
+            jobs = sorted(
+                self._jobs.values(), key=lambda j: (j.created_at, j.analysis_id), reverse=True
+            )
+            if before is not None:
+                jobs = [j for j in jobs if (j.created_at, j.analysis_id) < before]
+            return [job.model_copy(deep=True) for job in jobs[: max(1, limit)]]
 
     async def count_active(self) -> int:
         """Number of non-terminal jobs (used by ``/health``)."""

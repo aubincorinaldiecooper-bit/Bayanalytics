@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Protocol
 
 from bayanalytics.jobs.models import AnalysisJob
@@ -22,6 +23,16 @@ class AnalysisStore(Protocol):
     async def update_job(self, job: AnalysisJob) -> None: ...
 
     async def get_job(self, analysis_id: str) -> AnalysisJob | None: ...
+
+    async def list_jobs(
+        self, limit: int = 50, *, before: tuple[datetime, str] | None = None
+    ) -> list[AnalysisJob]:
+        """Jobs newest first by ``(created_at, analysis_id)``, at most ``limit`` of them.
+
+        ``before`` is that key taken from the last row of the previous page (keyset
+        pagination), so a page boundary stays stable while new analyses are created.
+        """
+        ...
 
     async def append_event(self, event: AnalysisEvent) -> None: ...
 
