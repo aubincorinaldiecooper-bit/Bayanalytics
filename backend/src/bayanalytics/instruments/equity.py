@@ -231,7 +231,7 @@ class EquityAnalyzer:
                     round=round_no,
                     intents=[str(i) for i in plan],
                     evidence_gaps=gaps,
-                    **_classification_view(request.requirements),
+                    **_interpretation_view(request.requirements),
                 )
                 for intent in plan:
                     if intent == ResearchIntent.stop_research:
@@ -244,7 +244,14 @@ class EquityAnalyzer:
                             g for g in gaps if g not in self.operand_gaps
                         ]
                     for planned in build_queries(
-                        intent, identity, request.resolved_horizon, request.as_of, query_gaps
+                        intent,
+                        identity,
+                        request.resolved_horizon,
+                        request.as_of,
+                        query_gaps,
+                        min_price_days=(
+                            request.requirements.min_price_days if request.requirements else None
+                        ),
                     ):
                         ctx.check_cancelled()
                         await self._execute(runner, planned, identity, request, ctx, round_no)
@@ -717,13 +724,15 @@ class EquityAnalyzer:
                         continue
                     seen.add(calc.name)
                     results.append(calc)
-            # The question's required calculations always run, whichever pack Laya chose;
-            # they come from their own packs so the records stay identical to a pack run.
-            required = [
-                name
-                for name in (self.requirements.required_calculations if self.requirements else [])
-                if name not in seen
-            ]
+            # The question's required calculations (and the ones it reports when available)
+            # always run, whichever pack Laya chose; they come from their own packs so the
+            # records stay identical to a pack run.
+            wanted_by_question = (
+                [*self.requirements.required_calculations, *self.requirements.also_calculated]
+                if self.requirements
+                else []
+            )
+            required = [name for name in wanted_by_question if name not in seen]
             added: list[str] = []
             for pack_name, names in CALCULATION_PACKS.items():
                 wanted = [n for n in required if n in names and n not in seen]
@@ -740,9 +749,15 @@ class EquityAnalyzer:
         return CalculatedMetrics(calculations=results)
 
     def validate_requirements(
-        self, evidence: NormalizedEvidence | None, calculations: CalculatedMetrics
+        self,
+        evidence: NormalizedEvidence | None,
+        calculations: CalculatedMetrics,
+        *,
+        prior_available: bool | None = None,
     ) -> RequirementsReport | None:
-        """Which of the question's requirements the analysis met (None when unclassified).
+        """Which of the question's requirements the analysis met (None before the question
+        was interpreted). ``prior_available`` is whether a prior completed assessment exists
+        (``None``: the lookup was not reached).
 
         Unmet requirements are uncertainties for the result and the Spark bundle; they never
         fail the analysis and leave ``INSUFFICIENT_EVIDENCE`` to the evidence gate.
@@ -750,7 +765,12 @@ class EquityAnalyzer:
         if self.requirements is None:
             return None
         self.requirements_report = check_requirements(
-            self.requirements, evidence, calculations, self.state.executed
+            self.requirements,
+            evidence,
+            calculations,
+            self.state.executed,
+            prior_available=prior_available,
+            symbol=self.identity.symbol if self.identity else None,
         )
         return self.requirements_report
 
@@ -838,16 +858,22 @@ class EquityAnalyzer:
             {**s.public_view(), "rank": s.rank} for s in evidence.sources if not s.rejected_reason
         ]
         requirements = request.requirements or self.requirements
+        report = self.requirements_report
         question_focus: dict[str, Any] = {}
-        if requirements is not None:
-            report = self.requirements_report
+        question_notes: list[str] = []
+        if requirements is not None and not requirements.broad:
             question_focus = {
-                "kind": requirements.question_kind,
+                "intent": requirements.intent_label,
+                "requirements": requirements.requirement_labels,
                 "focus": requirements.focus,
                 "horizons_emphasis": list(requirements.horizons_emphasis),
                 "recent_period": requirements.recent_period,
                 "unmet_requirements": list(report.uncertainties) if report else [],
             }
+        elif requirements is not None:
+            # A general assessment runs exactly as before; only an interpretation note (the
+            # fallback, a rejected interpretation) reaches Spark, as an uncertainty.
+            question_notes = list(report.uncertainties if report else requirements.notes)
         return SparkEvidenceBundle(
             instrument={
                 "symbol": self.identity.symbol,
@@ -861,7 +887,6 @@ class EquityAnalyzer:
                 "profile": request.profile,
                 "horizon": request.resolved_horizon,
                 "as_of": request.as_of.isoformat(),
-                "question_kind": requirements.question_kind if requirements else None,
             },
             current_metrics=self._latest_metrics(evidence),
             historical_metrics={
@@ -878,7 +903,7 @@ class EquityAnalyzer:
             sources=sources,
             excerpts=excerpts,
             conflicts=[c.model_dump(mode="json") for c in evidence.conflicts],
-            uncertainties=list(evidence.uncertainties),
+            uncertainties=_dedupe([*evidence.uncertainties, *question_notes]),
             freshness=evidence.freshness_summary,
             horizons=horizons,
             question_focus=question_focus,
@@ -930,14 +955,15 @@ def _dedupe(items: list[str]) -> list[str]:
     return out
 
 
-def _classification_view(requirements: AnalyticalRequirements | None) -> dict[str, Any]:
-    """The classification fields ``research.started`` carries (None before classification)."""
+def _interpretation_view(requirements: AnalyticalRequirements | None) -> dict[str, Any]:
+    """What ``research.started`` carries about the question: product labels only (never the
+    raw interpretation); null / empty before the question was interpreted."""
     if requirements is None:
-        return {"question_kind": None, "classification_source": None, "confidence": None}
+        return {"question_intent": None, "requirements": [], "interpretation_source": None}
     return {
-        "question_kind": requirements.question_kind,
-        "classification_source": requirements.source,
-        "confidence": round(requirements.confidence, 3),
+        "question_intent": requirements.intent_label,
+        "requirements": requirements.requirement_labels,
+        "interpretation_source": requirements.source,
     }
 
 

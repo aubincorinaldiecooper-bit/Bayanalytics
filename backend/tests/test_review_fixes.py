@@ -520,7 +520,7 @@ class SilentServer(FakeLlamaServer):
         self.release = asyncio.Event()
         self.closed = False
 
-    async def _stream(self) -> AsyncIterator[bytes]:
+    async def _stream(self, body: dict[str, Any] | None = None) -> AsyncIterator[bytes]:
         try:
             await self.release.wait()
             yield b"data: [DONE]\n\n"

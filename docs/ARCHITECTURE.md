@@ -6,13 +6,19 @@ sourced, multi-horizon assessment produced by a small stack:
 ```
 typed query / microphone
         ↓ (Whisper Tiny, voice only)
-instrument identification            instruments/identity.py
+instrument identification            instruments/identity.py  (tickers, cashtags, names, possessives)
+explicit horizon (if stated)         pipeline/horizon.py      (deterministic phrases only)
         ↓
-question classification              instruments/questions.py + pipeline/questions.py
-   deterministic rules  →  bounded Laya choice only when unclear  →  analytical requirements
+Spark pass 1: query understanding    pipeline/understanding.py
+   a short JSON interpretation constrained to the QueryUnderstanding schema; never an answer
+        ↓
+Laya question validation             pipeline/questions.py  (confirm or drop each proposed requirement)
+        ↓
+requirements builder                 instruments/questions.py
+   per-requirement rows → research intents (company facts first), calculations, operands, checks
         ↓
 active retrieval loop                instruments/equity.py + research/*
-   required intents first, then the horizon seed; required operands become evidence gaps;
+   required intents with the horizon seed; required operands become evidence gaps;
    Laya picks a bounded intent  →  deterministic query template  →  search / EDGAR / prices
         ↓
 normalization + provenance           normalization/*  (facts, periods, sessions, conflicts)
@@ -22,17 +28,20 @@ Laya finance wrapper                 laya/*  (question schemas, compaction, work
 deterministic calculations           calculations/*  (registry, packs, reconciliation, formatting)
    the Laya-chosen pack plus every calculation the question requires
         ↓
-required-operand validation          instruments/questions.py::check_requirements
-   unmet requirements → uncertainties + AnalysisResult.requirements (never a failure)
-        ↓
 prior assessment + thesis diff       pipeline/thesis.py  (store lookup, structured comparison)
+        ↓
+requirement acceptance checks        instruments/questions.py::check_requirements
+   unmet requirements → uncertainties + AnalysisResult.requirements (never a failure)
         ↓
 structured evidence bundle           instruments/equity.py::build_spark_bundle (+ question_focus, prior block)
         ↓
-Spark X2.5 1.7B Q4_K_M (llama.cpp)   spark/*  (profiles, manager, streaming client, parser)
+Spark pass 2: synthesis (streamed)   spark/*  (profiles, manager, streaming client, parser)
         ↓
 assessment + sources + uncertainty   pipeline/assemble.py
 ```
+
+Spark understands the question first. Laya constrains. Research and math execute. Spark
+explains at the end.
 
 ## Process topology (local)
 
@@ -57,8 +66,8 @@ product: test doubles live under `backend/tests/doubles`, are injected through
 
 | Model | Role | Runtime | Boundary |
 | --- | --- | --- | --- |
-| Laya (`@receptron/laya@0.1.2`) | fast bounded decisions: question kind (only when the rules are unclear), research intent, materiality, trends, stances, calculation pack | ONNX Runtime CPU in a persistent Node 20+ worker | `laya/worker/worker.mjs` exposes only `load`, `system_one`, `count_tokens`, `health`, `close` |
-| Spark X2.5 1.7B Q4_K_M | synthesis and explanation over the compact evidence bundle | llama.cpp `llama-server` ≥ b10828 | `spark/manager.py` owns Fast/Deep restarts under the Spark lock |
+| Laya (`@receptron/laya@0.1.2`) | fast bounded decisions: confirming or dropping the requirements Spark proposed, research intent, materiality, trends, stances, calculation pack | ONNX Runtime CPU in a persistent Node 20+ worker | `laya/worker/worker.mjs` exposes only `load`, `system_one`, `count_tokens`, `health`, `close` |
+| Spark X2.5 1.7B Q4_K_M | pass 1: a short structured interpretation of the question (JSON-schema constrained, internal, never an answer); pass 2: synthesis and explanation over the compact evidence bundle | llama.cpp `llama-server` ≥ b10828 | `spark/manager.py` owns Fast/Deep restarts under the Spark lock; each pass is its own short session |
 | Whisper Tiny | speech-to-text only | whisper.cpp `whisper-cli` | `whisper/client.py`; never auto-submits an analysis |
 
 Deterministic Python code does every calculation. Laya chooses the pack and consumes the
@@ -133,7 +142,11 @@ Nothing sizes a prompt by counting characters:
   compacted deterministically (priority order, 240-character strings, 8-item lists, then
   dropping keys from the tail) with per-key measurements until the assembled state measures
   under budget. Measured heads are cached per question batch.
-- **Spark.** The orchestrator opens a `SparkClient.session` (the lock is held, the profile is
+- **Spark pass 1.** The query-understanding prompt is small and bounded (the rules with every
+  allowed value, then the question capped at 300 characters, the company and the horizon; no
+  evidence), so it is not fitted; llama-server's `usage` for it is reported as
+  `telemetry.query_understanding_prompt_tokens` / `_output_tokens`, `null` when not reported.
+- **Spark pass 2.** The orchestrator opens a `SparkClient.session` (the lock is held, the profile is
   resident), and `fit_bundle` renders each candidate prompt and asks the server for its size:
   `/apply-template` applies the model's chat template, `/tokenize` counts it with special
   tokens as a request would. The trim policy of section 24 runs against that measurement;
@@ -152,10 +165,12 @@ The SSE stream (`GET /api/v1/analyses/{id}/events`) carries only recorded system
 
 ```
 analysis.started → instrument.resolved
-→ laya.started → laya.decision × 2 → laya.completed        (question_scan; only when the rules
-                                                            could not classify the question)
+→ spark.loading?                                            (only when Spark pass 1 loads the
+                                                            model; pass 1 streams nothing else)
+→ laya.started → laya.decision × (n + 1) → laya.completed  (question_validation; only when pass 1
+                                                            proposed n ≥ 1 requirements)
 → research.started / research.query / research.source_found / research.source_rejected
-  (per round; research.started carries question_kind, classification_source and confidence;
+  (per round; research.started carries question_intent, requirements and interpretation_source;
   then laya.started → laya.decision × n → laya.completed for the research_plan
   stage, which chooses the next bounded intent)
 → research.completed → normalization.completed
@@ -173,56 +188,150 @@ that llama-server separates into `reasoning_content` is dropped. Inline reasonin
 `content`, if the model ever produces any, is not filtered (to be verified on the reference
 machine).
 
-## Question classification and analytical requirements
+## Question understanding and analytical requirements
 
 The analyst's question shapes the analysis before any retrieval:
 
 ```
 user query
-  ↓ classify_question: deterministic keyword/regex rules with a confidence and the matched cues
-  ↓ question_scan: one bounded Laya choice over the same kinds, only when the rules are unclear
-  ↓ AnalyticalRequirements: required research intents, calculations, operands, focus, horizons
-  ↓ seed_plan(horizon, requirements): required intents first, then the horizon seed (deduplicated)
-  ↓ compute_gaps: required operands missing from the retrieval state are evidence gaps
-  ↓ calculate: the Laya-chosen pack plus every required calculation
-  ↓ check_requirements: what was met, what was not → uncertainties + result.requirements
-  ↓ Spark bundle question_focus → rendered in the instructions, outside the evidence block
+  ├─ resolve instrument           deterministic: tickers, cashtags, names, possessives
+  ├─ resolve explicit horizon     deterministic, pipeline/horizon.py (only stated periods)
+  └─ Spark pass 1                 a short structured QueryUnderstanding (not an answer)
+        ↓
+  Laya question_validation        one noul per proposed requirement + requirements_supported
+        ↓
+  requirements builder            per-requirement rows → intents, calculations, operands, checks
+        ↓
+  research loop → normalization → deterministic math → Laya evidence / stance judgements
+        ↓
+  check_requirements → uncertainties + result.requirements → Spark pass 2 (synthesis)
 ```
 
-The kinds are a closed set (`general_assessment`, `thesis_change`, `valuation`, `growth`,
-`profitability_margins`, `relative_performance`, `risk_volatility`, `guidance_outlook`,
-`earnings_reaction`, `balance_sheet_liquidity`, `dividends_capital_return`). Each rule adds its
-weight to one kind. `general_assessment` cues ("assess", "analyze", "should I buy") are framing:
-they win only when no specific kind scored, so "Assess Apple's valuation" is a valuation
-question, and they never count as a competitor. Among the rest the leading kind wins with
-`0.5 + 0.2 × margin − 0.15 × [a competing kind scored]`, capped at 0.95, so one plain cue is
-0.7, a decisive phrase 0.9 and a one-point lead over a competing kind 0.55. Below 0.6, or when
-nothing fired or two kinds tied, Laya answers
-`question_kind_questions` (a choice over the kinds plus a `recent_period_focus` noul) over a
-compact state holding the question, the horizon and the rules' candidates; the decision is
-recorded like every other one (stage `question_scan`). Laya's pick below 0.4 confidence is not
-trusted to narrow the analysis: a general assessment runs and the result says so. Laya only
-picks the kind; the requirements are a table lookup (`instruments/questions.py::REQUIREMENTS`,
-validated against the intent set, the calculation registry and the canonical metric names at
-import time) and the plan is ordinary code. `general_assessment` requires nothing beyond the
-horizon seed plan and the Laya-chosen pack, so "Assess X." behaves exactly as before.
+**No regular expression or keyword rule decides what a question is about.** Deterministic
+parsing is limited to resolving the instrument, an explicit horizon phrase and text
+normalisation. The meaning of the question comes from Spark pass 1, is constrained by Laya and
+executed by ordinary code.
 
-Required operands that the structured sources did not carry surface as gaps under their metric
-name (`gap_to_intent` maps them to `retrieve_earnings_history`, and once that was executed the
-loop escalates to one `retrieve_missing_metric` search whose template spells the metric out);
-the termination rules below are unchanged. After the calculations `check_requirements` lists
-each required calculation and operand as satisfied or missing (with the missing inputs or the
-reason the formula had no meaningful value) and each required intent the budget did not reach;
-every gap is one sentence such as "the question asks about valuation but the trailing P/E could
-not be computed: missing eps_ttm", added to the assessment's uncertainties and shown to Spark
-as "evidence the question needs that could not be retrieved or computed". Nothing here fails an
-analysis: `INSUFFICIENT_EVIDENCE` remains the evidence gate's verdict on facts and primary
-sources.
+**Bounded vocabularies** (`schemas/questions.py`, each value with a one-line description and a
+product label):
+
+- intent: `general_assessment`, `valuation`, `valuation_vs_fundamentals`, `growth`,
+  `profitability`, `event_impact`, `relative_performance`, `risk`, `balance_sheet`,
+  `capital_return`, `guidance_outlook`;
+- requirements (at most 8, deduplicated): `valuation_multiples`, `valuation_history`,
+  `price_vs_earnings`, `earnings_trajectory`, `revenue_trajectory`, `margin_trajectory`,
+  `cash_flow`, `price_performance`, `benchmark_comparison`, `volatility_drawdown`,
+  `balance_sheet`, `capital_return`, `guidance`, `latest_period`, `prior_assessment`,
+  `recent_coverage` (labels such as "Valuation history", "Earnings trajectory", "Price
+  performance", "Benchmark comparison", "Prior assessment");
+- comparison focus: `own_history`, `market`, `sector`, `peers`, `none`;
+- flags: `needs_benchmark`, `needs_prior_assessment`, `recent_period_focus`.
+
+**Two Spark passes, one runtime.** Pass 1 (`pipeline/understanding.py`) runs right after the
+instrument is resolved, on the same Spark runtime and profile as the synthesis but in its own
+short session: the Spark lock is held only while it generates and is released before research
+starts. Its system prompt says "Convert the analyst's question about a listed company into the
+JSON object described. Do not answer the question. No prose. Use only the listed values. A broad
+request such as 'Assess Apple' is general_assessment with no requirements." and lists every
+allowed value with its one-liner; the user message is the question (control characters and
+evidence markers removed, capped at 300 characters), the company and the resolved horizon. No
+evidence and no calculations. The request carries
+`response_format: {"type": "json_schema", "json_schema": {"name": "query_understanding",
+"schema": …}}` with the `QueryUnderstanding` JSON schema (enums, every field required,
+`additionalProperties: false`), which llama-server compiles into a grammar;
+`max_tokens = BAY_SPARK_UNDERSTANDING_MAX_TOKENS` (default 192) and temperature 0. There is no
+second or third model.
+
+Pass 1 is internal: its tokens are discarded and it emits no `spark.started`, `spark.token` or
+`spark.completed`. A model load it triggers still emits the manager's `spark.loading`, so a
+client normally sees `spark.loading` between `instrument.resolved` and `research.started`
+(pass 2 then finds the profile resident). The output is validated strictly: values outside the
+vocabularies are dropped with one product-level note ("part of the question's interpretation
+was outside the supported values and was ignored"); malformed or empty JSON, an unusable intent
+or a generation cut off by the token limit falls back to the broad interpretation (a general
+assessment, no requirements, `interpretation_source: fallback`) with the uncertainty "the
+question could not be interpreted; a general assessment was produced". Spark runtime errors
+(`SPARK_START_FAILED`, `MEMORY_PRESSURE`, `SPARK_INFERENCE_FAILED`, a profile being unavailable,
+`CANCELLED`, `INTERRUPTED`) fail the analysis with that error: the synthesis could not have run
+either. Prompts are never logged or persisted; the raw pass-1 output is logged at DEBUG only
+and never reaches an event or a result.
+
+**Laya constrains** (`pipeline/questions.py`, stage `question_validation`). When pass 1 proposed
+at least one requirement (its list plus the requirements its flags imply: `needs_benchmark` →
+`benchmark_comparison`, `needs_prior_assessment` → `prior_assessment`, `recent_period_focus` →
+`latest_period`), Laya answers one noul per proposed requirement ("Answering the question
+requires valuation history.") and `requirements_supported` ("The proposed requirements fit the
+question.") over a compact state holding the question, the instrument, the horizon and the
+proposed intent and requirements as labels. The batch is validated and measured like every
+other one, emits `laya.started` / `laya.decision` / `laya.completed` with that stage and is
+persisted with every other decision. The combination rule is Python
+(`instruments/questions.py::combine_validation`): a proposed requirement is kept unless its noul
+is below `REQUIREMENT_REJECT_BELOW` (0.3), then it is dropped and recorded in
+`dropped_by_validation`; `requirements_supported` below `SUPPORT_REJECT_BELOW` (0.3) rejects the
+interpretation (a general assessment runs, every proposed requirement is recorded as dropped,
+and an uncertainty says so). Laya only reads proposed requirements, so it can never add one. A
+broad interpretation (a general assessment with nothing proposed) has nothing to validate and
+Laya is not asked. Which calculation pack runs is still Laya's `calculation_pack` choice,
+unchanged.
+
+**Python executes** (`instruments/questions.py`). `REQUIREMENT_TABLE` maps every requirement to
+research intents, registry calculations, operands (canonical metric names, `prices`,
+`benchmark`, `sector_benchmark`) and a minimum price window; `INTENT_TABLE` maps every intent to
+the focus sentence Spark is given and the horizons to emphasise. Both are validated at import
+against `ResearchIntent`, `SPECS` and the operand names. `build_requirements` unions the kept
+requirements' rows in order (deduplicated), so requirements compose: "valuation history" is
+`pe_ttm`, `pe_5y_percentile`, `pe_history_percentile`; "price versus earnings" is the existing
+`valuation_reconciliation_1y` record (the three-year record runs alongside when the history reaches
+back, never reported as unmet); "benchmark comparison" adds `retrieve_sector_benchmark` and the
+relative-return, beta and relative-drawdown records; "prior assessment" retrieves and computes
+nothing: it is met when the prior completed assessment exists that the question-agnostic thesis diff
+(above) compares against, and the diff is never duplicated.
+
+- *Company facts first.* The research loop ends an intent list as soon as `max_sources` is
+  reached, and each search intent can fetch several sources, so searches planned ahead of the
+  XBRL company facts could fill the budget and leave the evidence gate without facts. The
+  required intents and the seed plan built from them are therefore reordered by a stable
+  structural rule (`research/intents.py::facts_first`): company facts and prices, then the other
+  structured sources (filings list, benchmarks), then searches.
+- *Price window.* A requirement can declare a minimum price window: valuation history and the
+  price-versus-earnings reconciliation need `PE_HISTORY_YEARS × 366` days of prices (eight
+  quarter-end P/E points and the price three years back), so `build_queries` uses the larger of
+  the horizon's window (`PRICE_DAYS`, 400 days for `near_term` / `next_cycle`) and the
+  requirements' minimum, for prices and benchmarks alike.
+- Required operands the retrieval state lacks become evidence gaps under their metric name
+  (`gap_to_intent` maps them to `retrieve_earnings_history`, and once that ran the loop
+  escalates to one `retrieve_missing_metric` search whose template spells the metric out); the
+  termination rules below are unchanged. Required calculations run whatever pack Laya chose.
+
+After the prior-assessment lookup, `check_requirements` records every requirement as satisfied
+or unmet, and each required calculation, operand and intent as satisfied or missing (with the
+missing inputs or the reason a formula had no meaningful value). Every gap is one sentence such
+as "the question needs valuation history but the P/E's five-year percentile could not be
+computed: missing eps_ttm, pe_history", added to the assessment's uncertainties and shown to
+Spark pass 2 in its instructions (outside the evidence block) with the intent, the requirement
+labels, the focus sentence and the horizons to emphasise. Nothing here fails an analysis:
+`INSUFFICIENT_EVIDENCE` remains the evidence gate's verdict on facts and primary sources.
+
+A general assessment with no requirements builds nothing: the seed plan is the horizon's, the
+calculations are the Laya-chosen pack, Spark pass 2 receives no question focus, and the result
+carries `requirements` with the label "General assessment" and empty lists. "Assess X." behaves
+exactly as before, apart from the pass-1 call itself.
+
+**Measurement.** Pass 1 is instrumented separately and measured only: `query_understanding_ms`
+(wall clock, lock wait and any model load included), `query_understanding_prompt_tokens` and
+`query_understanding_output_tokens` (llama-server `usage`), `query_understanding_load_ms` (only
+when this pass loaded the profile; the synthesis's `spark_load_ms` is then `null`),
+`query_understanding_wait_ms` (queued behind another analysis's Spark turn),
+`query_understanding_generation_ms` (prompt processing and decoding: the cost of the semantic
+step itself) and the `understanding` stage timer; each is `null` when not reported. Its latency on the 8 GB reference
+machine has not been measured yet and must be before any optimisation (prompt caching, a warm
+profile, a smaller prompt). While another analysis holds the Spark lane, pass 1 waits for it
+without an event; `spark.queued` is still emitted only before pass 2.
 
 ## Retrieval loop termination
 
-`EquityAnalyzer.retrieve` runs the seed plan (the question's required intents, then the
-horizon's), then asks Laya for the next bounded intent, an `evidence_sufficient` probability
+`EquityAnalyzer.retrieve` runs the seed plan (the question's required intents with the
+horizon's, company facts first), then asks Laya for the next bounded intent, an `evidence_sufficient` probability
 and a `stale_evidence_matters` probability after every round. It stops when evidence is
 sufficient (≥ 0.7), Laya chooses `stop_research` and no untried gap remains, the chosen intent
 was already executed, `max_sources` is reached, `max_rounds` is reached, the research budget

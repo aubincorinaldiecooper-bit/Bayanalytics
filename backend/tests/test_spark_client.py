@@ -3,6 +3,9 @@
 The fake implements ``/health``, ``/props``, ``/apply-template``, ``/tokenize`` and the
 streaming ``/v1/chat/completions``, records every request with its headers, and can demand
 an API key. Its tokenizer is the deterministic word/punctuation rule shared by the doubles.
+A request carrying ``response_format`` (Spark pass 1, query understanding) is answered with
+``structured_deltas`` / ``structured_finish_reason``, every other one with ``deltas`` /
+``finish_reason``; the fake applies no grammar, it only replays what the test scripted.
 """
 
 from __future__ import annotations
@@ -21,7 +24,12 @@ import pytest
 from bayanalytics.config import Settings
 from bayanalytics.context import AnalysisContext
 from bayanalytics.errors import AnalysisError
+from bayanalytics.instruments.base import InstrumentIdentity
+from bayanalytics.pipeline.understanding import FALLBACK_NOTE as UNDERSTANDING_FALLBACK_NOTE
+from bayanalytics.pipeline.understanding import SYSTEM_PROMPT as UNDERSTANDING_SYSTEM_PROMPT
+from bayanalytics.pipeline.understanding import understand_question
 from bayanalytics.schemas.common import ErrorCode
+from bayanalytics.schemas.questions import QueryUnderstanding, query_understanding_schema
 from bayanalytics.spark import manager as manager_module
 from bayanalytics.spark.base import SparkMessage, SparkRunOptions
 from bayanalytics.spark.client import LlamaSparkClient
@@ -35,8 +43,15 @@ from bayanalytics.spark.profiles import (
     static_probe,
     version_fields,
 )
+from bayanalytics.wiring import build_runtime
+from doubles import FixedTranscriber, RuleLaya, fixture_research_stack
+from test_vertical_slice import FIXTURES, _run_to_completion
 
 SENTINEL = "PROMPT-CONTENT-MUST-NOT-LEAK"
+STRUCTURED_REST = (
+    '"requirements": [], "comparison_focus": "none", "needs_benchmark": false, '
+    '"needs_prior_assessment": false, "recent_period_focus": false}'
+)
 OK_PROBE = static_probe(available_mb=6000.0, total_mb=8192.0)
 _TOKEN = re.compile(r"\w+|[^\w\s]")
 
@@ -98,6 +113,8 @@ class FakeLlamaServer:
         self.transport_error: type[httpx.TransportError] | None = None
         self.deltas = ["## Summary\n", "Evidence suggests ", "signals are mixed ", "[src_a]."]
         self.finish_reason = "stop"
+        self.structured_deltas = ['{"intent": "general_assessment", ', STRUCTURED_REST]
+        self.structured_finish_reason = "stop"
         self.include_usage = True
         self.include_timings = True
         self.raw_lines: list[str] | None = None
@@ -174,15 +191,20 @@ class FakeLlamaServer:
             if self.status != 200:
                 return httpx.Response(self.status, json={"error": {"message": "boom"}})
             return httpx.Response(
-                200, stream=FakeSSEStream(self), headers={"content-type": "text/event-stream"}
+                200,
+                stream=FakeSSEStream(self, self.requests[-1]),
+                headers={"content-type": "text/event-stream"},
             )
         return httpx.Response(404)
 
-    def sse_lines(self) -> list[str]:
+    def sse_lines(self, body: dict[str, Any] | None = None) -> list[str]:
         if self.raw_lines is not None:
             return self.raw_lines
+        structured = bool(body and "response_format" in body)
+        deltas = self.structured_deltas if structured else self.deltas
+        finish_reason = self.structured_finish_reason if structured else self.finish_reason
         lines = []
-        for index, delta in enumerate(self.deltas):
+        for index, delta in enumerate(deltas):
             chunk = {
                 "id": "chatcmpl-1",
                 "object": "chat.completion.chunk",
@@ -199,22 +221,20 @@ class FakeLlamaServer:
             lines.append("data: " + json.dumps(chunk))
         lines.append(
             "data: "
-            + json.dumps(
-                {"choices": [{"index": 0, "delta": {}, "finish_reason": self.finish_reason}]}
-            )
+            + json.dumps({"choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}]})
         )
         final: dict[str, Any] = {"choices": []}
         if self.include_usage:
             final["usage"] = {
                 "prompt_tokens": 900,
-                "completion_tokens": len(self.deltas),
-                "total_tokens": 900 + len(self.deltas),
+                "completion_tokens": len(deltas),
+                "total_tokens": 900 + len(deltas),
             }
         if self.include_timings:
             final["timings"] = {
                 "prompt_n": 900,
                 "prompt_ms": 1500.0,
-                "predicted_n": len(self.deltas),
+                "predicted_n": len(deltas),
                 "predicted_ms": 200.0,
                 "predicted_per_second": 20.0,
             }
@@ -223,12 +243,12 @@ class FakeLlamaServer:
         lines.append("data: [DONE]")
         return lines
 
-    async def _stream(self) -> AsyncIterator[bytes]:
+    async def _stream(self, body: dict[str, Any] | None = None) -> AsyncIterator[bytes]:
         self.active += 1
         if self.active > 1:
             self.overlap = True
         try:
-            for line in self.sse_lines():
+            for line in self.sse_lines(body):
                 yield (line + "\n\n").encode()
                 await asyncio.sleep(0)
         finally:
@@ -238,8 +258,8 @@ class FakeLlamaServer:
 class FakeSSEStream(httpx.AsyncByteStream):
     """Forwards ``aclose`` to the generator so the fake sees the client close the response."""
 
-    def __init__(self, server: FakeLlamaServer) -> None:
-        self._gen = server._stream()
+    def __init__(self, server: FakeLlamaServer, body: dict[str, Any] | None = None) -> None:
+        self._gen = server._stream(body)
 
     async def __aiter__(self) -> AsyncIterator[bytes]:
         async for chunk in self._gen:
@@ -581,6 +601,181 @@ async def test_apply_template_and_tokenize_shape_and_transport_errors(
     assert info.value.code == ErrorCode.SPARK_INFERENCE_FAILED
     assert info.value.details == {"reason": "ConnectError"}
     assert SENTINEL not in json.dumps(info.value.details)
+
+
+# --- Spark pass 1: query understanding --------------------------------------------------------
+
+UNDERSTANDING_IDENTITY = InstrumentIdentity(symbol="AAPL", name="Apple Inc.", cik="320193")
+VALUATION_JSON = json.dumps(
+    {
+        "intent": "valuation",
+        "requirements": ["valuation_multiples", "valuation_history"],
+        "comparison_focus": "own_history",
+        "needs_benchmark": False,
+        "needs_prior_assessment": False,
+        "recent_period_focus": False,
+    }
+)
+
+
+def _split(text: str, parts: int = 4) -> list[str]:
+    size = max(1, len(text) // parts)
+    return [text[i : i + size] for i in range(0, len(text), size)]
+
+
+async def _understand(harness: Harness, ctx: AnalysisContext, settings: Settings) -> Any:
+    return await understand_question(
+        "Assess Apple's valuation",
+        UNDERSTANDING_IDENTITY,
+        "multi_horizon",
+        harness.client,
+        "fast",
+        ctx,
+        settings,
+    )
+
+
+async def test_pass_one_request_is_schema_constrained_short_and_internal(
+    harness: Harness, server: FakeLlamaServer, settings: Settings
+):
+    server.structured_deltas = _split(VALUATION_JSON)
+    ctx = harness.ctx()
+    understood = await _understand(harness, ctx, settings)
+    assert understood.source == "spark"
+    assert understood.understanding.requirements == ["valuation_multiples", "valuation_history"]
+    (body,) = server.requests
+    assert body["response_format"] == {
+        "type": "json_schema",
+        "json_schema": {"name": "query_understanding", "schema": query_understanding_schema()},
+    }
+    assert body["max_tokens"] == 192 and body["temperature"] == 0.0 and body["stream"] is True
+    assert body["messages"][0] == {"role": "system", "content": UNDERSTANDING_SYSTEM_PROMPT}
+    assert body["messages"][1]["content"].startswith("Question: Assess Apple's valuation\n")
+    # internal: the model load is the only event, nothing reaches the token callback
+    assert [name for name, _ in harness.events] == ["spark.loading"]
+    assert harness.tokens == [] and harness.client.busy is False
+    assert "spark" not in ctx.timers.elapsed_ms and ctx.timers.elapsed_ms["understanding"] > 0
+    assert "spark_ttft_ms" not in ctx.diagnostics
+    assert "spark_streamed_deltas" not in ctx.diagnostics
+    # measured: llama-server usage for tokens, the load only when this pass loaded the profile
+    stats = understood.stats
+    assert stats.prompt_tokens == 900 and stats.output_tokens == len(server.structured_deltas)
+    assert stats.load_ms is not None and stats.load_ms >= 0 and stats.wall_ms >= stats.load_ms
+    # the wall clock splits into the wait for the lane, the load and the generation itself
+    assert stats.wait_ms is not None and stats.wait_ms >= 0
+    assert stats.generation_ms is not None and stats.generation_ms > 0
+    assert stats.wait_ms + stats.load_ms + stats.generation_ms <= stats.wall_ms + 0.01
+    again = await _understand(harness, harness.ctx("an_2"), settings)
+    assert again.stats.load_ms is None  # already loaded: no load to report
+    assert again.stats.generation_ms is not None and again.stats.generation_ms > 0
+    # the synthesis request never carries a response format
+    await harness.client.run("fast", messages(), harness.on_token, harness.ctx("an_3"))
+    assert "response_format" not in server.requests[-1]
+
+
+@pytest.mark.parametrize(
+    ("deltas", "finish_reason"),
+    [
+        (['{"intent": "valuation", "requirements": ["valuation_mult'], "stop"),
+        (["not json at all"], "stop"),
+        ([], "stop"),
+        (_split(VALUATION_JSON), "length"),
+    ],
+)
+async def test_pass_one_falls_back_on_unusable_output(
+    harness: Harness, server: FakeLlamaServer, settings: Settings, deltas, finish_reason
+):
+    server.structured_deltas = deltas
+    server.structured_finish_reason = finish_reason
+    understood = await _understand(harness, harness.ctx(), settings)
+    assert understood.source == "fallback"
+    assert understood.understanding == QueryUnderstanding.broad()
+    assert understood.notes == [UNDERSTANDING_FALLBACK_NOTE]
+    assert [name for name, _ in harness.events] == ["spark.loading"]
+
+
+async def test_pass_one_token_counts_are_none_without_usage(
+    harness: Harness, server: FakeLlamaServer, settings: Settings
+):
+    server.include_usage = False
+    server.include_timings = False
+    understood = await _understand(harness, harness.ctx(), settings)
+    assert understood.stats.prompt_tokens is None and understood.stats.output_tokens is None
+    assert understood.stats.wall_ms > 0
+
+
+async def test_pass_one_runtime_errors_propagate(
+    harness: Harness, server: FakeLlamaServer, settings: Settings
+):
+    server.status = 500
+    with pytest.raises(AnalysisError) as info:
+        await _understand(harness, harness.ctx(), settings)
+    assert info.value.code == ErrorCode.SPARK_INFERENCE_FAILED
+    assert harness.client.busy is False
+
+
+async def test_pass_one_runs_between_resolution_and_research_on_its_own_session(
+    harness: Harness, server: FakeLlamaServer, settings: Settings
+):
+    """The real client inside the orchestrator: pass 1 after instrument.resolved and before
+    research.started, the Spark lock released in between, pass 2 on a second session."""
+    server.structured_deltas = _split(VALUATION_JSON)
+    rt = build_runtime(
+        settings,
+        laya=RuleLaya(),
+        spark=harness.client,
+        transcriber=FixedTranscriber(),
+        research=fixture_research_stack(settings, FIXTURES),
+    )
+    lane: dict[str, bool] = {}
+    publish = rt.bus.publish
+
+    async def recording_publish(analysis_id: str, event: str, data: dict[str, Any]) -> Any:
+        if event in {"instrument.resolved", "research.started"}:
+            lane.setdefault(event, harness.client.busy)
+        return await publish(analysis_id, event, data)
+
+    rt.bus.publish = recording_publish  # type: ignore[method-assign]
+    _id, events, result = await _run_to_completion(rt, {"query": "Assess Apple's valuation"})
+    assert result["status"] == "completed", result["error"]
+    names = [e["event"] for e in events]
+    # pass 1: a load is visible before research, nothing else of it is streamed
+    assert names.index("instrument.resolved") < names.index("spark.loading")
+    assert names.index("spark.loading") < names.index("research.started")
+    assert names.count("spark.started") == names.count("spark.completed") == 1
+    assert names.index("research.completed") < names.index("spark.started")
+    tokens = [e["data"]["text"] for e in events if e["event"] == "spark.token"]
+    assert tokens == server.deltas and result["streamed_text"] == "".join(server.deltas)
+    # the lane was free when research started: pass 1 held the lock only for itself
+    assert lane == {"instrument.resolved": False, "research.started": False}
+    assert server.overlap is False
+    chats = server.requests
+    assert len(chats) == 2
+    assert "response_format" in chats[0] and "response_format" not in chats[1]
+    assert chats[0]["max_tokens"] == 192
+    assert chats[1]["max_tokens"] == settings.spark_max_output_tokens
+    started = next(e["data"] for e in events if e["event"] == "research.started")
+    assert started["question_intent"] == "Valuation"
+    assert started["requirements"] == ["Valuation multiples", "Valuation history"]
+    telemetry = result["telemetry"]
+    assert telemetry["query_understanding_prompt_tokens"] == 900
+    assert telemetry["query_understanding_output_tokens"] == len(server.structured_deltas)
+    assert telemetry["query_understanding_load_ms"] is not None  # pass 1 loaded the profile
+    assert telemetry["spark_load_ms"] is None  # so pass 2 did not
+    assert telemetry["query_understanding_ms"] >= telemetry["query_understanding_load_ms"]
+    assert telemetry["query_understanding_wait_ms"] is not None
+    assert telemetry["query_understanding_generation_ms"] > 0
+    assert telemetry["spark_prompt_tokens"] == 900  # pass 2's own usage, not pass 1's
+    # without usage from the server the pass-1 counts stay None
+    server.include_usage = False
+    server.include_timings = False
+    _id, _events, second = await _run_to_completion(rt, {"query": "Assess Apple's valuation"})
+    telemetry = second["telemetry"]
+    assert telemetry["query_understanding_prompt_tokens"] is None
+    assert telemetry["query_understanding_output_tokens"] is None
+    # (a new app lifespan stopped the server, so pass 1 loaded it again: measured, not usage)
+    assert telemetry["query_understanding_load_ms"] is not None
+    assert telemetry["query_understanding_ms"] is not None
 
 
 # --- authentication ---------------------------------------------------------------------------

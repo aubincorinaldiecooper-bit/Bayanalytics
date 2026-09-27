@@ -17,9 +17,10 @@ Bundle entry shapes this module reads (all keys optional, unknown keys ignored):
 - ``prior_assessment``: ``pipeline.thesis.prior_assessment_block`` (``analysis_id``, ``as_of``,
   ``stances``, ``metrics``, ``new_conflicts``, ``resolved_conflicts``, ``freshness``,
   ``summary``), rendered as at most ``PRIOR_MAX_LINES`` lines.
-- ``question_focus``: ``{"kind", "focus", "horizons_emphasis", "recent_period",
-  "unmet_requirements"}`` from the question classification (rendered in the instructions,
-  not inside the evidence block: it is produced by the application, never by a retrieved page).
+- ``question_focus``: ``{"intent", "requirements", "focus", "horizons_emphasis",
+  "recent_period", "unmet_requirements"}`` from the interpreted question (product labels and
+  application sentences, rendered in the instructions, not inside the evidence block: it is
+  produced by the application, never by a retrieved page).
 """
 
 from __future__ import annotations
@@ -64,8 +65,9 @@ EVIDENCE_SECTIONS: frozenset[str] = frozenset(
     {"What changed", "Bull evidence", "Bear evidence", "Risks", "Conflicts", "Uncertainties"}
 )
 
-FOCUS_TEXT_MAX_CHARS = 400
+FOCUS_TEXT_MAX_CHARS = 500
 MAX_UNMET_REQUIREMENTS = 8
+MAX_FOCUS_REQUIREMENTS = 12
 
 SYSTEM_PROMPT = """You are Spark, the synthesis layer of a CPU-only equity research assistant. \
 You write for a professional analyst who remains the decision-maker. Deterministic tooling has \
@@ -448,8 +450,9 @@ def render_instructions(bundle: SparkEvidenceBundle, options: SparkRunOptions | 
 def _render_question_focus(bundle: SparkEvidenceBundle) -> list[str]:
     """What the analyst asked and what the evidence could not supply for it.
 
-    Application-generated text (the requirements table and the requirement check), so it sits
-    with the instructions; the analyst's own words stay capped in ``Analyst question``.
+    Application-generated text (the interpretation's labels, the requirements tables and the
+    requirement check), so it sits with the instructions; the analyst's own words stay capped
+    in ``Analyst question``.
     """
     focus = bundle.question_focus or {}
     if not isinstance(focus, dict):
@@ -457,8 +460,13 @@ def _render_question_focus(bundle: SparkEvidenceBundle) -> list[str]:
     lines: list[str] = []
     text = clean_text(focus.get("focus"), FOCUS_TEXT_MAX_CHARS)
     if text:
-        kind = clean_text(focus.get("kind"), 40)
-        lines.append(f"Question focus{f' ({kind})' if kind else ''}: {text}")
+        intent = clean_text(focus.get("intent"), 60)
+        lines.append(f"Question focus{f' ({intent})' if intent else ''}: {text}")
+    requirements = focus.get("requirements")
+    if isinstance(requirements, list | tuple) and requirements:
+        labels = ", ".join(clean_text(r, 60) for r in requirements[:MAX_FOCUS_REQUIREMENTS] if r)
+        if labels:
+            lines.append(f"What the question requires: {labels}.")
     horizons = focus.get("horizons_emphasis")
     if isinstance(horizons, list | tuple) and horizons:
         labels = ", ".join(HORIZON_LABELS.get(str(h), clean_text(h, 40)) for h in horizons if h)
@@ -474,7 +482,7 @@ def _render_question_focus(bundle: SparkEvidenceBundle) -> list[str]:
         items = [clean_text(u, 300) for u in unmet[:MAX_UNMET_REQUIREMENTS] if u]
         if items:
             lines.append(
-                "Evidence the question needs that could not be retrieved or computed (say so "
+                "What the question needs that could not be retrieved or computed (say so "
                 "explicitly under Uncertainties; never fill the gap):"
             )
             lines.extend(f"- {item}" for item in items)

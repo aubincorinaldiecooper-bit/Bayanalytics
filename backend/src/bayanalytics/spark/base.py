@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from contextlib import AbstractAsyncContextManager
-from typing import Literal, Protocol
+from typing import Any, Literal, Protocol
 
 from pydantic import BaseModel, Field
 
@@ -58,6 +58,11 @@ class SparkRunOptions(BaseModel):
     temperature: float = 0.2
     top_p: float = 0.9
     stop: list[str] = Field(default_factory=list)
+    json_schema: dict[str, Any] | None = None
+    """When set, the generation is constrained to this JSON schema (llama-server
+    ``response_format`` ``json_schema``, compiled to a grammar). Such a structured generation
+    is internal to the pipeline (query understanding): its caller times it, so it adds nothing
+    to the synthesis stage timer or the synthesis diagnostics."""
 
 
 class SparkSession(Protocol):

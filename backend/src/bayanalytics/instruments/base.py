@@ -56,7 +56,8 @@ class AnalysisRequest(BaseModel):
     resolved_horizon: ResolvedHorizon
     as_of: datetime
     budget: ResearchBudget = Field(default_factory=ResearchBudget)
-    # What the question needs (instruments/questions.py); None until it was classified.
+    # What the interpreted question needs (pipeline/understanding.py, pipeline/questions.py,
+    # instruments/questions.py); None until the question was interpreted.
     requirements: AnalyticalRequirements | None = None
 
 
@@ -102,8 +103,9 @@ class SparkEvidenceBundle(BaseModel):
     prior_assessment: dict[str, Any] | None = None
     """Bounded, evidence-only comparison with the prior completed assessment of the same
     instrument (``pipeline.thesis.prior_assessment_block``); ``None`` when there is none."""
-    # What the analyst asked (kind, focus sentence, horizons to emphasise) and the
-    # requirements the analysis could not meet, so the synthesis addresses the question.
+    # What the analyst asked (intent and requirement labels, focus sentence, horizons to
+    # emphasise) and what the analysis could not meet, so the synthesis addresses the question;
+    # empty for a general assessment with nothing narrower.
     question_focus: dict[str, Any] = Field(default_factory=dict)
 
 

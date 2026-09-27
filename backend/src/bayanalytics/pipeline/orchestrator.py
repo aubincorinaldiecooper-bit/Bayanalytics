@@ -1,10 +1,12 @@
 """The vertical slice (AGENT.md sections 19, 27, 40).
 
-resolve instrument -> Laya-directed research -> normalize + provenance -> Laya scoring ->
-deterministic calculations -> Laya horizon stances -> Spark synthesis (streamed) -> structured,
-sourced result. Every stage emits recorded system state; nothing hidden is streamed. The function
-never raises: failures become a result with ``status`` failed/cancelled and a structured error,
-preserving whatever content was already produced as ``partial``.
+resolve instrument -> Spark pass 1 (question understanding) -> Laya validation of the proposed
+requirements -> deterministic requirements -> Laya-directed research -> normalize + provenance
+-> Laya scoring -> deterministic calculations -> Laya horizon stances -> Spark pass 2 synthesis
+(streamed) -> structured, sourced result. Every stage emits recorded system state; nothing
+hidden is streamed. The function never raises: failures become a result with ``status``
+failed/cancelled and a structured error, preserving whatever content was already produced as
+``partial``.
 """
 
 from __future__ import annotations
@@ -35,6 +37,8 @@ from bayanalytics.pipeline.thesis import (
     snapshot_of_assembled,
     snapshot_of_draft,
 )
+from bayanalytics.pipeline.understanding import TIMER_NAME as UNDERSTANDING_TIMER
+from bayanalytics.pipeline.understanding import Understanding, understand_question
 from bayanalytics.runtime import Runtime
 from bayanalytics.schemas.common import ErrorCode, utcnow
 from bayanalytics.schemas.decisions import LayaDecision
@@ -78,6 +82,7 @@ class _Draft:
         self.partial_synthesis = False
         self.prior: AnalysisResult | None = None  # the last completed assessment, if any
         self.thesis_diff: ThesisDiff | None = None
+        self.understanding: Understanding | None = None  # Spark pass 1, once it ran
         self.requirements: RequirementsReport | None = None
 
     def instrument_view(self) -> InstrumentView | None:
@@ -163,10 +168,26 @@ async def run_analysis(job: AnalysisJob, ctx: AnalysisContext, rt: Runtime) -> A
             )
             # 2. research ---------------------------------------------------------------
             await _set_status(rt, job, "researching")
-            # 2a. what the question requires: rules, or one bounded Laya choice
-            # (question_scan) when the rules are unclear; the plan is built from it.
+            # 2a. what the question requires: Spark pass 1 interprets it (a short structured
+            # reading on its own Spark session, lock released before research), Laya confirms
+            # or drops each proposed requirement (question_validation), and the requirements
+            # builder turns what survives into intents, calculations, operands and checks.
+            draft.understanding = await understand_question(
+                job.query,
+                identity,
+                job.resolved_horizon,
+                rt.spark,
+                job.profile,
+                ctx,
+                rt.settings,
+            )
             requirements, question_decisions = await resolve_requirements(
-                job.query, job.resolved_horizon, analyzer.laya, ctx, instrument=identity.symbol
+                draft.understanding,
+                job.query,
+                identity,
+                job.resolved_horizon,
+                analyzer.laya,
+                ctx,
             )
             draft.decisions.decisions.extend(question_decisions)
             request = request.model_copy(update={"requirements": requirements})
@@ -215,11 +236,6 @@ async def run_analysis(job: AnalysisJob, ctx: AnalysisContext, rt: Runtime) -> A
             for calc in calculations.calculations:
                 await ctx.event("calculation.completed", **calc.event_view())
             await rt.store.save_calculations(job.analysis_id, calculations.calculations)
-            # 5a. required-operand validation: unmet requirements are uncertainties (for the
-            # result and for Spark), never a failure.
-            draft.requirements = analyzer.validate_requirements(evidence, calculations)
-            if draft.requirements is not None:
-                draft.extra_uncertainties.extend(draft.requirements.uncertainties)
             # 5b. horizon stances (Laya, with calculations in state) ----------------------
             horizon_sets = analyzer.build_horizon_questions(
                 evidence, draft.decisions, calculations, request, horizons
@@ -248,6 +264,14 @@ async def run_analysis(job: AnalysisJob, ctx: AnalysisContext, rt: Runtime) -> A
                     evidence, draft.decisions, calculations, horizons, draft.extra_uncertainties
                 )
                 draft.thesis_diff = diff_assessments(draft.prior, current)
+            # 5d. requirement acceptance checks (after the prior lookup, which the
+            # prior_assessment requirement needs): unmet requirements are uncertainties for
+            # the result and for Spark, never a failure.
+            draft.requirements = analyzer.validate_requirements(
+                evidence, calculations, prior_available=draft.prior is not None
+            )
+            if draft.requirements is not None:
+                draft.extra_uncertainties.extend(draft.requirements.uncertainties)
             # 6. Spark synthesis --------------------------------------------------------
             await _set_status(rt, job, "synthesizing")
             options = SparkRunOptions(
@@ -414,9 +438,13 @@ async def _salvage(rt: Runtime, job: AnalysisJob, draft: _Draft, analyzer: Equit
     if draft.identity is None and analyzer.identity is not None:
         draft.identity = analyzer.identity
     if draft.requirements is None and analyzer.requirements is not None:
-        # The classification happened even if the calculations did not: report it, with
+        # The question was interpreted even if the calculations did not run: report it, with
         # every requirement the analysis never reached listed as unmet.
-        draft.requirements = analyzer.validate_requirements(draft.evidence, draft.calculations)
+        draft.requirements = analyzer.validate_requirements(
+            draft.evidence,
+            draft.calculations,
+            prior_available=None if draft.prior is None else True,
+        )
     try:
         if draft.sources:
             await rt.store.save_sources(job.analysis_id, draft.sources)
@@ -489,10 +517,11 @@ def _evidence_gate(
 
 
 def _spark_busy(spark: Any) -> bool:
-    """One Spark request runs at a time; report when this analysis has to wait for the lane."""
-    lock = getattr(spark, "_lock", None)
-    locked = getattr(lock, "locked", None)
-    return bool(locked()) if callable(locked) else False
+    """One Spark request runs at a time; report when this analysis has to wait for the lane.
+    The client's ``busy`` counts a running turn and any queued ones (with pass 1 and pass 2 of
+    several analyses contending, a turn is often handed over to a waiter that has not run yet).
+    """
+    return bool(getattr(spark, "busy", False))
 
 
 def _child_pids(rt: Runtime) -> dict[str, int]:
@@ -548,6 +577,14 @@ def _telemetry(
     if isinstance(laya_stats, dict):
         telemetry.laya_resident_ram_mb = laya_stats.get("resident_rss_mb")
         telemetry.laya_warm_inference_ms = laya_stats.get("warm_inference_ms")
+    telemetry.query_understanding_ms = elapsed.get(UNDERSTANDING_TIMER)
+    if draft.understanding is not None:
+        understood = draft.understanding.stats
+        telemetry.query_understanding_prompt_tokens = understood.prompt_tokens
+        telemetry.query_understanding_output_tokens = understood.output_tokens
+        telemetry.query_understanding_load_ms = understood.load_ms
+        telemetry.query_understanding_wait_ms = understood.wait_ms
+        telemetry.query_understanding_generation_ms = understood.generation_ms
     if spark_stats is not None:
         telemetry.spark_load_ms = spark_stats.load_ms
         telemetry.spark_time_to_first_token_ms = spark_stats.time_to_first_token_ms

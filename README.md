@@ -5,9 +5,13 @@ about a listed company into a sourced, explainable, multi-horizon assessment bui
 information:
 
 ```
-public research → normalization + provenance → Laya (bounded decisions)
-→ deterministic calculations → Spark X2.5 1.7B Q4_K_M (synthesis) → analyst
+question → Spark X2.5 1.7B Q4_K_M (pass 1: what the question requires) → Laya (bounded validation)
+→ public research → normalization + provenance → Laya (bounded decisions)
+→ deterministic calculations → Spark (pass 2: synthesis) → analyst
 ```
+
+Spark understands the question first. Laya constrains. Research and math execute. Spark
+explains at the end. No keyword or regex rule decides what a question is about.
 
 No GPU is required. The reference machine is an 8 GB Intel Mac. The same API contract is
 intended to run unchanged on CPU-only cloud infrastructure; no cloud deployment exists yet.
@@ -31,8 +35,8 @@ backend/
   src/bayanalytics/
     api/            FastAPI routes: analyses, SSE events, cancel, transcriptions, health, capabilities
     jobs/           asyncio job runner (admission control), per-analysis event bus, durable job model
-    pipeline/       orchestrator (the vertical slice), horizon resolution, question classification stage, result assembly
-    instruments/    InstrumentAnalyzer boundary, identity resolution, question kinds + analytical requirements, EquityAnalyzer
+    pipeline/       orchestrator (the vertical slice), horizon resolution, question understanding (Spark pass 1) and validation, thesis diff, result assembly
+    instruments/    InstrumentAnalyzer boundary, identity resolution, analytical requirements builder, EquityAnalyzer
     research/       ResearchProvider boundary, SearXNG search, fetch (SSRF gate)/extract/dedup, SEC EDGAR, prices, intents
     normalization/  units, fiscal periods, market sessions, facts + conflicts + freshness, corporate actions (EDGAR name history)
     laya/           Node worker (@receptron/laya@0.1.2, NDJSON), Python client, finance question schemas, measured compaction
@@ -159,24 +163,44 @@ Notes for the client (from a real-HTTP simulation of the frontend reducer):
 - A user cancel ends with `analysis.failed` whose `status` is `cancelled` and `error.code` is
   `CANCELLED`; branch on `status`, and treat the terminal event as authoritative (the cancel
   response echoes the pre-cancel stage). A backend stop or crash is `INTERRUPTED`, never `CANCELLED`.
-- `laya.started` / `laya.decision` / `laya.completed` carry a `stage`: `question_scan` (only
-  when the deterministic question classifier was unclear) and `research_plan` happen inside the
+- `laya.started` / `laya.decision` / `laya.completed` carry a `stage`: `question_validation`
+  (only when Spark's interpretation proposed requirements) and `research_plan` happen inside the
   research phase, `evidence_scan`, `history_scan` and `text_evidence` are the scoring phase, and
   `horizon` runs after the calculations. Map by stage, not by first occurrence.
-- The question is classified before research starts (see "Question classification" in
-  `docs/ARCHITECTURE.md`). Every `research.started` carries `question_kind` (one of
-  `general_assessment`, `thesis_change`, `valuation`, `growth`, `profitability_margins`,
-  `relative_performance`, `risk_volatility`, `guidance_outlook`, `earnings_reaction`,
-  `balance_sheet_liquidity`, `dividends_capital_return`), `classification_source` (`rules` or
-  `laya`) and `confidence`. The result's `requirements` field holds the `classification`
-  (`kind`, `confidence`, `source`, `cues`, `recent_period`, `decision_id`, `note`), the
-  `focus` sentence Spark was given, `horizons_emphasis`, and for research intents,
-  calculations and operands the `required_*` / `satisfied_*` / `missing_*` lists plus the
-  `uncertainties` those gaps produced (also merged into `assessment.uncertainties`). Unmet
-  requirements never fail an analysis; `INSUFFICIENT_EVIDENCE` keeps its meaning.
+- The question is interpreted before research starts (see "Question understanding" in
+  `docs/ARCHITECTURE.md`): Spark pass 1 produces a short structured interpretation, Laya
+  confirms or drops each proposed requirement, and Python builds the research plan and
+  calculations from what survives. Events and results carry product labels only, never the raw
+  interpretation, a prompt or model reasoning. Every `research.started` carries
+  `question_intent` (a label such as "Valuation", "Growth", "Event impact", "Relative
+  performance" or "General assessment"), `requirements` (labels such as `["Valuation
+  history", "Earnings trajectory"]`, empty for a general assessment) and
+  `interpretation_source` (`spark`, or `fallback` when the interpretation was unusable or
+  rejected and a general assessment runs). The result's `requirements` field holds
+  `question_intent`, `requirements`, `interpretation_source`, `dropped_by_validation` (labels
+  Laya did not confirm), the `focus` sentence Spark was given, `horizons_emphasis`,
+  `satisfied_requirements` / `unmet_requirements` (label and reason), and for research
+  intents, calculations and operands the `required_*` / `executed_*` / `satisfied_*` /
+  `missing_*` lists (with reasons and missing inputs) plus the `uncertainties` those gaps
+  produced (also merged into `assessment.uncertainties`). Unmet requirements never fail an
+  analysis; `INSUFFICIENT_EVIDENCE` keeps its meaning.
+- Spark pass 1 is internal and emits no `spark.started` / `spark.token` / `spark.completed`,
+  but a model load it triggers emits `spark.loading`: the first analysis after a start (or a
+  profile switch) shows `spark.loading` between `instrument.resolved` and `research.started`,
+  and the synthesis then normally shows none. A Spark runtime error in pass 1 fails the
+  analysis with that code before research starts.
 - `spark.queued` (with `active_analyses`) is emitted when the analysis is waiting for the single
-  Spark lane; `spark.loading` appears only when a model load actually happens; `spark.started`
-  arrives with the first token and carries the measured `prompt_tokens`.
+  Spark lane before its synthesis; `spark.loading` appears only when a model load actually
+  happens; `spark.started` arrives with the first token and carries the measured
+  `prompt_tokens`. While another analysis synthesizes, pass 1 of a new analysis waits for the
+  lane without an event.
+- `telemetry` adds `query_understanding_ms` (wall clock of pass 1, lock wait included),
+  `query_understanding_prompt_tokens` / `query_understanding_output_tokens` (llama-server
+  usage), `query_understanding_load_ms` (only when pass 1 loaded the model; `spark_load_ms`
+  is then `null`), `query_understanding_wait_ms` (queued behind another analysis's Spark turn)
+  and `query_understanding_generation_ms` (the pass itself: prompt processing and decoding);
+  each is `null` when not reported. `BAY_SPARK_UNDERSTANDING_MAX_TOKENS`
+  (default 192) bounds pass 1's output.
 - A result with `partial: true` and `status: completed` means the synthesis was cut off or a
   horizon section is missing (`horizon_assessments[*].synthesized`).
 - `POST /transcriptions` takes the audio as multipart field `audio`.
@@ -242,6 +266,7 @@ SearXNG instance, the Railway database or the reference machine.
 | Normalization: periods, sessions (no exchange-holiday calendar), restatements, conflicts, freshness, leakage guard, corporate actions from EDGAR name history | | The Railway Postgres instance (`bayanalytics migrate` against it) |
 | Fetcher target policy (loopback, link-local, private and every redirect hop refused), DOM depth cap, keyword-only rejection reasons, cache policy | | |
 | End-to-end "Assess Apple." with the synthetic fixture, `RuleLaya` and `ScriptedSpark` doubles | | |
+| Question understanding: the pass-1 request (`response_format` JSON schema, 192 tokens, temperature 0), fallbacks, event order and lock release through the real Spark client and a fake llama-server; Laya validation and the requirements builder with scripted interpretations (the doubles do not understand language, so these prove the pipeline, not interpretation quality) | | Pass-1 latency and interpretation quality with the real Spark model on the reference machine |
 
 Known limits not yet addressed: no exchange-holiday calendar (a session around an NYSE holiday
 is labelled one day late); splits, mergers and spin-offs are not retrieved (only EDGAR former

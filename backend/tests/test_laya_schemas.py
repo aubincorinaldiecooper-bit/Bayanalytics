@@ -44,6 +44,7 @@ from bayanalytics.schemas.decisions import (
     ScoreAnswer,
     answer_confidence,
 )
+from bayanalytics.schemas.questions import REQUIREMENT_NAMES
 from doubles import RuleLaya
 
 _TOKEN = re.compile(r"\w+|[^\w\s]")
@@ -75,7 +76,8 @@ def head_tokens(question: LayaQuestion) -> int:
 @pytest.mark.parametrize(
     "builder",
     [
-        schemas.question_kind_questions,
+        lambda: schemas.requirement_validation_questions(REQUIREMENT_NAMES),
+        lambda: schemas.requirement_validation_questions(["valuation_history"]),
         schemas.research_plan_questions,
         schemas.evidence_scan_questions,
         schemas.history_segment_questions,
