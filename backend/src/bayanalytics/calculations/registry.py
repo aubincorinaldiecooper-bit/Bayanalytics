@@ -464,7 +464,7 @@ _spec(
         "/ var(benchmark daily returns)",
         required_inputs=("asset_closes", "benchmark_closes"),
         optional_inputs=(),
-        unit="ratio",
+        unit="coefficient",
         description="Beta to the broad-market benchmark over one year of daily simple returns "
         f"aligned on common sessions (at least {BETA_MIN_OBSERVATIONS} observations).",
         fn=_beta_from_closes,

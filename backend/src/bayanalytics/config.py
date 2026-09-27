@@ -17,7 +17,7 @@ from pydantic import BaseModel, Field
 
 Deployment = Literal["local", "cloud"]
 
-_SECRET_FIELDS = {"database_url", "api_key"}
+_SECRET_FIELDS = {"database_url", "api_key", "spark_api_key"}
 _PATH_FIELDS_ARE_MASKED = True
 _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 _DEFAULT_WORKER_DIR = Path(__file__).resolve().parent / "laya" / "worker"
@@ -68,6 +68,7 @@ class Settings(BaseModel):
     max_upload_bytes: int = 25 * 1024 * 1024
     health_cache_s: float = 2.0
     sse_keepalive_s: float = 15.0
+    graceful_shutdown_s: int = 10  # uvicorn waits this long for open connections on stop
 
     # --- persistence --------------------------------------------------------------------
     database_url: str | None = None
@@ -75,22 +76,20 @@ class Settings(BaseModel):
     database_pool_max: int = 4
 
     # --- research -----------------------------------------------------------------------
-    research_provider: Literal["http", "fixture"] = "http"
     research_search_url: str | None = None  # SearXNG base URL (carried over from GNSIS)
     research_contact_email: str | None = None  # required by SEC EDGAR fair-access policy
     research_user_agent: str = "BayAnalytics/0.1"
-    research_fixture_dir: Path | None = None
     research_cache_dir: Path | None = None
     research_max_rounds: int = 4
     research_max_sources: int = 24
     research_max_fetch_per_round: int = 6
+    research_timeout_s: float = 240.0
     research_fetch_timeout_s: float = 20.0
     research_min_request_interval_s: float = 0.25
     research_price_history_days: int = 5 * 366
     eval_as_of: datetime | None = None  # leakage guard: drop evidence published after this
 
     # --- laya ---------------------------------------------------------------------------
-    laya_mode: Literal["worker", "mock"] = "worker"
     laya_node_bin: str = "node"
     laya_worker_dir: Path = _DEFAULT_WORKER_DIR
     laya_model_dir: Path | None = None
@@ -101,8 +100,11 @@ class Settings(BaseModel):
     laya_max_restarts: int = 1
 
     # --- spark --------------------------------------------------------------------------
-    spark_mode: Literal["managed", "external", "mock"] = "managed"
+    spark_mode: Literal["managed", "external"] = "managed"
     spark_server_url: str = "http://127.0.0.1:8081"
+    # Managed mode: the key llama-server is started with (a random per-process key when unset)
+    # so no other local process can drive the model. External mode: the key that server uses.
+    spark_api_key: str | None = None
     spark_llama_server_bin: str = "llama-server"
     spark_model_path: Path | None = None
     spark_lockfile: Path | None = None
@@ -120,18 +122,16 @@ class Settings(BaseModel):
     spark_request_timeout_s: float = 900.0
 
     # --- whisper ------------------------------------------------------------------------
-    whisper_mode: Literal["cli", "mock", "disabled"] = "disabled"
+    whisper_mode: Literal["cli", "disabled"] = "disabled"
     whisper_bin: str = "whisper-cli"
     whisper_model_path: Path | None = None
     whisper_threads: int | None = None
     ffmpeg_bin: str = "ffmpeg"
     whisper_timeout_s: float = 120.0
 
-    # --- versions recorded on every job -------------------------------------------------
+    # --- schema versions recorded on every job (code constants, not runtime measurements) ---
     normalization_version: str = "2026.09-1"
     laya_schema_version: str = "finance-v1"
-    laya_package_version: str = "@receptron/laya@0.1.2"
-    spark_artifact: str = "XHToken/Spark-X2.5-1.7B-GGUF:Q4_K_M"
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> Settings:

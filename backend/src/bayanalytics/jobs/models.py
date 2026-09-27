@@ -36,7 +36,7 @@ class AnalysisJob(BaseModel):
     source_ids: list[str] = Field(default_factory=list)
     normalization_version: str = ""
     laya_schema_version: str = ""
-    spark_artifact: str = ""
+    spark_artifact: str | None = None
     spark_runtime: str | None = None
     status: AnalysisStatus = "queued"
     error: ErrorPayload | None = None

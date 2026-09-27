@@ -2,9 +2,16 @@
 
 One persistent ``node worker.mjs`` child speaks newline-delimited JSON over stdin/stdout. A single
 ``asyncio.Lock`` serialises every request so ordering stays unambiguous; responses are matched by
-id. If the worker dies, the in-flight request fails and the next call performs at most
-``laya_max_restarts`` controlled restarts (respawn + reload) before failing fast. Failures surface
-as ``AnalysisError(LAYA_INFERENCE_FAILED)`` whose details never contain state contents.
+id. If the worker dies or hangs past ``laya_request_timeout_s`` (a hung worker is killed), the
+in-flight request fails and the next call performs at most ``laya_max_restarts`` controlled
+restarts (respawn + reload) before failing fast. Failures surface as
+``AnalysisError(LAYA_INFERENCE_FAILED)`` whose ``details`` carry only a ``worker_code`` and a
+fixed ``reason`` keyword (plus small integers such as ``exit_code``): never state contents, never
+the worker's free-text message and never a file-system path. The raw message is logged
+server-side with paths reduced to their basenames.
+
+The child runs with an allow-listed environment (:mod:`bayanalytics.procenv`), so backend
+settings and secrets are not readable by the Node process or the model library.
 """
 
 from __future__ import annotations
@@ -12,9 +19,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
+import re
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +30,7 @@ import psutil
 from bayanalytics.config import Settings
 from bayanalytics.errors import AnalysisError
 from bayanalytics.laya.base import LAYA_HEAD_MAX_LEN, LAYA_MAX_LEN, LayaHealth, LayaLoadInfo
+from bayanalytics.procenv import child_env
 from bayanalytics.schemas.common import ErrorCode
 from bayanalytics.schemas.decisions import (
     ChoiceAnswer,
@@ -46,13 +54,43 @@ MAX_ERROR_MESSAGE_CHARS = 300
 STREAM_LIMIT = 8 * 1024 * 1024
 _MB = 1048576.0
 
+WORKER_CRASHED = "WORKER_CRASHED"
+"""Error code the worker sends for the in-flight request just before it exits on a crash."""
+
+_WORKER_REASONS: dict[str, str] = {
+    "LOAD_FAILED": "load_failed",
+    "LAYA_ERROR": "library_error",
+    "NOT_LOADED": "not_loaded",
+    "BAD_REQUEST": "bad_request",
+    "UNKNOWN_OP": "protocol_error",
+    "INTERNAL": "worker_internal",
+    WORKER_CRASHED: "worker_crashed",
+}
+"""Fixed ``reason`` keyword for each error code the worker itself can report."""
+
+_PATH_RE = re.compile(r"(?:file://)?(?:~|\.{1,2})?(?:/[^\s/'\"`,;:()\[\]<>|]+)+/?")
+
+
+def _scrub_paths(text: str) -> str:
+    """Reduce every absolute path (or ``file://`` URL) in ``text`` to its basename."""
+    return _PATH_RE.sub(lambda m: m.group(0).rstrip("/").rsplit("/", 1)[-1], text)
+
 
 def _worker_error(
-    code: str, message: str, *, retryable: bool | None = None, **details: Any
+    code: str, reason: str, message: str, *, retryable: bool | None = None, **details: Any
 ) -> AnalysisError:
-    """LAYA_INFERENCE_FAILED with a worker code and a truncated message (never state contents)."""
-    payload: dict[str, Any] = {"worker_code": code, "message": message[:MAX_ERROR_MESSAGE_CHARS]}
-    payload.update(details)
+    """LAYA_INFERENCE_FAILED whose details carry only ``worker_code``, ``reason`` and ``details``.
+
+    ``message`` (the worker's or the OS's free text, which may name files) is logged here at
+    WARNING with paths reduced to basenames; it never reaches the error the client sees.
+    """
+    log.warning(
+        "laya worker error %s (%s): %s",
+        code,
+        reason,
+        _scrub_paths(message)[:MAX_ERROR_MESSAGE_CHARS],
+    )
+    payload: dict[str, Any] = {"worker_code": code, "reason": reason, **details}
     return AnalysisError(ErrorCode.LAYA_INFERENCE_FAILED, retryable=retryable, details=payload)
 
 
@@ -139,7 +177,6 @@ class LayaWorkerClient:
         self._stderr_task: asyncio.Task[None] | None = None
         self._ps: psutil.Process | None = None
         self._seq = 0
-        self._abandoned: set[str] = set()
         self._dead = False
         self._ever_started = False
         self._loaded = False
@@ -218,13 +255,38 @@ class LayaWorkerClient:
                 result = parse_result(raw, expected_keys=payload_questions)
             except (ValueError, TypeError, KeyError) as exc:
                 raise _worker_error(
-                    "PROTOCOL_ERROR", f"unparseable answers: {type(exc).__name__}: {exc}"
+                    "PROTOCOL_ERROR",
+                    "protocol_error",
+                    f"unparseable answers: {type(exc).__name__}: {exc}",
                 ) from exc
             if result.latency_ms is None:
                 result.latency_ms = round(round_trip_ms, 1)
             self._stats["warm_inference_ms"] = result.latency_ms
             self._sample_rss()
             return result
+
+    async def count_tokens(self, texts: Sequence[str]) -> list[int]:
+        """Measured token counts from the worker (the bundle's own tokenizer)."""
+        items = [str(t) for t in texts]
+        if not items:
+            return []
+        async with self._lock:
+            await self._ensure_worker_locked()
+            if not self._loaded:
+                await self._load_locked()
+            raw = await self._request_locked(
+                "count_tokens", {"texts": items}, self._settings.laya_request_timeout_s
+            )
+        counts = raw.get("counts")
+        if (
+            not isinstance(counts, list)
+            or len(counts) != len(items)
+            or not all(isinstance(c, int) and not isinstance(c, bool) and c >= 0 for c in counts)
+        ):
+            raise _worker_error(
+                "PROTOCOL_ERROR", "protocol_error", "count_tokens returned no usable counts"
+            )
+        return [int(c) for c in counts]
 
     async def health(self) -> LayaHealth:
         """Never raises. ``ok`` means the worker process is alive and answering."""
@@ -281,7 +343,7 @@ class LayaWorkerClient:
             return
         self._proc = None
         self._loaded = False
-        if proc.returncode is None and not self._dead and not self._abandoned:
+        if proc.returncode is None and not self._dead:
             acquired = False
             try:
                 await asyncio.wait_for(self._lock.acquire(), CLOSE_TIMEOUT_S)
@@ -306,18 +368,20 @@ class LayaWorkerClient:
 
     async def _ensure_worker_locked(self) -> None:
         if self._closed:
-            raise _worker_error("CLOSED", "client is closed", retryable=False)
+            raise _worker_error("CLOSED", "closed", "client is closed", retryable=False)
         proc = self._proc
         if proc is not None and proc.returncode is None and not self._dead:
             return
         if proc is None and not self._ever_started:
             await self._spawn_locked()
             return
-        # The worker died: at most laya_max_restarts controlled restarts, never a loop.
+        # The worker died (or hung and was killed): at most laya_max_restarts controlled
+        # restarts, never a loop.
         max_restarts = self._settings.laya_max_restarts
         if self._restarts >= max_restarts:
             raise _worker_error(
                 "WORKER_EXITED",
+                "restarts_exhausted",
                 "worker exited and the restart budget is exhausted",
                 retryable=False,
                 restarts_exhausted=True,
@@ -325,7 +389,9 @@ class LayaWorkerClient:
             )
         self._restarts += 1
         self._stats["restarts"] = self._restarts
-        log.warning("laya worker died; controlled restart %s/%s", self._restarts, max_restarts)
+        log.warning(
+            "laya worker is not running; controlled restart %s/%s", self._restarts, max_restarts
+        )
         if proc is not None:
             await self._stop(proc)
             await self._cleanup_proc(proc)
@@ -339,9 +405,13 @@ class LayaWorkerClient:
         script = worker_dir / WORKER_SCRIPT
         if not script.is_file():
             raise _worker_error(
-                "SPAWN_FAILED", f"worker script not found: {script}", retryable=False
+                "SPAWN_FAILED",
+                "worker_missing",
+                f"worker script not found: {script}",
+                retryable=False,
             )
-        env = {**os.environ, **self._env_overrides}
+        # Allow-listed environment: the Node process never sees BAY_* settings or secrets.
+        env = child_env(self._env_overrides)
         try:
             proc = await asyncio.create_subprocess_exec(
                 settings.laya_node_bin,
@@ -354,13 +424,13 @@ class LayaWorkerClient:
                 limit=STREAM_LIMIT,
             )
         except (OSError, ValueError) as exc:
+            reason = "node_missing" if isinstance(exc, FileNotFoundError) else "spawn_failed"
             raise _worker_error(
-                "SPAWN_FAILED", f"{type(exc).__name__}: {exc}", retryable=False
+                "SPAWN_FAILED", reason, f"{type(exc).__name__}: {exc}", retryable=False
             ) from exc
         self._proc = proc
         self._dead = False
         self._loaded = False
-        self._abandoned = set()
         self._ever_started = True
         self._started_at = time.monotonic()
         try:
@@ -414,7 +484,7 @@ class LayaWorkerClient:
     ) -> dict[str, Any]:
         proc = self._proc
         if proc is None or proc.returncode is not None or self._dead:
-            raise _worker_error("WORKER_EXITED", f"worker is not running (op {op})")
+            raise _worker_error("WORKER_EXITED", "worker_exited", f"worker is not running ({op})")
         return await self._request_on(proc, op, params, timeout_s)
 
     async def _request_on(
@@ -424,7 +494,12 @@ class LayaWorkerClient:
         params: dict[str, Any],
         timeout_s: float,
     ) -> dict[str, Any]:
-        """Write one request line and read its response, skipping late replies to timed-out ids."""
+        """Write one request line and read its response.
+
+        A request that outlives ``timeout_s`` marks the worker dead and kills it: the worker
+        answers strictly in order, so a hung request would otherwise block every later one. The
+        timed-out request itself is never retried; the next call performs the controlled restart.
+        """
         assert proc.stdin is not None and proc.stdout is not None
         self._seq += 1
         rid = str(self._seq)
@@ -438,6 +513,7 @@ class LayaWorkerClient:
         except (TypeError, ValueError) as exc:
             raise _worker_error(
                 "BAD_STATE",
+                "bad_state",
                 f"request is not JSON-serialisable: {type(exc).__name__}",
                 retryable=False,
             ) from exc
@@ -447,47 +523,53 @@ class LayaWorkerClient:
         except (BrokenPipeError, ConnectionResetError, OSError) as exc:
             code = await self._mark_dead(proc)
             raise _worker_error(
-                "WORKER_EXITED", f"worker pipe broke during {op}", exit_code=code
+                "WORKER_EXITED", "worker_exited", f"worker pipe broke during {op}", exit_code=code
             ) from exc
-        deadline = time.monotonic() + timeout_s
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                self._abandoned.add(rid)
-                raise _worker_error("TIMEOUT", f"{op} exceeded {timeout_s:g}s")
-            try:
-                raw = await asyncio.wait_for(proc.stdout.readline(), remaining)
-            except TimeoutError:
-                self._abandoned.add(rid)
-                raise _worker_error("TIMEOUT", f"{op} exceeded {timeout_s:g}s") from None
-            if not raw:
-                code = await self._mark_dead(proc)
-                raise _worker_error("WORKER_EXITED", f"worker exited during {op}", exit_code=code)
-            try:
-                response = json.loads(raw)
-            except ValueError as exc:
-                await self._mark_dead(proc, kill=True)
-                raise _worker_error("PROTOCOL_ERROR", "non-JSON line on worker stdout") from exc
-            if not isinstance(response, Mapping):
-                await self._mark_dead(proc, kill=True)
-                raise _worker_error("PROTOCOL_ERROR", "worker response is not an object")
-            response_id = response.get("id")
-            response_id = str(response_id) if response_id is not None else None
-            if response_id != rid:
-                if response_id in self._abandoned:
-                    self._abandoned.discard(response_id)
-                    continue  # late answer to a request that already timed out
-                await self._mark_dead(proc, kill=True)
-                raise _worker_error("PROTOCOL_ERROR", "worker response id mismatch")
-            if response.get("ok"):
-                result = response.get("result")
-                return dict(result) if isinstance(result, Mapping) else {}
-            error = response.get("error") or {}
-            if not isinstance(error, Mapping):
-                error = {}
+        try:
+            raw = await asyncio.wait_for(proc.stdout.readline(), timeout_s)
+        except TimeoutError:
+            code = await self._mark_dead(proc, kill=True)
             raise _worker_error(
-                str(error.get("code") or "UNKNOWN"), str(error.get("message") or "worker error")
+                "TIMEOUT",
+                "timeout",
+                f"{op} exceeded {timeout_s:g}s; worker killed",
+                timeout_s=timeout_s,
+                exit_code=code,
+            ) from None
+        if not raw:
+            code = await self._mark_dead(proc)
+            raise _worker_error(
+                "WORKER_EXITED", "worker_exited", f"worker exited during {op}", exit_code=code
             )
+        try:
+            response = json.loads(raw)
+        except ValueError as exc:
+            await self._mark_dead(proc, kill=True)
+            raise _worker_error(
+                "PROTOCOL_ERROR", "protocol_error", "non-JSON line on worker stdout"
+            ) from exc
+        if not isinstance(response, Mapping):
+            await self._mark_dead(proc, kill=True)
+            raise _worker_error(
+                "PROTOCOL_ERROR", "protocol_error", "worker response is not an object"
+            )
+        response_id = response.get("id")
+        if (str(response_id) if response_id is not None else None) != rid:
+            await self._mark_dead(proc, kill=True)
+            raise _worker_error("PROTOCOL_ERROR", "protocol_error", "worker response id mismatch")
+        if response.get("ok"):
+            result = response.get("result")
+            return dict(result) if isinstance(result, Mapping) else {}
+        error = response.get("error") or {}
+        if not isinstance(error, Mapping):
+            error = {}
+        code_str = str(error.get("code") or "UNKNOWN")
+        message = str(error.get("message") or "worker error")
+        if code_str == WORKER_CRASHED:
+            # The worker answered the in-flight request and is exiting non-zero right now.
+            exit_code = await self._mark_dead(proc)
+            raise _worker_error(code_str, "worker_crashed", message, exit_code=exit_code)
+        raise _worker_error(code_str, _WORKER_REASONS.get(code_str, "worker_error"), message)
 
     async def _mark_dead(
         self, proc: asyncio.subprocess.Process, *, kill: bool = False

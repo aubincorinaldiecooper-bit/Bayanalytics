@@ -1,4 +1,9 @@
-"""Build the process runtime from settings (mock, fixture and real runtimes share one shape)."""
+"""Build the process runtime from settings.
+
+Every component is the real implementation (Node Laya worker, llama-server client, whisper.cpp
+CLI or disabled voice, HTTP research stack, in-memory or Postgres store). Tests inject their
+own doubles through the keyword arguments of ``build_runtime``; nothing here selects a mock.
+"""
 
 from __future__ import annotations
 
@@ -7,19 +12,22 @@ import logging
 from typing import Any
 
 from bayanalytics.config import Settings
+from bayanalytics.errors import AnalysisError
 from bayanalytics.instruments.equity import EquityAnalyzer
 from bayanalytics.instruments.identity import InstrumentResolver
 from bayanalytics.jobs.bus import AnalysisEventBus
 from bayanalytics.jobs.runner import AnalysisRunner
 from bayanalytics.laya.base import LayaClient
+from bayanalytics.laya.client import LayaWorkerClient
 from bayanalytics.laya.schemas import LAYA_SCHEMA_VERSION
 from bayanalytics.laya.wrapper import LayaFinanceWrapper
 from bayanalytics.normalization import NORMALIZATION_VERSION
 from bayanalytics.pipeline.orchestrator import run_analysis
-from bayanalytics.research.edgar import load_company_tickers_seed
 from bayanalytics.research.http_provider import build_research_stack
 from bayanalytics.runtime import Runtime
+from bayanalytics.schemas.common import ErrorCode
 from bayanalytics.spark.base import SparkClient
+from bayanalytics.spark.client import LlamaSparkClient
 from bayanalytics.spark.profiles import read_lockfile
 from bayanalytics.store import build_store
 from bayanalytics.whisper import build_transcriber
@@ -28,22 +36,10 @@ log = logging.getLogger(__name__)
 
 
 def build_laya(settings: Settings) -> LayaClient:
-    if settings.laya_mode == "mock":
-        from bayanalytics.laya.mock import MockLaya
-
-        return MockLaya()
-    from bayanalytics.laya.client import LayaWorkerClient
-
     return LayaWorkerClient(settings)
 
 
 def build_spark(settings: Settings) -> SparkClient:
-    if settings.spark_mode == "mock":
-        from bayanalytics.spark.mock import MockSpark
-
-        return MockSpark()
-    from bayanalytics.spark.client import LlamaSparkClient
-
     return LlamaSparkClient(settings)
 
 
@@ -65,25 +61,24 @@ def build_runtime(
     wrapper = LayaFinanceWrapper(laya, LAYA_SCHEMA_VERSION)
 
     async def resolver_factory() -> InstrumentResolver:
-        rows: list[dict] = []
+        """The live SEC ticker directory (disk-cached for a day). When it cannot be fetched the
+        analysis fails as a retryable research outage rather than guessing from a partial list."""
         try:
             rows = await edgar.company_tickers()
-        except Exception as exc:  # network unavailable: fall back to the bundled seed
-            log.warning("company ticker list unavailable (%s); using seed", type(exc).__name__)
-        if not rows:
-            rows = load_company_tickers_seed()
+        except Exception as exc:
+            log.warning("company ticker directory unavailable: %s", type(exc).__name__)
+            raise AnalysisError(
+                ErrorCode.RESEARCH_UNAVAILABLE,
+                "The public company directory is unavailable, so the company could not be "
+                "looked up. Try again shortly.",
+                details={"stage": "ticker_directory", "reason": "ticker_directory_unavailable"},
+            ) from exc
         return InstrumentResolver(rows)
 
     def analyzer_factory() -> EquityAnalyzer:
         return EquityAnalyzer(settings, research, wrapper, resolver_factory)
 
     spark_lock = read_lockfile(settings.spark_lockfile) if settings.spark_lockfile else None
-    versions = {
-        "normalization_version": NORMALIZATION_VERSION,
-        "laya_schema_version": LAYA_SCHEMA_VERSION,
-        "spark_artifact": settings.spark_artifact,
-        "spark_runtime": (spark_lock or {}).get("llama_cpp_version"),
-    }
     bus = AnalysisEventBus(store)
     runtime = Runtime(
         settings=settings,
@@ -100,6 +95,18 @@ def build_runtime(
             "spark_lock": spark_lock or {},
         },
     )
+
+    def versions() -> dict[str, Any]:
+        """Schema versions are code constants; runtime versions are whatever the probes at
+        startup measured (``Runtime.start``), never configured labels."""
+        spark_version = runtime.extras.get("spark_version") or {}
+        return {
+            "normalization_version": NORMALIZATION_VERSION,
+            "laya_schema_version": LAYA_SCHEMA_VERSION,
+            "spark_artifact": spark_version.get("spark_artifact"),
+            "spark_runtime": spark_version.get("spark_runtime"),
+        }
+
     runtime.runner = AnalysisRunner(
         store,
         bus,

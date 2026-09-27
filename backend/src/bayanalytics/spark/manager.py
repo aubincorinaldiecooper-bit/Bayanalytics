@@ -5,6 +5,10 @@ AGENT.md references: section 29 (load time measured separately from inference), 
 boundary, called over localhost HTTP), section 38 (the Spark lock owns Fast / Deep transitions;
 never restart while a request is in flight).
 
+Every request carries the server's API key (managed: generated per process unless
+``BAY_SPARK_API_KEY`` is set, passed through ``LLAMA_API_KEY`` in the child environment;
+external: ``BAY_SPARK_API_KEY`` when that server needs one).
+
 Modes (``settings.spark_mode``):
 
 - ``managed``: this class spawns ``llama-server`` with the profile's context size and KV cache
@@ -20,13 +24,16 @@ Modes (``settings.spark_mode``):
   ``/props`` for the loaded context size. The profile is whatever that server has.
 
 The process' stdout is discarded; stderr is inherited so llama-server's own startup log stays
-visible in the backend terminal. Nothing here logs prompt content.
+visible in the backend terminal. Nothing here logs prompt content. Every llama-server child
+(the server and the ``--version`` probe) runs with the allow-listed environment from
+:mod:`bayanalytics.procenv`, so it never sees backend settings or secrets.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import secrets
 import shutil
 import time
 from collections.abc import Awaitable, Callable, Iterator
@@ -42,6 +49,7 @@ from pydantic import BaseModel
 from bayanalytics.config import Settings
 from bayanalytics.context import AnalysisContext
 from bayanalytics.errors import AnalysisError
+from bayanalytics.procenv import child_env
 from bayanalytics.schemas.common import ErrorCode, Profile
 from bayanalytics.spark.base import ProfileSpec
 from bayanalytics.spark.profiles import (
@@ -74,7 +82,8 @@ class ProcessLike(Protocol):
     async def wait(self) -> int: ...
 
 
-SpawnFn = Callable[[list[str]], Awaitable[ProcessLike]]
+SpawnFn = Callable[[list[str], dict[str, str]], Awaitable[ProcessLike]]
+"""Spawn llama-server from ``argv`` with ``env`` added to the allow-listed child environment."""
 VersionProbe = Callable[[], Awaitable[str | None]]
 
 
@@ -86,12 +95,15 @@ class LoadOutcome(BaseModel):
     n_ctx: int | None = None
 
 
-async def default_spawn(argv: list[str]) -> ProcessLike:
+async def default_spawn(argv: list[str], env: dict[str, str]) -> ProcessLike:
+    """Spawn llama-server with an allow-listed environment (never the backend's own) plus
+    ``env`` (the API key travels here, not on the command line)."""
     return await asyncio.create_subprocess_exec(
         *argv,
         stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.DEVNULL,
         stderr=None,
+        env=child_env(env),
     )
 
 
@@ -115,6 +127,11 @@ class LlamaServerManager:
         self._poll_interval = health_poll_interval_s
         self._specs = profile_specs(settings)
 
+        # Managed servers always run behind a key: the configured one, else a per-process
+        # random key. External servers use the configured key when there is one.
+        self.api_key: str | None = settings.spark_api_key or (
+            None if settings.spark_mode == "external" else secrets.token_urlsafe(24)
+        )
         parts = urlsplit(settings.spark_server_url)
         self.host = parts.hostname or "127.0.0.1"
         self.port = parts.port or 8081
@@ -209,7 +226,7 @@ class LlamaServerManager:
         logger.debug("spark argv=%s", argv)
         started = time.perf_counter()
         try:
-            process = await self._spawn(argv)
+            process = await self._spawn(argv, self.child_env_extra())
         except FileNotFoundError as exc:
             raise AnalysisError(
                 ErrorCode.SPARK_START_FAILED,
@@ -279,6 +296,15 @@ class LlamaServerManager:
                 self.n_ctx = n_ctx
         return healthy
 
+    @property
+    def auth_headers(self) -> dict[str, str]:
+        """``Authorization`` for every llama-server request (empty without a key)."""
+        return {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+
+    def child_env_extra(self) -> dict[str, str]:
+        """Environment added for a managed llama-server: its API key (``LLAMA_API_KEY``)."""
+        return {"LLAMA_API_KEY": self.api_key} if self.api_key else {}
+
     def model_present(self) -> bool:
         model_path = self._settings.spark_model_path
         return model_path is not None and Path(model_path).is_file()
@@ -335,7 +361,9 @@ class LlamaServerManager:
     async def _health_ok(self) -> bool:
         try:
             response = await self._http.get(
-                f"{self.base_url}/health", timeout=HEALTH_REQUEST_TIMEOUT_S
+                f"{self.base_url}/health",
+                timeout=HEALTH_REQUEST_TIMEOUT_S,
+                headers=self.auth_headers,
             )
         except httpx.HTTPError:
             return False
@@ -344,7 +372,9 @@ class LlamaServerManager:
     async def _fetch_props(self) -> dict[str, Any] | None:
         try:
             response = await self._http.get(
-                f"{self.base_url}/props", timeout=HEALTH_REQUEST_TIMEOUT_S
+                f"{self.base_url}/props",
+                timeout=HEALTH_REQUEST_TIMEOUT_S,
+                headers=self.auth_headers,
             )
             if response.status_code != 200:
                 return None
@@ -423,6 +453,7 @@ class LlamaServerManager:
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                env=child_env(),
             )
             stdout, stderr = await asyncio.wait_for(process.communicate(), VERSION_TIMEOUT_S)
         except (OSError, TimeoutError):

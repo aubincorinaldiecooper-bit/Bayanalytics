@@ -59,7 +59,7 @@ class BodyLimitMiddleware:
         payload = ErrorEnvelope(
             error=ErrorPayload(code=ErrorCode.INVALID_REQUEST, message=message, retryable=False)
         )
-        body = json.dumps(payload.model_dump(mode="json")).encode()
+        body = json.dumps(payload.model_dump(mode="json"), separators=(",", ":")).encode()
         start: Message = {
             "type": "http.response.start",
             "status": status,

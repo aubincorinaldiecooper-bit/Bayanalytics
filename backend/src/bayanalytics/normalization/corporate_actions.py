@@ -124,6 +124,11 @@ def detect_identity_breaks(actions: Sequence[CorporateAction]) -> list[str]:
                 f"ticker change on {_when(action)}{detail}: price history under the previous "
                 "identifier must be linked explicitly; identifier history preserved"
             )
+        elif action.kind == "name_change":
+            warnings.append(
+                f"name change on {_when(action)}{detail}: older filings and coverage appear "
+                "under the former name; the reporting entity is unchanged"
+            )
         elif action.kind == "share_class_change":
             warnings.append(
                 f"share-class change on {_when(action)}{detail}: per-share figures before and "

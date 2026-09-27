@@ -8,6 +8,12 @@ can be detected without keeping full articles.
 
 Only the standard library is used: ``html.parser`` builds a tiny DOM, and a small readability
 heuristic scores block containers by paragraph text length and link density.
+
+Hostile input: element nesting is capped at ``MAX_DOM_DEPTH`` in the tree builder (a page
+nested deeper is rejected as ``extract_failed``; real pages stay far below the cap) and every
+tree walk is iterative, so no page can exhaust the interpreter stack. ``extract_page`` turns
+any other parser failure into ``ResearchProviderError("extract_failed")`` so one bad page is a
+rejected source, never a failed analysis.
 """
 
 from __future__ import annotations
@@ -16,6 +22,7 @@ import csv
 import hashlib
 import io
 import json
+import logging
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -24,13 +31,21 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from bayanalytics.research.dates import parse_datetime_lenient
-from bayanalytics.research.fetch import PAYWALL_HEADER
-from bayanalytics.research.provider import EvidenceRecord, PageResult
+from bayanalytics.research.fetch import PAYWALL_HEADER, REASON_EXTRACT_FAILED, TaggedProviderError
+from bayanalytics.research.provider import EvidenceRecord, PageResult, ResearchProviderError
+
+log = logging.getLogger(__name__)
 
 MAX_TEXT_CHARS = 12_000
 EXCERPT_CHARS = 600
 MAX_CSV_ROWS = 20_000
+MAX_DOM_DEPTH = 200
 HTML_METHOD = "html_readability_v1"
+
+
+class HtmlTooDeepError(ValueError):
+    """Raised by the tree builder when element nesting exceeds ``MAX_DOM_DEPTH``."""
+
 
 _DROP_TAGS = frozenset(
     {
@@ -186,6 +201,8 @@ class _TreeBuilder(HTMLParser):
             self._pop_to("p")
         elif tag == "li" and self.current.tag == "li":
             self._pop_to("li")
+        if len(self._stack) - 1 >= MAX_DOM_DEPTH:
+            raise HtmlTooDeepError(f"element nesting deeper than {MAX_DOM_DEPTH}")
         node = _Node(tag, attributes, self.current)
         node.dropped = tag in _DROP_TAGS or self.current.dropped
         self.current.children.append(node)
@@ -220,38 +237,52 @@ class _TreeBuilder(HTMLParser):
                 return
 
 
+def _child_nodes(node: _Node) -> list[_Node]:
+    """Element children in reverse document order, ready to push on a DFS stack."""
+    return [child for child in reversed(node.children) if not isinstance(child, str)]
+
+
 def _text_of(node: _Node, *, links: bool = False) -> tuple[int, int]:
     """Return (text_len, link_text_len) for the subtree, ignoring dropped nodes."""
-    if node.dropped:
-        return 0, 0
     text_len = 0
     link_len = 0
-    is_link = links or node.tag == "a"
-    for child in node.children:
-        if isinstance(child, str):
-            n = len(_WS_RE.sub(" ", child).strip())
-            text_len += n
-            if is_link:
-                link_len += n
-        else:
-            t, l_ = _text_of(child, links=is_link)
-            text_len += t
-            link_len += l_
+    stack: list[tuple[_Node, bool]] = [(node, links)]
+    while stack:
+        current, in_link = stack.pop()
+        if current.dropped:
+            continue
+        in_link = in_link or current.tag == "a"
+        for child in current.children:
+            if isinstance(child, str):
+                n = len(_WS_RE.sub(" ", child).strip())
+                text_len += n
+                if in_link:
+                    link_len += n
+            else:
+                stack.append((child, in_link))
     return text_len, link_len
 
 
 def _collect_text(node: _Node, out: list[str]) -> None:
+    """Append the subtree's text to ``out`` in document order, block tags as line breaks."""
     if node.dropped:
         return
-    for child in node.children:
-        if isinstance(child, str):
-            out.append(child)
-        else:
-            if child.tag in _BLOCK_TAGS:
+    stack: list[_Node | str] = list(reversed(node.children))
+    while stack:
+        item = stack.pop()
+        if isinstance(item, str):
+            out.append(item)
+            continue
+        block = item.tag in _BLOCK_TAGS
+        if block:
+            out.append("\n")
+        if item.dropped:
+            if block:
                 out.append("\n")
-            _collect_text(child, out)
-            if child.tag in _BLOCK_TAGS:
-                out.append("\n")
+            continue
+        if block:
+            stack.append("\n")  # emitted after the children
+        stack.extend(reversed(item.children))
 
 
 def _node_text(node: _Node) -> str:
@@ -270,23 +301,27 @@ def _paragraphs(node: _Node, out: list[str]) -> None:
     """Outermost paragraph-like blocks under ``node`` in document order."""
     if node.dropped:
         return
-    for child in node.children:
-        if isinstance(child, str):
+    stack = _child_nodes(node)
+    while stack:
+        child = stack.pop()
+        if child.dropped:
             continue
         if child.tag in _PARAGRAPH_TAGS:
             text = _WS_RE.sub(" ", _node_text(child)).strip()
             if text:
                 out.append(text)
         else:
-            _paragraphs(child, out)
+            stack.extend(_child_nodes(child))
 
 
 def _para_score(node: _Node) -> float:
     if node.dropped:
         return 0.0
     score = 0.0
-    for child in node.children:
-        if isinstance(child, str):
+    stack = _child_nodes(node)
+    while stack:
+        child = stack.pop()
+        if child.dropped:
             continue
         if child.tag in _PARAGRAPH_TAGS:
             text_len, link_len = _text_of(child)
@@ -294,18 +329,19 @@ def _para_score(node: _Node) -> float:
                 density = link_len / text_len if text_len else 1.0
                 score += text_len * (1.0 - density)
         else:
-            score += _para_score(child)
+            stack.extend(_child_nodes(child))
     return score
 
 
 def _candidates(node: _Node, out: list[_Node]) -> None:
-    if node.dropped:
-        return
-    if node.tag in _CANDIDATE_TAGS:
-        out.append(node)
-    for child in node.children:
-        if not isinstance(child, str):
-            _candidates(child, out)
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        if current.dropped:
+            continue
+        if current.tag in _CANDIDATE_TAGS:
+            out.append(current)
+        stack.extend(_child_nodes(current))
 
 
 def _best_container(root: _Node) -> _Node | None:
@@ -376,20 +412,17 @@ def registrable_domain(host: str) -> str:
 
 
 def _find_jsonld_dates(blob: Any) -> str | None:
-    if isinstance(blob, dict):
-        for key in ("datePublished", "dateCreated", "uploadDate"):
-            value = blob.get(key)
-            if isinstance(value, str) and value.strip():
-                return value
-        for value in blob.values():
-            found = _find_jsonld_dates(value)
-            if found:
-                return found
-    elif isinstance(blob, list):
-        for item in blob:
-            found = _find_jsonld_dates(item)
-            if found:
-                return found
+    stack: list[Any] = [blob]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, dict):
+            for key in ("datePublished", "dateCreated", "uploadDate"):
+                value = item.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value
+            stack.extend(reversed(list(item.values())))
+        elif isinstance(item, list):
+            stack.extend(reversed(item))
     return None
 
 
@@ -404,7 +437,7 @@ def _published_at(tree: _TreeBuilder) -> datetime | None:
     for blob in tree.jsonld:
         try:
             data = json.loads(blob)
-        except ValueError:
+        except (ValueError, RecursionError):  # the C decoder recurses on nested JSON
             continue
         candidate = _find_jsonld_dates(data)
         if candidate:
@@ -468,23 +501,19 @@ def extract_html(url: str, html: str, fetched_at: datetime) -> EvidenceRecord:
 
 
 def _first_heading(root: _Node) -> str:
-    found: list[str] = []
-
-    def walk(node: _Node) -> None:
-        if found or node.dropped:
-            return
-        for child in node.children:
-            if isinstance(child, str):
-                continue
-            if child.tag == "h1":
-                text = _WS_RE.sub(" ", _node_text(child)).strip()
-                if text:
-                    found.append(text)
-                    return
-            walk(child)
-
-    walk(root)
-    return found[0] if found else ""
+    if root.dropped:
+        return ""
+    stack = _child_nodes(root)
+    while stack:
+        child = stack.pop()
+        if child.dropped:
+            continue
+        if child.tag == "h1":
+            text = _WS_RE.sub(" ", _node_text(child)).strip()
+            if text:
+                return text
+        stack.extend(_child_nodes(child))
+    return ""
 
 
 def extract_json(url: str, body: str, fetched_at: datetime) -> EvidenceRecord:
@@ -583,6 +612,23 @@ def page_kind(page: PageResult) -> str:
 
 
 def extract_page(page: PageResult) -> EvidenceRecord:
+    """Extract ``page``; any parser failure becomes ``ResearchProviderError("extract_failed")``.
+
+    Retrieved content is untrusted, so a page that breaks the extractor (hostile nesting,
+    malformed markup, a parser bug) is reported with a fixed keyword and the detail is logged.
+    """
+    try:
+        return _extract_page(page)
+    except ResearchProviderError:
+        raise
+    except Exception as exc:
+        log.warning(
+            "extraction failed for %s (%s: %s)", page.final_url or page.url, type(exc).__name__, exc
+        )
+        raise TaggedProviderError(REASON_EXTRACT_FAILED) from exc
+
+
+def _extract_page(page: PageResult) -> EvidenceRecord:
     url = page.final_url or page.url
     if page.headers.get(PAYWALL_HEADER) == "true":
         record = EvidenceRecord(

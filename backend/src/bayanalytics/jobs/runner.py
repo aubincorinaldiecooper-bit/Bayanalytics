@@ -35,17 +35,20 @@ class AnalysisRunner:
         bus: AnalysisEventBus,
         pipeline: PipelineFn,
         *,
-        versions: dict[str, Any] | None = None,
+        versions: dict[str, Any] | Callable[[], dict[str, Any]] | None = None,
         max_active: int = 4,
     ) -> None:
         self._store = store
         self._bus = bus
         self._pipeline = pipeline
+        # A callable is read at submit time so measured runtime versions (probed at startup)
+        # land on the job record.
         self._versions = versions or {}
         self._max_active = max(1, int(max_active))
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._contexts: dict[str, AnalysisContext] = {}
         self._jobs: dict[str, AnalysisJob] = {}
+        self._pending = 0  # admissions reserved but not yet registered in _tasks
         self._accepting = True
 
     # -- lifecycle -----------------------------------------------------------------------
@@ -97,7 +100,7 @@ class AnalysisRunner:
 
     @property
     def active_count(self) -> int:
-        return len(self._tasks)
+        return len(self._tasks) + self._pending
 
     def active_ids(self) -> list[str]:
         return list(self._tasks)
@@ -113,11 +116,27 @@ class AnalysisRunner:
     ) -> AnalysisJob:
         if not self._accepting:
             raise AnalysisError(ErrorCode.INTERNAL_ERROR, "The backend is shutting down.")
-        if len(self._tasks) >= self._max_active:
+        if len(self._tasks) + self._pending >= self._max_active:
             raise AnalysisError(
                 ErrorCode.TOO_MANY_ANALYSES,
-                details={"active": len(self._tasks), "limit": self._max_active},
+                details={"active": len(self._tasks) + self._pending, "limit": self._max_active},
             )
+        # Reserve the slot before the first await: the store round trip below suspends, and
+        # every request arriving meanwhile would otherwise pass the check above.
+        self._pending += 1
+        try:
+            return await self._submit_reserved(request, resolved_horizon, budget, as_of)
+        finally:
+            self._pending -= 1
+
+    async def _submit_reserved(
+        self,
+        request: CreateAnalysisRequest,
+        resolved_horizon: str,
+        budget: Any,
+        as_of: Any | None,
+    ) -> AnalysisJob:
+        versions = self._versions() if callable(self._versions) else self._versions
         job = AnalysisJob(
             analysis_id=new_id("an"),
             query=request.query,
@@ -126,10 +145,10 @@ class AnalysisRunner:
             requested_horizon=request.horizon,
             resolved_horizon=resolved_horizon,  # type: ignore[arg-type]
             research_budget=budget if budget is not None else ResearchBudget(),
-            normalization_version=str(self._versions.get("normalization_version", "")),
-            laya_schema_version=str(self._versions.get("laya_schema_version", "")),
-            spark_artifact=str(self._versions.get("spark_artifact", "")),
-            spark_runtime=self._versions.get("spark_runtime"),
+            normalization_version=str(versions.get("normalization_version", "")),
+            laya_schema_version=str(versions.get("laya_schema_version", "")),
+            spark_artifact=versions.get("spark_artifact"),
+            spark_runtime=versions.get("spark_runtime"),
         )
         if as_of is not None:
             job.as_of = as_of

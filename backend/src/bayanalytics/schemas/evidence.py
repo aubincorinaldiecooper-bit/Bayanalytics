@@ -187,6 +187,7 @@ class CorporateAction(BaseModel):
         "split",
         "reverse_split",
         "ticker_change",
+        "name_change",
         "merger",
         "acquisition",
         "spin_off",

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
 from typing import Any
 
 from bayanalytics.instruments.base import SparkEvidenceBundle
@@ -29,6 +30,8 @@ from bayanalytics.spark.base import SparkMessage, SparkRunOptions
 EVIDENCE_OPEN = "<EVIDENCE>"
 EVIDENCE_CLOSE = "</EVIDENCE>"
 EXCERPT_MAX_CHARS = 600
+REQUEST_TEXT_MAX_CHARS = 300
+"""Cap for every free-text value of ``bundle.request`` (the analyst query can be 2,000 chars)."""
 HORIZON_HEADING_PREFIX = "Horizon: "
 STANCES: tuple[str, ...] = ("bullish", "neutral", "bearish", "mixed")
 
@@ -87,15 +90,33 @@ resolving the conflict yourself.
 9. Output only the requested markdown sections in the requested order, in plain prose and \
 bullets, with no preamble and no closing remarks."""
 
-_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+_ASCII_CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+_KEEP_CONTROL = frozenset("\n\t")
+_DROP_CATEGORIES = frozenset({"Cc", "Cf"})  # C0/C1 controls and format chars (ZWSP, ZWJ, BOM…)
 _WS_RE = re.compile(r"\s+")
 _MARKER_RE = re.compile(r"<\s*/?\s*EVIDENCE\s*>", re.IGNORECASE)
 
 
+def _strip_control(text: str) -> str:
+    """Drop control (Cc) and format (Cf) characters, keeping newline and tab.
+
+    Non-ASCII text is NFKC-normalised first so fullwidth or compatibility look-alikes of the
+    evidence markers (U+FF1C/U+FF1E angle brackets, U+FF21-U+FF3A fullwidth letters) fold to
+    the ASCII form the marker regex neutralises; zero-width joiners and similar Cf characters
+    that could be used to split ``EVIDENCE`` past that regex are removed rather than replaced.
+    """
+    if text.isascii():
+        return _ASCII_CONTROL_RE.sub("", text)
+    text = unicodedata.normalize("NFKC", text)
+    return "".join(
+        ch for ch in text if ch in _KEEP_CONTROL or unicodedata.category(ch) not in _DROP_CATEGORIES
+    )
+
+
 def clean_text(value: Any, limit: int | None = None) -> str:
-    """Strip control characters, collapse whitespace, neutralize evidence markers, truncate."""
+    """Strip control and format characters, collapse whitespace, neutralize markers, truncate."""
     text = "" if value is None else str(value)
-    text = _CONTROL_RE.sub("", text)
+    text = _strip_control(text)
     text = _WS_RE.sub(" ", text).strip()
     text = _MARKER_RE.sub("[marker removed]", text)
     if limit is not None and len(text) > limit:
@@ -103,21 +124,26 @@ def clean_text(value: Any, limit: int | None = None) -> str:
     return text
 
 
-def _sanitize(value: Any) -> Any:
+def _sanitize(value: Any, limit: int | None = None) -> Any:
     if isinstance(value, str):
-        return clean_text(value)
+        return clean_text(value, limit)
     if isinstance(value, dict):
-        return {str(k): _sanitize(v) for k, v in value.items()}
+        return {str(k): _sanitize(v, limit) for k, v in value.items()}
     if isinstance(value, list | tuple):
-        return [_sanitize(v) for v in value]
+        return [_sanitize(v, limit) for v in value]
     return value
 
 
-def _json(value: Any) -> str:
+def _json(value: Any, limit: int | None = None) -> str:
+    """Deterministic JSON of ``value`` with every string cleaned (and capped at ``limit``)."""
     if not value:
         return "{}"
     return json.dumps(
-        _sanitize(value), sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str
+        _sanitize(value, limit),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        default=str,
     )
 
 
@@ -166,7 +192,9 @@ def render_bundle(bundle: SparkEvidenceBundle) -> str:
         if inst.get(key):
             inst_line += f" | {key} {clean_text(inst[key])}"
     lines.append(inst_line)
-    lines.append(f"Request: {_json(bundle.request)}")
+    # The request is the one bundle section written by the user, so its free text is capped at
+    # the same length ``render_instructions`` uses; the full query is never embedded here.
+    lines.append(f"Request: {_json(bundle.request, limit=REQUEST_TEXT_MAX_CHARS)}")
     lines.append(f"Freshness: {_json(bundle.freshness)}")
     lines.append(f"Current metrics: {_json(bundle.current_metrics)}")
     lines.append(f"Historical metrics: {_json(bundle.historical_metrics)}")

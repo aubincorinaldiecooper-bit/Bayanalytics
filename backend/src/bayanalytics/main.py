@@ -39,7 +39,12 @@ def create_app(settings: Settings | None = None, runtime: Runtime | None = None)
         log.info(
             "starting BayAnalytics backend %s with settings %s", __version__, settings.redacted()
         )
-        await rt.start()
+        try:
+            await rt.start()
+        except Exception as exc:
+            # One clear line for the operator; uvicorn prints the traceback after it.
+            log.error("startup aborted: %s", exc)
+            raise
         try:
             yield
         finally:

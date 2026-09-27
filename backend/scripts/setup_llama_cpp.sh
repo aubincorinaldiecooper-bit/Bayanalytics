@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Build llama.cpp (CPU only) at a pinned tag and record the version in models/spark.lock.json.
-# Spark X2.5 architecture support requires b10828 or later (AGENT.md section 1.3).
+# Spark X2.5 architecture support requires b10828 or later (AGENT.md section 1.3); the backend
+# also needs the server's /apply-template and /tokenize endpoints, present at this tag.
 set -euo pipefail
 
 TAG="${LLAMA_CPP_TAG:-b10828}"
@@ -20,9 +21,9 @@ cmake -S "$DEST" -B "$DEST/build" \
   -DGGML_NATIVE=ON \
   -DGGML_METAL=OFF \
   -DGGML_CUDA=OFF \
-  -DLLAMA_CURL=OFF \
   -DLLAMA_BUILD_TESTS=OFF \
   -DLLAMA_BUILD_EXAMPLES=OFF \
+  -DLLAMA_BUILD_TOOLS=ON \
   -DLLAMA_BUILD_SERVER=ON
 cmake --build "$DEST/build" --config Release -j "$JOBS" --target llama-server
 

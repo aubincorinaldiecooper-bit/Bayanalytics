@@ -1,4 +1,4 @@
-"""Spark synthesis layer: llama-server client, mock, prompt, bundle fitting and parsing."""
+"""Spark synthesis layer: llama-server client, prompt, bundle fitting and parsing."""
 
 from typing import Any
 
@@ -9,19 +9,19 @@ from bayanalytics.spark.base import (
     SparkGeneration,
     SparkMessage,
     SparkRunOptions,
+    SparkSession,
     SparkStreamStats,
     TokenCallback,
 )
 from bayanalytics.spark.bundle import (
-    bundle_tokens,
-    estimate_tokens,
+    OVERFLOW_TRIM,
+    FitResult,
+    PromptCounter,
     fit_bundle,
     reserved_output_tokens,
-    system_tokens,
 )
 from bayanalytics.spark.client import LlamaSparkClient
 from bayanalytics.spark.manager import LlamaServerManager, LoadOutcome
-from bayanalytics.spark.mock import MockSpark
 from bayanalytics.spark.parse import (
     conflict_notes,
     extract_citations,
@@ -42,26 +42,27 @@ from bayanalytics.spark.profiles import (
 from bayanalytics.spark.prompt import SECTION_HEADINGS, SYSTEM_PROMPT, build_messages, render_bundle
 
 __all__ = [
+    "OVERFLOW_TRIM",
     "SECTION_HEADINGS",
     "SYSTEM_PROMPT",
+    "FitResult",
     "LlamaServerManager",
     "LlamaSparkClient",
     "LoadOutcome",
     "MemorySnapshot",
-    "MockSpark",
     "ProfileSpec",
+    "PromptCounter",
     "SparkClient",
     "SparkGeneration",
     "SparkMessage",
     "SparkRunOptions",
+    "SparkSession",
     "SparkStreamStats",
     "TokenCallback",
     "assert_can_allocate",
     "build_messages",
-    "bundle_tokens",
     "check_availability",
     "conflict_notes",
-    "estimate_tokens",
     "extract_citations",
     "fit_bundle",
     "make_spark_client",
@@ -73,14 +74,10 @@ __all__ = [
     "read_lockfile",
     "render_bundle",
     "reserved_output_tokens",
-    "system_tokens",
     "to_assessment",
     "version_fields",
 ]
 
 
 def make_spark_client(settings: Settings, **kwargs: Any) -> SparkClient:
-    """``MockSpark`` for ``spark_mode == "mock"``, otherwise ``LlamaSparkClient``."""
-    if settings.spark_mode == "mock":
-        return MockSpark(settings, **kwargs)
     return LlamaSparkClient(settings, **kwargs)

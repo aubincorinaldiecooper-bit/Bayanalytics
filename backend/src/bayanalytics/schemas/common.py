@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import secrets
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -117,6 +118,14 @@ def utcnow() -> datetime:
 
 def new_id(prefix: str) -> str:
     return f"{prefix}_{secrets.token_hex(8)}"
+
+
+def stable_id(prefix: str, *parts: object) -> str:
+    """Deterministic id from its identifying parts, so provenance ids repeat across runs
+    (a source is the same source when its canonical URL is the same; a decision is the same
+    decision when its state digest, stage and question are the same)."""
+    digest = hashlib.sha256("\x1f".join("" if p is None else str(p) for p in parts).encode())
+    return f"{prefix}_{digest.hexdigest()[:16]}"
 
 
 def source_rank(source_type: str) -> int:

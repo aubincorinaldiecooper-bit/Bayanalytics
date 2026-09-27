@@ -37,21 +37,14 @@ from bayanalytics.schemas.results import (
     VersionInfo,
 )
 from bayanalytics.spark.base import SparkMessage, SparkRunOptions
-from bayanalytics.spark.bundle import (
-    OVERFLOW_TRIM,
-    estimate_tokens,
-    fit_bundle,
-    reserved_output_tokens,
-)
+from bayanalytics.spark.bundle import OVERFLOW_TRIM, fit_bundle
 from bayanalytics.spark.parse import parse_sections, to_assessment
-from bayanalytics.spark.prompt import SYSTEM_PROMPT, build_messages
+from bayanalytics.spark.prompt import build_messages
 from bayanalytics.telemetry.tracker import PeakTracker
 
 log = logging.getLogger(__name__)
 
 AnalyzerFactory = Callable[[], EquityAnalyzer]
-
-_MIN_USABLE_EVIDENCE = 1
 
 
 class _Draft:
@@ -125,12 +118,14 @@ async def run_analysis(job: AnalysisJob, ctx: AnalysisContext, rt: Runtime) -> A
     ctx.timers.start("total")
     try:
         async with tracker:
+            execution = rt.extras.get("execution")
             await ctx.event(
                 "analysis.started",
                 query=job.query,
                 profile=job.profile,
                 resolved_horizon=job.resolved_horizon,
                 as_of=job.as_of.isoformat(),
+                execution=execution.model_dump() if execution is not None else None,
             )
             # 1. instrument -------------------------------------------------------------
             await _set_status(rt, job, "resolving_instrument")
@@ -170,7 +165,11 @@ async def run_analysis(job: AnalysisJob, ctx: AnalysisContext, rt: Runtime) -> A
                 segments=len(evidence.segments),
                 freshness=_freshness_view(evidence.freshness_summary),
             )
-            _evidence_gate(evidence, analyzer.compute_gaps(job.resolved_horizon, job.as_of))
+            _evidence_gate(
+                evidence,
+                analyzer.compute_gaps(job.resolved_horizon, job.as_of),
+                structured_failures=analyzer.state.structured_failures,
+            )
             # 4. Laya scoring -----------------------------------------------------------
             await _set_status(rt, job, "scoring")
             question_sets = analyzer.build_laya_questions(evidence, request)
@@ -209,34 +208,13 @@ async def run_analysis(job: AnalysisJob, ctx: AnalysisContext, rt: Runtime) -> A
             await rt.store.save_decisions(job.analysis_id, draft.decisions.decisions)
             # 6. Spark synthesis --------------------------------------------------------
             await _set_status(rt, job, "synthesizing")
-            spec = rt.spark.profile_spec(job.profile)
             options = SparkRunOptions(
                 max_tokens=rt.settings.spark_max_output_tokens,
                 temperature=rt.settings.spark_temperature,
             )
             bundle = analyzer.build_spark_bundle(evidence, draft.decisions, calculations, request)
-            fitted, trims = fit_bundle(
-                bundle,
-                spec.context_ceiling,
-                reserved_output_tokens(options),
-                estimate_tokens(SYSTEM_PROMPT),
-            )
-            draft.extra_uncertainties.extend(t for t in trims if t != OVERFLOW_TRIM)
-            if OVERFLOW_TRIM in trims:
-                raise AnalysisError(
-                    ErrorCode.SPARK_INFERENCE_FAILED,
-                    "The evidence bundle exceeds this profile's context ceiling even after "
-                    "trimming. Try the Deep profile.",
-                    retryable=True,
-                    details={
-                        "reason": "context_overflow",
-                        "profile": job.profile,
-                        "context_ceiling": spec.context_ceiling,
-                    },
-                )
-            messages: list[SparkMessage] = build_messages(fitted, options)
-            prompt_estimate = sum(estimate_tokens(m.content) for m in messages)
             started = False
+            prompt_tokens: int | None = None
 
             async def emit_started() -> None:
                 nonlocal started
@@ -247,7 +225,7 @@ async def run_analysis(job: AnalysisJob, ctx: AnalysisContext, rt: Runtime) -> A
                     "spark.started",
                     profile=job.profile,
                     context_ceiling=spec.context_ceiling,
-                    prompt_tokens_estimate=prompt_estimate,
+                    prompt_tokens=prompt_tokens,
                     horizons=horizons,
                 )
 
@@ -264,11 +242,38 @@ async def run_analysis(job: AnalysisJob, ctx: AnalysisContext, rt: Runtime) -> A
                     profile=job.profile,
                     active_analyses=rt.runner.active_count,
                 )
-            generation = await rt.spark.run(job.profile, messages, on_token, ctx, options)
+            async with rt.spark.session(job.profile, ctx) as session:
+                spec = session.spec
+                # The prompt is sized by the server's own tokenizer and chat template, so the
+                # overflow decision below is a measurement, not an estimate.
+                fit = await fit_bundle(
+                    bundle, spec.context_ceiling, options, session.count_prompt_tokens
+                )
+                prompt_tokens = fit.prompt_tokens
+                ctx.diagnostics["spark_prompt_tokens"] = fit.prompt_tokens
+                ctx.diagnostics["spark_fit_measurements"] = fit.measurements
+                draft.extra_uncertainties.extend(t for t in fit.trims if t != OVERFLOW_TRIM)
+                if fit.overflow:
+                    raise AnalysisError(
+                        ErrorCode.SPARK_INFERENCE_FAILED,
+                        "The evidence bundle exceeds this profile's context ceiling even after "
+                        "trimming. Try the Deep profile.",
+                        retryable=True,
+                        details={
+                            "reason": "context_overflow",
+                            "profile": job.profile,
+                            "context_ceiling": spec.context_ceiling,
+                            "prompt_tokens": fit.prompt_tokens,
+                            "budget": fit.budget,
+                        },
+                    )
+                messages: list[SparkMessage] = build_messages(fit.bundle, options)
+                generation = await session.generate(messages, on_token, options)
             await emit_started()  # an empty generation still marks the answer state
             stats = generation.stats
             await ctx.event(
                 "spark.completed",
+                prompt_tokens=stats.prompt_tokens,
                 output_tokens=stats.output_tokens,
                 time_to_first_token_ms=stats.time_to_first_token_ms,
                 total_ms=stats.total_ms,
@@ -372,7 +377,9 @@ def _pack_name(decisions: LayaDecisions) -> str:
     return str(chosen.decision) if chosen is not None else "all_standard"
 
 
-def _evidence_gate(evidence: NormalizedEvidence, gaps: list[str]) -> None:
+def _evidence_gate(
+    evidence: NormalizedEvidence, gaps: list[str], *, structured_failures: int = 0
+) -> None:
     """Refuse to synthesise without at least one normalized fact and one primary source
     (AGENT.md section 24): a price series or a lone news snippet is not an assessment."""
     primary = [s for s in evidence.sources if s.is_primary and not s.rejected_reason]
@@ -383,6 +390,17 @@ def _evidence_gate(evidence: NormalizedEvidence, gaps: list[str]) -> None:
         missing.append("a primary source (regulatory filing, issuer release or transcript)")
     if evidence.prices is None:
         missing.append("price history")
+    if (not evidence.facts or not primary) and structured_failures:
+        # The facts are missing because a structured public source failed, not because the
+        # company lacks them: that is a retryable outage, not a verdict on the evidence.
+        raise AnalysisError(
+            ErrorCode.RESEARCH_UNAVAILABLE,
+            details={
+                "reason": "structured_source_failed",
+                "missing": missing,
+                "structured_failures": structured_failures,
+            },
+        )
     if not evidence.facts or not primary:
         raise AnalysisError(
             ErrorCode.INSUFFICIENT_EVIDENCE,
@@ -434,7 +452,6 @@ def _telemetry(
     spark_stats: Any,
 ) -> Telemetry:
     elapsed = ctx.timers.elapsed_ms
-    settings = rt.settings
     spec = rt.spark.profile_spec(draft.job.profile)
     telemetry = Telemetry(
         profile=draft.job.profile,
@@ -450,11 +467,14 @@ def _telemetry(
         versions=VersionInfo(
             normalization_version=draft.job.normalization_version,
             laya_schema_version=draft.job.laya_schema_version,
-            laya_package_version=settings.laya_package_version,
-            spark_artifact=draft.job.spark_artifact,
-            spark_runtime=draft.job.spark_runtime,
+            laya_package_version=(rt.extras.get("laya_load") or {}).get("package_version"),
+            spark_artifact=(rt.extras.get("spark_version") or {}).get("spark_artifact")
+            or draft.job.spark_artifact,
+            spark_runtime=(rt.extras.get("spark_version") or {}).get("spark_runtime")
+            or draft.job.spark_runtime,
             spark_gguf_sha256=rt.extras.get("spark_lock", {}).get("gguf_sha256"),
             spark_hf_revision=rt.extras.get("spark_lock", {}).get("hf_revision"),
+            execution=rt.extras.get("execution") or VersionInfo().execution,
         ),
     )
     laya_load = rt.extras.get("laya_load") or {}

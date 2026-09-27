@@ -1,4 +1,4 @@
-"""Spark runtime boundary. Implementations: llama-server backed client and ``MockSpark``.
+"""Spark runtime boundary, implemented by the llama-server backed client.
 
 One Spark request at a time. The client owns the Fast/Deep profile transition under its own
 lock: acquire -> restart llama-server if the loaded profile differs -> generate -> release.
@@ -7,6 +7,7 @@ lock: acquire -> restart llama-server if the loaded profile differs -> generate 
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+from contextlib import AbstractAsyncContextManager
 from typing import Literal, Protocol
 
 from pydantic import BaseModel, Field
@@ -59,6 +60,27 @@ class SparkRunOptions(BaseModel):
     stop: list[str] = Field(default_factory=list)
 
 
+class SparkSession(Protocol):
+    """One exclusive turn with the loaded profile: measure prompts, then generate once.
+
+    Entered through ``SparkClient.session``; the profile is resident for the whole session, so
+    ``count_prompt_tokens`` measures with the same tokenizer and chat template ``generate`` will
+    use (llama-server ``/apply-template`` + ``/tokenize``).
+    """
+
+    @property
+    def spec(self) -> ProfileSpec: ...
+
+    async def count_prompt_tokens(self, messages: list[SparkMessage]) -> int: ...
+
+    async def generate(
+        self,
+        messages: list[SparkMessage],
+        on_token: TokenCallback,
+        options: SparkRunOptions | None = None,
+    ) -> SparkGeneration: ...
+
+
 class SparkClient(Protocol):
     async def start(self) -> None: ...
 
@@ -67,6 +89,10 @@ class SparkClient(Protocol):
     def availability(self, profile: Profile) -> ProfileCapability: ...
 
     def profile_spec(self, profile: Profile) -> ProfileSpec: ...
+
+    def session(
+        self, profile: Profile, ctx: AnalysisContext
+    ) -> AbstractAsyncContextManager[SparkSession]: ...
 
     async def run(
         self,

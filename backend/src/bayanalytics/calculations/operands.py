@@ -306,7 +306,7 @@ class OperandResolver:
     def prior_year_quarter(self, metric: str, quarter: Operand) -> Operand | None:
         """The same fiscal quarter one year earlier (fy - 1, same fp; else end ~365 days back)."""
         period = self.period_of(quarter)
-        facts = self.facts(metric, "fiscal_quarter")
+        facts = self._same_basis(self.facts(metric, "fiscal_quarter"), quarter)
         target: list[NormalizedFact] = []
         if period is not None and period.fiscal_year is not None and period.fiscal_period:
             target = [
@@ -329,7 +329,7 @@ class OperandResolver:
             return None
         facts = [
             f
-            for f in self.facts(metric, "fiscal_quarter")
+            for f in self._same_basis(self.facts(metric, "fiscal_quarter"), quarter)
             if f.period.end
             and period.end
             and f.period.end < period.end
@@ -337,6 +337,12 @@ class OperandResolver:
         ]
         chosen = self._choose(facts)
         return self._operand(chosen, facts) if chosen else None
+
+    @staticmethod
+    def _same_basis(facts: list[NormalizedFact], reference: Operand) -> list[NormalizedFact]:
+        """Only facts reported in the reference operand's unit and currency: a USD quarter is
+        never compared with a EUR one, nor a per-share figure with a total."""
+        return [f for f in facts if f.unit == reference.unit and f.currency == reference.currency]
 
     def ttm(self, metric: str) -> Operand | None:
         """Sum of the latest four consecutive fiscal quarters, or ``None``."""

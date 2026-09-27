@@ -18,7 +18,6 @@ from __future__ import annotations
 import json
 import re
 from datetime import UTC, date, datetime
-from importlib import resources
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -28,8 +27,8 @@ from bayanalytics.research.dates import ensure_utc, parse_date_lenient
 from bayanalytics.research.extract import EXCERPT_CHARS, excerpt_of, extract_page
 from bayanalytics.research.fetch import DEFAULT_TTL_S, EDGAR_TICKERS_TTL_S, PageFetcher
 from bayanalytics.research.provider import ResearchProviderError
-from bayanalytics.research.sources import classify_freshness
-from bayanalytics.schemas.common import new_id, utcnow
+from bayanalytics.research.sources import canonical_url, classify_freshness
+from bayanalytics.schemas.common import stable_id, utcnow
 from bayanalytics.schemas.evidence import SourceRecord
 
 COMPANY_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
@@ -71,19 +70,6 @@ UNIT_MAP: dict[str, str] = {
     "pure": "pure",
 }
 _ACCESSION_RE = re.compile(r"^\d{10}-\d{2}-\d{6}$")
-
-
-# --------------------------------------------------------------------------------------
-# seed
-# --------------------------------------------------------------------------------------
-
-
-def load_company_tickers_seed() -> list[dict[str, Any]]:
-    """The packaged EDGAR ticker seed (``research/data/company_tickers_seed.json``)."""
-    path = resources.files("bayanalytics.research.data").joinpath("company_tickers_seed.json")
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    companies = payload.get("companies") if isinstance(payload, dict) else None
-    return [dict(row) for row in companies or [] if isinstance(row, dict)]
 
 
 def parse_company_tickers(payload: Any) -> list[dict[str, Any]]:
@@ -417,22 +403,20 @@ class EdgarClient:
     def __init__(self, fetcher: PageFetcher, settings: Settings) -> None:
         self._fetcher = fetcher
         self._settings = settings
-        self.seed_fallback = False
 
     async def company_tickers(self) -> list[dict[str, Any]]:
-        """Live EDGAR ticker directory (24 h cache); falls back to the packaged seed."""
+        """Live EDGAR ticker directory (24 h disk cache). There is no packaged fallback: when
+        the directory cannot be fetched the caller reports ``RESEARCH_UNAVAILABLE``."""
+        page = await self._fetcher.open(
+            COMPANY_TICKERS_URL, ttl_s=EDGAR_TICKERS_TTL_S, accept="application/json"
+        )
         try:
-            page = await self._fetcher.open(
-                COMPANY_TICKERS_URL, ttl_s=EDGAR_TICKERS_TTL_S, accept="application/json"
-            )
             rows = parse_company_tickers(json.loads(page.body))
-            if not rows:
-                raise ResearchProviderError("company_tickers.json contained no companies")
-            self.seed_fallback = False
-            return rows
-        except (ResearchProviderError, ValueError):
-            self.seed_fallback = True
-            return load_company_tickers_seed()
+        except ValueError as exc:
+            raise ResearchProviderError("company_tickers.json is not valid JSON") from exc
+        if not rows:
+            raise ResearchProviderError("company_tickers.json contained no companies")
+        return rows
 
     async def submissions(self, cik: int | str) -> EdgarSubmissions:
         number = normalize_cik(cik)
@@ -472,7 +456,7 @@ class EdgarClient:
             raise ResearchProviderError(f"companyfacts for CIK {number} is not JSON") from exc
         if not isinstance(payload, dict):
             raise ResearchProviderError(f"companyfacts for CIK {number} has an unexpected shape")
-        source_id = new_id("src")
+        source_id = stable_id("src", canonical_url(url))
         rows, filtered, used = parse_company_facts(payload, source_id=source_id, as_of=as_of)
         latest_filed = max((r["filed"] for r in rows), default=None)
         published_at = (
@@ -530,7 +514,7 @@ class EdgarClient:
             tzinfo=UTC,
         )
         return SourceRecord(
-            source_id=new_id("src"),
+            source_id=stable_id("src", canonical_url(filing.index_url)),
             url=filing.index_url,
             title=f"{filing.form} filed {filing.filing_date.isoformat()}",
             publisher="SEC EDGAR",

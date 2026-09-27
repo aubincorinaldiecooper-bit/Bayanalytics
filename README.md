@@ -1,18 +1,28 @@
 # BayAnalytics
 
-CPU-only financial analysis backend for public equities. Ask about a listed company and get a
-fast, sourced, explainable, multi-horizon assessment built from public information:
+CPU-only financial analysis backend for public equities. It is designed to turn one question
+about a listed company into a sourced, explainable, multi-horizon assessment built from public
+information:
 
 ```
 public research → normalization + provenance → Laya (bounded decisions)
 → deterministic calculations → Spark X2.5 1.7B Q4_K_M (synthesis) → analyst
 ```
 
-No GPU is required. The reference machine is an 8 GB Intel Mac; the same backend runs on
-CPU-only cloud infrastructure with the same API contract.
+No GPU is required. The reference machine is an 8 GB Intel Mac. The same API contract is
+intended to run unchanged on CPU-only cloud infrastructure; no cloud deployment exists yet.
 
 This repository holds the **backend** (`backend/`). The Next.js + Beautiful UI frontend lives in
 a separate repository and is a thin client of this API.
+
+**Nothing in the product is a mock, a fixture or a placeholder.** Every component the backend
+starts is the real one (the `@receptron/laya` Node worker, `llama-server`, `whisper-cli`, SEC
+EDGAR, Stooq, a SearXNG instance, Postgres or the in-memory store), every number in
+`telemetry` is measured or `null`, and every token count that sizes a prompt or a Laya state is
+taken from the real tokenizer (llama-server `/apply-template` + `/tokenize`; the Laya bundle's
+tokenizer through the worker's `count_tokens` op). Test doubles and the synthetic Apple fixture
+exist only under `backend/tests/doubles` and `backend/tests/fixtures`; they are not importable
+from the product and no setting can select them.
 
 ## Repository layout
 
@@ -20,70 +30,86 @@ a separate repository and is a thin client of this API.
 backend/
   src/bayanalytics/
     api/            FastAPI routes: analyses, SSE events, cancel, transcriptions, health, capabilities
-    jobs/           asyncio job runner, per-analysis event bus, durable job model
+    jobs/           asyncio job runner (admission control), per-analysis event bus, durable job model
     pipeline/       orchestrator (the vertical slice), horizon resolution, result assembly
     instruments/    InstrumentAnalyzer boundary, identity resolution, EquityAnalyzer
-    research/       ResearchProvider boundary, SearXNG search, fetch/extract/dedup, SEC EDGAR, prices, intents
-    normalization/  units, fiscal periods, market sessions, facts + conflicts + freshness, corporate actions
-    laya/           Node worker (@receptron/laya@0.1.2, NDJSON), Python client, finance question schemas, mock
+    research/       ResearchProvider boundary, SearXNG search, fetch (SSRF gate)/extract/dedup, SEC EDGAR, prices, intents
+    normalization/  units, fiscal periods, market sessions, facts + conflicts + freshness, corporate actions (EDGAR name history)
+    laya/           Node worker (@receptron/laya@0.1.2, NDJSON), Python client, finance question schemas, measured compaction
     calculations/   deterministic finance math, reproducible calculation records, formatting
-    spark/          llama-server manager, Fast/Deep profiles, streaming client, prompt, bundle fitting, parser, mock
+    spark/          llama-server manager, Fast/Deep profiles, streaming client, prompt, measured bundle fitting, parser
     store/          AnalysisStore boundary, in-memory store, Postgres (asyncpg) store + schema
     telemetry/      RSS / system RAM / swap / CPU sampling, peak tracker
-    whisper/        whisper.cpp transcriber (optional voice input), mock
-  tests/            unit + integration tests (mock runtimes, fixture research; no network)
+    whisper/        whisper.cpp transcriber (optional voice input) or disabled
+    procenv.py      environment allow-list for every child process
+  tests/            unit + integration tests; doubles under tests/doubles, synthetic fixture under tests/fixtures
   scripts/          model setup, benchmark, vertical-slice runner
   models/           downloaded weights (git-ignored) + spark.lock.json
 docs/ARCHITECTURE.md
+THIRD_PARTY_NOTICES.md
 ```
 
-## Quick start (development, no models)
+## Development
 
 All commands below run from `backend/`; relative paths such as `models/…` and `bench/…` assume it.
 
 ```bash
 cd backend
 uv venv --python 3.12 .venv && uv pip install -p .venv/bin/python -e ".[dev]"
-.venv/bin/python -m pytest -q
-BAY_RESEARCH_PROVIDER=fixture BAY_RESEARCH_FIXTURE_DIR=tests/fixtures/research/apple \
-BAY_LAYA_MODE=mock BAY_SPARK_MODE=mock .venv/bin/python scripts/run_vertical_slice.py
+.venv/bin/python -m pytest -q          # test doubles + synthetic fixture; no network, no weights
+.venv/bin/ruff check src tests scripts
 ```
 
-The last command runs `Assess Apple.` through the whole pipeline with fixture research and mock
-Laya/Spark, printing every SSE event, the streamed answer and the telemetry block. Fixture data is
-synthetic and labelled as such; it never reaches a real analysis path.
+The tests exercise the real code paths (runner, event bus, orchestrator, API, the real
+`worker.mjs` protocol with a stub module, the real Spark client against a fake llama-server over
+`httpx.MockTransport`, the real HTTP fetcher's target policy) with doubles injected through
+`build_runtime(...)`. Running an analysis needs the real models: there is no "demo mode".
 
 ## Runbook: the 8 GB Intel Mac
 
-1. **Tooling**: Xcode command line tools, `cmake`, Python 3.12, Node 20+ (22 recommended), `uv`.
+1. **Tooling**: Xcode command line tools, `git`, `cmake`, Python 3.12, Node 20+ (22 recommended),
+   `uv`, `ffmpeg` (any browser recording that is not 16 kHz mono WAV goes through it), and a
+   reachable SearXNG instance for web search (without one, research is SEC EDGAR + Stooq only and
+   the backend says so at startup).
 2. **Backend**: `cd backend && uv venv --python 3.12 .venv && uv pip install -p .venv/bin/python -e ".[dev]"`.
-3. **Laya**: `scripts/install_laya_worker.sh` (installs the pinned `@receptron/laya@0.1.2`, downloads the
-   ~1.7 GB ONNX bundle into `~/.cache/receptron-laya`, prints load time and RSS).
-4. **llama.cpp**: `scripts/setup_llama_cpp.sh` (builds `llama-server` at tag `b10828`, the first
-   with Spark X2.5 support; records the commit in `models/spark.lock.json`).
-5. **Spark weights**: `pip install huggingface_hub && scripts/download_spark.py` (official
-   `XHToken/Spark-X2.5-1.7B-GGUF`, Q4_K_M only; records revision + sha256 in the lockfile).
-6. **Whisper (optional)**: `scripts/setup_whisper.sh`.
-7. **Configuration**: copy `backend/.env.example` to `backend/.env`, fill in the paths the scripts
-   printed, `BAY_RESEARCH_CONTACT_EMAIL` (SEC EDGAR requires it), `BAY_RESEARCH_SEARCH_URL` (a SearXNG
-   instance, the search backend carried over from GNSIS) and `DATABASE_URL`. The backend binds
-   `127.0.0.1` and needs no key there; any other host refuses to start unless `BAY_API_KEY` is set,
-   and clients then send `Authorization: Bearer <key>`. `BAY_MAX_ACTIVE_ANALYSES` (default 4) bounds
-   concurrent analyses; further requests get `429 TOO_MANY_ANALYSES`.
+   The venv has no `pip`; use `uv pip install -p .venv/bin/python …` for extras.
+3. **Laya**: `scripts/install_laya_worker.sh` installs the pinned `@receptron/laya@0.1.2` (and its
+   tokenizer package), downloads the ~1.7 GB ONNX bundle into `$LAYA_CACHE`
+   (default `~/.cache/receptron-laya`, or `BAY_LAYA_CACHE_DIR` when set) and prints load time,
+   RSS and the bundle directory. Put that directory in `BAY_LAYA_MODEL_DIR` (or the cache in
+   `BAY_LAYA_CACHE_DIR`) so the backend and the script use one copy.
+4. **llama.cpp**: `scripts/setup_llama_cpp.sh` builds `llama-server` at tag `b10828` (the minimum
+   version the spec requires for Spark X2.5; its `/apply-template` and `/tokenize` endpoints are
+   what the backend measures prompts with) and records the commit in `models/spark.lock.json`.
+5. **Spark weights**: `uv pip install -p .venv/bin/python huggingface_hub &&
+   .venv/bin/python scripts/download_spark.py` (official `XHToken/Spark-X2.5-1.7B-GGUF`, Q4_K_M
+   only; records revision + sha256 in the lockfile, which is where `telemetry.versions.spark_artifact`
+   comes from).
+6. **Whisper (optional)**: `scripts/setup_whisper.sh` (whisper.cpp at tag `v1.9.4`, Whisper Tiny).
+7. **Configuration**: copy `backend/.env.example` to `backend/.env`, replace every placeholder
+   (a literal `<…>` breaks `source`), fill in the paths the scripts printed,
+   `BAY_RESEARCH_CONTACT_EMAIL` (SEC EDGAR requires it), `BAY_RESEARCH_SEARCH_URL` and
+   `DATABASE_URL`. The backend binds `127.0.0.1` and needs no key there; any other host refuses to
+   start unless `BAY_API_KEY` is set, and clients then send `Authorization: Bearer <key>` or
+   `X-API-Key`. `BAY_MAX_ACTIVE_ANALYSES` (default 4) bounds concurrent analyses; further requests
+   get `429 TOO_MANY_ANALYSES`.
 8. **Database**: `set -a; source .env; set +a; .venv/bin/bayanalytics migrate`.
 9. **Measure before trusting**: `.venv/bin/python scripts/benchmark_local.py --profiles fast deep`
-   records load times, TTFT, tokens/s, resident RAM, system peak RAM and swap per profile. Choose
-   `BAY_SPARK_*_KV` and the `*_MIN_AVAILABLE_MB` thresholds from these numbers, not from estimates.
-10. **Run**: `.venv/bin/bayanalytics serve` (binds 127.0.0.1:8000), then
-    `.venv/bin/python scripts/run_vertical_slice.py --profile fast`.
+   (with `.env` exported) records Laya load time and warm latency, and per Spark profile the load
+   time, TTFT, tokens/s, llama-server RSS and the prompt size measured before the run next to the
+   server's own `usage.prompt_tokens` (they must agree), plus system peak RAM and swap for the whole
+   run. Choose `BAY_SPARK_*_KV` and the `*_MIN_AVAILABLE_MB` thresholds from these numbers.
+10. **Run**: either `.venv/bin/bayanalytics serve` (binds 127.0.0.1:8000) and drive it over HTTP,
+    or `.venv/bin/python scripts/run_vertical_slice.py --profile fast` on its own (it starts its own
+    Laya worker and llama-server). Do not run both at once on the 8 GB machine.
 
 ## Persistence (Railway Postgres)
 
-A Railway project `bayanalytics` with a `Postgres` service (postgres-ssl image, 5 GB volume,
-us-west2) was provisioned for this backend. Its public TCP endpoint is
-`altaria.proxy.rlwy.net:14222`. The service's own `DATABASE_URL` variable is the private-network
-form and only works inside Railway; from the Mac build the URL yourself from the dashboard
-values (service `Postgres` → Variables → `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`):
+A Railway project `bayanalytics` with a `Postgres` service was provisioned for this backend;
+its public TCP endpoint is `altaria.proxy.rlwy.net:14222`. The service's own `DATABASE_URL`
+variable is the private-network form and only works inside Railway; from the Mac build the URL
+from the dashboard values (service `Postgres` → Variables → `POSTGRES_USER`, `POSTGRES_PASSWORD`,
+`POSTGRES_DB`):
 
 ```
 DATABASE_URL=postgresql://postgres:<POSTGRES_PASSWORD>@altaria.proxy.rlwy.net:14222/railway?sslmode=require
@@ -92,7 +118,9 @@ DATABASE_URL=postgresql://postgres:<POSTGRES_PASSWORD>@altaria.proxy.rlwy.net:14
 `BAY_DATABASE_URL` is honoured as well. The image uses a self-signed certificate, so
 `sslmode=require` encrypts without verifying the CA (`verify-full` needs the CA via
 `?sslrootcert=`). Without a database URL the backend uses an in-memory store (development only;
-finished analyses are evicted after 200). The Postgres tests run when
+finished analyses are evicted after 200). The Postgres store, migrations and the INTERRUPTED
+recovery path have been exercised against a local PostgreSQL 16 (see below); the Railway
+instance itself has not been connected to yet. The Postgres tests run when
 `BAY_TEST_DATABASE_URL` points at a disposable database.
 
 ## API contract (`/api/v1`)
@@ -101,11 +129,11 @@ finished analyses are evicted after 200). The Postgres tests run when
 | --- | --- | --- |
 | POST | `/analyses` | create an analysis `{query, instrument?, profile: fast\|deep, horizon}` → `202 {analysis_id, status, profile, resolved_horizon}` |
 | GET | `/analyses/{id}/events` | SSE stream of recorded system state (`Last-Event-ID` replay supported) |
-| GET | `/analyses/{id}` | the structured result (or the job snapshot while running) |
+| GET | `/analyses/{id}` | the structured result (or the persisted artifacts so far while running or after an interruption) |
 | POST | `/analyses/{id}/cancel` | best-effort cancellation |
 | POST | `/transcriptions` | multipart `audio` → `{text, duration_ms, transcription_ms}` (never starts an analysis) |
-| GET | `/health` | process and component health |
-| GET | `/capabilities` | Fast/Deep availability with reasons, voice, deployment |
+| GET | `/health` | process and component health (`down` if any component is down, `degraded` if any is degraded) |
+| GET | `/capabilities` | Fast/Deep availability with reasons, voice, deployment, `execution` (Spark mode, voice mode, search configured) |
 
 Errors always use `{"error": {"code", "message", "retryable", "details?"}}` with the locked codes
 (`AMBIGUOUS_INSTRUMENT`, `INSUFFICIENT_EVIDENCE`, `STALE_EVIDENCE`, `RESEARCH_UNAVAILABLE`,
@@ -121,15 +149,19 @@ Notes for the client (from a real-HTTP simulation of the frontend reducer):
   `details.candidates`); no analysis is created, so the "Which company did you mean?" picker
   runs before any stream is opened. If a live ticker refresh changes the answer, the same code
   can still arrive as `analysis.failed`.
+- `RESEARCH_UNAVAILABLE` (retryable) covers every public-source outage: the SEC ticker directory
+  (`details.reason = ticker_directory_unavailable`), EDGAR submissions or facts
+  (`structured_source_failed`), or the first structured call of a run. A dead SearXNG does not
+  fail the run; it lowers `telemetry.research.queries_failed` and adds an uncertainty.
 - A user cancel ends with `analysis.failed` whose `status` is `cancelled` and `error.code` is
   `CANCELLED`; branch on `status`, and treat the terminal event as authoritative (the cancel
-  response echoes the pre-cancel stage).
+  response echoes the pre-cancel stage). A backend stop or crash is `INTERRUPTED`, never `CANCELLED`.
 - `laya.started` / `laya.decision` / `laya.completed` carry a `stage`: `research_plan` happens
   inside the research phase, `evidence_scan`, `history_scan` and `text_evidence` are the scoring
   phase, and `horizon` runs after the calculations. Map by stage, not by first occurrence.
 - `spark.queued` (with `active_analyses`) is emitted when the analysis is waiting for the single
   Spark lane; `spark.loading` appears only when a model load actually happens; `spark.started`
-  arrives with the first token.
+  arrives with the first token and carries the measured `prompt_tokens`.
 - A result with `partial: true` and `status: completed` means the synthesis was cut off or a
   horizon section is missing (`horizon_assessments[*].synthesized`).
 - `POST /transcriptions` takes the audio as multipart field `audio`.
@@ -138,18 +170,39 @@ Notes for the client (from a real-HTTP simulation of the frontend reducer):
 - `429 TOO_MANY_ANALYSES` carries `Retry-After: 5`.
 
 See `docs/ARCHITECTURE.md` for the event sequence, retrieval-loop termination rules, the
-evidence-only boundary and the profile/memory policy.
+evidence-only boundary, the measured token accounting and the profile/memory policy.
 
 ## What is verified where
 
-| Verified in CI / this repository | Must be verified on the reference machine |
-| --- | --- |
-| API contract, SSE replay, cancellation, INTERRUPTED marking | Laya ONNX load time and resident RAM |
-| Laya worker protocol (real Node worker, stub model) and one controlled restart | Real `systemOne` latency and calibration on finance states |
-| Spark streaming client, profile switch command lines, memory-pressure errors (fake server) | llama-server build, GGUF sha256, TTFT, tokens/s, KV precision per profile |
-| Deterministic calculations (reproducibility, units, formatting) | Live SEC EDGAR / price / SearXNG retrieval quality |
-| Normalization: periods, sessions, restatements, conflicts, freshness, leakage guard | Postgres schema against the Railway instance (`bayanalytics migrate`) |
-| End-to-end vertical slice with fixture research + mock models | End-to-end "Assess Apple." with real research and models, with telemetry |
+Everything in the left column runs in CI on every push (`.github/workflows/ci.yml`, Python 3.12
+and Node 22) with test doubles injected through `build_runtime`, a fake llama-server over
+`httpx.MockTransport`, the real `worker.mjs` with a stub Laya module and the synthetic Apple
+fixture. The middle column was executed in the development container against a local
+PostgreSQL 16 and a real uvicorn process. Nothing in the right column has been executed anywhere
+yet: the container this backend was written in had no access to Hugging Face, sec.gov, Stooq, a
+SearXNG instance, the Railway database or the reference machine.
 
-The container this backend was written in has no access to HuggingFace, sec.gov or public search
-engines, so none of the right-hand column has been executed yet. The scripts above are the path.
+| Verified in CI (doubles, fakes, fixture) | Verified in the container (real process, real Postgres 16) | Not yet executed anywhere |
+| --- | --- | --- |
+| API contract, SSE replay (`Last-Event-ID`), cancellation, INTERRUPTED marking, API-key gate, body limits, admission control (including the store-await race) | `bayanalytics migrate` twice, schema-version refusal, every table populated by real analyses, INTERRUPTED recovery after SIGKILL, JSONB/typed column agreement, no DSN or path leaks | Loading the real `@receptron/laya` ONNX bundle: load time, resident RAM, `systemOne` latency, calibration on finance states |
+| Laya worker NDJSON protocol (`load`, `system_one`, `count_tokens`, `health`, `close`) with the real `worker.mjs` and a stub model, one controlled restart per process lifetime | Real uvicorn: health, capabilities, 202/SSE/GET, cancel, reconnect edge cases, 413/411/401 envelopes, SIGTERM and SIGKILL behaviour, process hygiene | Building llama-server b10828, GGUF download and sha256, a real generation, TTFT, tokens/s, KV precision, whether 128K allocates on 8 GB |
+| Spark streaming client, Fast/Deep restart command lines, `/apply-template` + `/tokenize` prompt measurement, memory-pressure and Deep-unavailable errors, cancel-while-silent (fake llama-server) | The real worker answering `load`/`health`/`system_one`/`close` with a bogus model directory (fails fast, no orphan) | A real `whisper-cli` run (tests use a fake shell script) |
+| Deterministic calculations (reproducibility, units, formatting), derived Q4 (direct unit tests) | | End-to-end "Assess Apple." with live SEC EDGAR, Stooq and SearXNG retrieval and real models, with telemetry |
+| Normalization: periods, sessions (no exchange-holiday calendar), restatements, conflicts, freshness, leakage guard, corporate actions from EDGAR name history | | The Railway Postgres instance (`bayanalytics migrate` against it) |
+| Fetcher target policy (loopback, link-local, private and every redirect hop refused), DOM depth cap, keyword-only rejection reasons, cache policy | | |
+| End-to-end "Assess Apple." with the synthetic fixture, `RuleLaya` and `ScriptedSpark` doubles | | |
+
+Known limits not yet addressed: no exchange-holiday calendar (a session around an NYSE holiday
+is labelled one day late); splits, mergers and spin-offs are not retrieved (only EDGAR former
+names feed the corporate-action checks); Stooq prices are assumed split-adjusted; conflict
+handling preserves and surfaces disagreements but does not search for a primary source to
+resolve them; z-scores, correlations and scenario tables exist as primitives without a
+calculation pack; the evaluation harness is limited to the global `BAY_EVAL_AS_OF` guard; free
+prose from Spark is checked for citations but its numbers are not cross-checked against the
+bundle.
+
+## Licensing
+
+`pyproject.toml` marks the backend proprietary. The SearXNG discovery pattern in
+`research/searxng.py` is adapted from GNSIS under MIT; the licence text and the licences of the
+runtimes and models the backend uses are listed in `THIRD_PARTY_NOTICES.md`.

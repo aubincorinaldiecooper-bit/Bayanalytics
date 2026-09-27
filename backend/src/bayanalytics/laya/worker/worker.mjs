@@ -3,9 +3,10 @@
  * BayAnalytics Laya worker (AGENT.md section 36, "Laya worker boundary").
  *
  * A very small persistent process that keeps one `@receptron/laya` instance resident and exposes
- * exactly four operations to the Python backend over newline-delimited JSON:
+ * exactly five operations to the Python backend over newline-delimited JSON:
  *
- *   stdin  : {"id": string, "op": "load" | "system_one" | "health" | "close", "params": object}
+ *   stdin  : {"id": string, "op": "load" | "system_one" | "count_tokens" | "health" | "close",
+ *             "params": object}
  *   stdout : {"id": string, "ok": true, "result": object}
  *          | {"id": string | null, "ok": false, "error": {"code": string, "message": string}}
  *
@@ -13,7 +14,11 @@
  *   - stdout carries protocol lines only; every log line goes to stderr;
  *   - exactly one response per request, in arrival order (requests are processed sequentially);
  *   - no finance logic, no retrieval, no Spark, no orchestration lives here;
- *   - the process only exits on `close`, when stdin ends (parent gone) or on a real crash.
+ *   - the process exits on `close` or when stdin ends (parent gone); an uncaught exception or an
+ *     unhandled rejection answers the in-flight request (when there is one) and then exits with a
+ *     non-zero code so the parent performs its budgeted restart instead of waiting on a zombie;
+ *   - error messages and log lines name files by basename only, and the Python side never
+ *     forwards them to clients anyway (it maps the `code` to a fixed reason keyword).
  *
  * The Laya implementation module is `@receptron/laya` unless the LAYA_MODULE environment variable
  * names another module (tests inject `stub_laya.mjs` this way).
@@ -32,11 +37,15 @@ const MODULE = process.env.LAYA_MODULE || DEFAULT_MODULE;
 const MAX_LEN = 512;
 const HEAD_MAX_LEN = 192;
 const MAX_ERROR_CHARS = 2000;
+const CRASH_EXIT_CODE = 70;
+const CRASH_FLUSH_MS = 1000;
 
 const startedAt = Date.now();
 let laya = null;
 let loadInfo = null;
 let closing = false;
+let crashing = false;
+let inFlight = null; // id of the request being handled, answered on a crash
 
 // ---- plumbing -----------------------------------------------------------------------------
 
@@ -74,6 +83,11 @@ function moduleSpecifier() {
   return MODULE;
 }
 
+function describeModule() {
+  // A package name as is; a file path only by its basename (no directory layout in messages).
+  return MODULE.startsWith(".") || path.isAbsolute(MODULE) ? path.basename(MODULE) : MODULE;
+}
+
 async function packageVersion() {
   // `@receptron/laya` restricts its exports, so read the file directly instead of resolving it.
   try {
@@ -95,18 +109,18 @@ async function opLoad(params = {}) {
   try {
     mod = await import(moduleSpecifier());
   } catch (err) {
-    throw new WorkerError("LOAD_FAILED", `cannot import ${MODULE}: ${err?.message ?? err}`);
+    throw new WorkerError("LOAD_FAILED", `cannot import ${describeModule()}: ${err?.message ?? err}`);
   }
   const Laya = mod.Laya ?? mod.default?.Laya;
   if (!Laya || typeof Laya.load !== "function") {
-    throw new WorkerError("LOAD_FAILED", `${MODULE} does not export a Laya class with a static load()`);
+    throw new WorkerError("LOAD_FAILED", `${describeModule()} does not export a Laya class with a static load()`);
   }
   const opts = { executionProviders: ["cpu"] };
   if (params.modelDir) opts.modelDir = String(params.modelDir);
   if (params.cacheDir) opts.cacheDir = String(params.cacheDir);
   if (params.revision) opts.revision = String(params.revision);
   if (params.threads) opts.sessionOptions = { intraOpNumThreads: Number(params.threads) };
-  log(`loading ${MODULE}` + (opts.modelDir ? ` from ${opts.modelDir}` : " (cache / download)"));
+  log(`loading ${describeModule()}` + (opts.modelDir ? ` from ${path.basename(opts.modelDir)}` : " (cache / download)"));
   try {
     laya = await Laya.load(opts);
   } catch (err) {
@@ -116,7 +130,9 @@ async function opLoad(params = {}) {
   const load_ms = round1(performance.now() - t0);
   loadInfo = {
     load_ms,
-    package_version: await packageVersion(),
+    // The installed package's version only when that package is what was loaded; a module
+    // injected by path (tests) reports null rather than borrowing the package's number.
+    package_version: MODULE === DEFAULT_MODULE ? await packageVersion() : null,
     rss_mb: round1(rssMb()),
     max_len: laya.config?.max_len ?? MAX_LEN,
     head_max_len: laya.config?.head_max_len ?? HEAD_MAX_LEN,
@@ -147,6 +163,46 @@ async function opSystemOne(params) {
   };
 }
 
+async function opCountTokens(params) {
+  // Measured token counts with the loaded bundle's own tokenizer (the Python side sizes states
+  // and question heads with these numbers; it never estimates).
+  if (!laya) {
+    throw new WorkerError("NOT_LOADED", "count_tokens called before load");
+  }
+  const texts = params?.texts;
+  if (!Array.isArray(texts) || texts.some((t) => typeof t !== "string")) {
+    throw new WorkerError("BAD_REQUEST", "count_tokens needs params.texts: string[]");
+  }
+  const encode = await tokenEncoder();
+  return { counts: texts.map((t) => encode(t).length) };
+}
+
+let encoder = null;
+
+async function tokenEncoder() {
+  if (encoder) return encoder;
+  if (typeof laya.encode === "function") {
+    // The package's own encoder (add_special_tokens: false), exactly what systemOne uses.
+    encoder = (text) => laya.encode(text);
+    return encoder;
+  }
+  // Older/other implementations: build the same tokenizer from the bundle's public files.
+  const modelDir = laya.modelDir;
+  if (!modelDir) {
+    throw new WorkerError("NOT_SUPPORTED", "the Laya implementation exposes no tokenizer");
+  }
+  let Tokenizer;
+  try {
+    ({ Tokenizer } = await import("@huggingface/tokenizers"));
+  } catch (err) {
+    throw new WorkerError("NOT_SUPPORTED", `tokenizer package unavailable: ${err?.message ?? err}`);
+  }
+  const read = async (f) => JSON.parse(await readFile(path.join(modelDir, "tokenizer", f), "utf8"));
+  const tok = new Tokenizer(await read("tokenizer.json"), await read("tokenizer_config.json"));
+  encoder = (text) => tok.encode(text, { add_special_tokens: false }).ids;
+  return encoder;
+}
+
 function opHealth() {
   return {
     loaded: laya !== null,
@@ -165,6 +221,7 @@ async function shutdown(code) {
     log(`close error: ${err?.message ?? err}`);
   }
   laya = null;
+  encoder = null;
   process.exit(code);
 }
 
@@ -190,6 +247,7 @@ async function handle(line) {
     return;
   }
   const params = req.params && typeof req.params === "object" ? req.params : {};
+  inFlight = id;
   try {
     switch (req.op) {
       case "load":
@@ -197,6 +255,9 @@ async function handle(line) {
         break;
       case "system_one":
         ok(id, await opSystemOne(params));
+        break;
+      case "count_tokens":
+        ok(id, await opCountTokens(params));
         break;
       case "health":
         ok(id, opHealth());
@@ -215,7 +276,28 @@ async function handle(line) {
       log(`unexpected error in ${req.op}: ${err?.stack ?? err}`);
       fail(id, "INTERNAL", err?.message ?? String(err));
     }
+  } finally {
+    inFlight = null;
   }
+}
+
+function crash(kind, err) {
+  // A crashed worker must never linger half-alive. Answer the in-flight request when there is
+  // one (so the parent fails that call now rather than at its timeout), then exit non-zero.
+  log(`${kind}: ${err?.stack ?? err}`);
+  if (crashing) return;
+  crashing = true;
+  const exit = () => process.exit(CRASH_EXIT_CODE);
+  const fallback = setTimeout(exit, CRASH_FLUSH_MS);
+  if (inFlight === null) {
+    clearTimeout(fallback);
+    exit();
+    return;
+  }
+  send({ id: inFlight, ok: false, error: { code: "WORKER_CRASHED", message: kind } }, () => {
+    clearTimeout(fallback);
+    exit();
+  });
 }
 
 let chain = Promise.resolve();
@@ -235,11 +317,7 @@ process.stdout.on("error", (err) => {
   log(`stdout error (${err?.code ?? err}), exiting`);
   process.exit(0);
 });
-process.on("uncaughtException", (err) => {
-  log(`uncaught exception: ${err?.stack ?? err}`);
-});
-process.on("unhandledRejection", (err) => {
-  log(`unhandled rejection: ${err?.stack ?? err}`);
-});
+process.on("uncaughtException", (err) => crash("uncaught exception", err));
+process.on("unhandledRejection", (err) => crash("unhandled rejection", err));
 
-log(`ready (node ${process.version}, module ${MODULE})`);
+log(`ready (node ${process.version}, module ${describeModule()})`);

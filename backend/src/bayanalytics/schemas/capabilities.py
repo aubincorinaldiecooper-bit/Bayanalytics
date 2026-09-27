@@ -5,6 +5,7 @@ from __future__ import annotations
 from pydantic import BaseModel, Field
 
 from bayanalytics.schemas.common import ErrorCode
+from bayanalytics.schemas.results import ExecutionInfo
 
 
 class ProfileCapability(BaseModel):
@@ -19,6 +20,7 @@ class Capabilities(BaseModel):
     voice: bool
     deployment: str
     research: bool = True
+    execution: ExecutionInfo = Field(default_factory=ExecutionInfo)
 
 
 class ComponentHealth(BaseModel):
@@ -32,3 +34,4 @@ class Health(BaseModel):
     version: str
     components: list[ComponentHealth] = Field(default_factory=list)
     active_analyses: int = 0
+    execution: ExecutionInfo = Field(default_factory=ExecutionInfo)

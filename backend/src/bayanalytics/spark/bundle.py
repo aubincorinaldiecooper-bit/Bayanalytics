@@ -5,23 +5,26 @@ human-readable string the orchestrator surfaces as an uncertainty. Protected sec
 touched: ``calculated_metrics``, ``conflicts``, ``uncertainties``, ``laya_assessments``,
 ``current_metrics``, ``freshness``.
 
-Token counts here are *estimates* (about 3.5 characters per token for English prose and JSON
-with the Spark tokenizer family); they size the prompt against a ceiling with a safety margin.
-Measured counts come back from llama-server in ``SparkStreamStats``.
+Every token count is **measured**: ``fit_bundle`` renders the candidate prompt and asks the
+Spark session for the number of tokens the server will see (its own chat template and
+tokenizer), so "fits" here is exactly "fits in llama-server".
 """
 
 from __future__ import annotations
 
 import hashlib
-import math
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 from typing import Any
 
 from bayanalytics.instruments.base import SparkEvidenceBundle
 from bayanalytics.schemas.common import is_primary_source, source_rank
-from bayanalytics.spark.base import SparkRunOptions
-from bayanalytics.spark.prompt import SYSTEM_PROMPT, clean_text, render_bundle, render_instructions
+from bayanalytics.spark.base import SparkMessage, SparkRunOptions
+from bayanalytics.spark.prompt import build_messages, clean_text
 
-CHARS_PER_TOKEN = 3.5
+PromptCounter = Callable[[list[SparkMessage]], Awaitable[int]]
+"""Measured token count of a message list as the server will process it."""
+
 OUTPUT_MARGIN_TOKENS = 64
 MAX_ANALOGUES = 3
 MAX_EVENTS = 8
@@ -33,41 +36,37 @@ excerpts dropped in step 2; other non-primary excerpts survive until step 6."""
 OVERFLOW_TRIM = "evidence exceeds context ceiling even after trimming"
 
 
-def estimate_tokens(text: str) -> int:
-    """Rough token estimate (chars / 3.5). An estimate, never reported as a measurement."""
-    return math.ceil(len(text) / CHARS_PER_TOKEN)
-
-
-def bundle_tokens(bundle: SparkEvidenceBundle) -> int:
-    return estimate_tokens(render_bundle(bundle))
-
-
-def system_tokens() -> int:
-    return estimate_tokens(SYSTEM_PROMPT)
-
-
 def reserved_output_tokens(options: SparkRunOptions | None) -> int:
     opts = options or SparkRunOptions()
     return opts.max_tokens + OUTPUT_MARGIN_TOKENS
 
 
-def prompt_tokens_estimate(
-    bundle: SparkEvidenceBundle, options: SparkRunOptions | None = None
-) -> int:
-    """Estimated tokens of the user message (instructions + evidence)."""
-    return estimate_tokens(render_instructions(bundle, options)) + bundle_tokens(bundle)
+@dataclass
+class FitResult:
+    bundle: SparkEvidenceBundle
+    trims: list[str] = field(default_factory=list)
+    prompt_tokens: int = 0
+    """Measured size of the final prompt (system + user messages, templated)."""
+    budget: int = 0
+    measurements: int = 0
+    """How many prompt measurements the fit needed (each is one server round trip)."""
+
+    @property
+    def overflow(self) -> bool:
+        return OVERFLOW_TRIM in self.trims
 
 
-def fit_bundle(
+async def fit_bundle(
     bundle: SparkEvidenceBundle,
     context_ceiling: int,
-    reserved_output_tokens: int,
-    system_tokens: int,
-) -> tuple[SparkEvidenceBundle, list[str]]:
-    """Trim ``bundle`` until instructions + evidence fit the input budget.
+    options: SparkRunOptions | None,
+    count_prompt: PromptCounter,
+) -> FitResult:
+    """Trim ``bundle`` until the full prompt (system + instructions + evidence) fits.
 
-    Budget = ``context_ceiling - reserved_output_tokens - system_tokens``. Steps, in order,
-    each applied only while still over budget:
+    Budget = ``context_ceiling - reserved_output_tokens(options)``; every "does it fit" is a
+    measurement of the rendered prompt by ``count_prompt``. Steps, in order, each applied only
+    while still over budget:
 
     1. remove duplicate excerpts (same source id and text);
     2. drop excerpts from low-ranked non-primary sources, least authoritative first;
@@ -79,28 +78,35 @@ def fit_bundle(
     If the bundle still does not fit, the trims end with ``OVERFLOW_TRIM`` and the caller
     decides (record an uncertainty, suggest Deep, or refuse).
     """
-    budget = context_ceiling - reserved_output_tokens - system_tokens
+    budget = context_ceiling - reserved_output_tokens(options)
     trims: list[str] = []
     current = bundle.model_copy(deep=True)
+    result = FitResult(bundle=current, trims=trims, budget=budget)
 
-    def fits() -> bool:
-        return prompt_tokens_estimate(current) <= budget
+    async def fits() -> bool:
+        result.prompt_tokens = await count_prompt(build_messages(current, options))
+        result.measurements += 1
+        return result.prompt_tokens <= budget
 
-    if fits():
-        return current, trims
+    def done() -> FitResult:
+        result.bundle = current
+        return result
+
+    if await fits():
+        return done()
 
     # 1. duplicates
     excerpts, removed = _dedupe_excerpts(current.excerpts)
     if removed:
         current = current.model_copy(update={"excerpts": excerpts})
         trims.append(f"removed {removed} duplicate excerpt(s)")
-        if fits():
-            return current, trims
+        if await fits():
+            return done()
 
     # 2. low-ranked non-primary excerpts, least authoritative first
     meta = _source_meta(current)
     dropped = 0
-    while not fits():
+    while not await fits():
         index = _worst_excerpt_index(current.excerpts, meta, min_rank=LOW_RANK_THRESHOLD)
         if index is None:
             break
@@ -110,8 +116,8 @@ def fit_bundle(
         dropped += 1
     if dropped:
         trims.append(f"dropped {dropped} excerpt(s) from low-ranked non-primary sources")
-        if fits():
-            return current, trims
+        if await fits():
+            return done()
 
     # 3. analogues beyond 3
     if len(current.historical_analogues) > MAX_ANALOGUES:
@@ -120,8 +126,8 @@ def fit_bundle(
             update={"historical_analogues": list(current.historical_analogues[:MAX_ANALOGUES])}
         )
         trims.append(f"dropped {removed} historical analogue(s) beyond the first {MAX_ANALOGUES}")
-        if fits():
-            return current, trims
+        if await fits():
+            return done()
 
     # 4. events beyond 8, material first
     if len(current.important_events) > MAX_EVENTS:
@@ -133,16 +139,16 @@ def fit_bundle(
         kept = sorted(ordered[:MAX_EVENTS], key=lambda item: item[0])
         current = current.model_copy(update={"important_events": [e for _, e in kept]})
         trims.append(f"dropped {removed} non-material event(s) beyond the first {MAX_EVENTS}")
-        if fits():
-            return current, trims
+        if await fits():
+            return done()
 
     # 5. truncate excerpt text
     excerpts, truncated = _truncate_excerpts(current.excerpts, TRIMMED_EXCERPT_CHARS)
     if truncated:
         current = current.model_copy(update={"excerpts": excerpts})
         trims.append(f"truncated {truncated} excerpt(s) to {TRIMMED_EXCERPT_CHARS} characters")
-        if fits():
-            return current, trims
+        if await fits():
+            return done()
 
     # 6. drop every remaining non-primary excerpt
     excerpts = [e for e in current.excerpts if _is_primary_excerpt(e, meta)]
@@ -150,12 +156,12 @@ def fit_bundle(
     if removed:
         current = current.model_copy(update={"excerpts": excerpts})
         trims.append(f"dropped {removed} remaining excerpt(s) from non-primary sources")
-        if fits():
-            return current, trims
+        if await fits():
+            return done()
 
-    if not fits():
+    if not await fits():
         trims.append(OVERFLOW_TRIM)
-    return current, trims
+    return done()
 
 
 # --- helpers ----------------------------------------------------------------------------------

@@ -27,6 +27,9 @@ def _serve(args: argparse.Namespace) -> int:
         host=settings.host,
         port=settings.port,
         log_level=settings.log_level.lower(),
+        # Open SSE streams must not hold a stop for the length of a Deep synthesis: after this
+        # grace the lifespan shuts down and running analyses are reported INTERRUPTED.
+        timeout_graceful_shutdown=settings.graceful_shutdown_s,
     )
     return 0
 

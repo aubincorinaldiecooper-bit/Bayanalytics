@@ -13,10 +13,10 @@ import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Any
 
-from bayanalytics.calculations.primitives import growth_rate, margin
+from bayanalytics.calculations.primitives import annualized_volatility, growth_rate, margin
 from bayanalytics.calculations.registry import CALCULATION_PACKS, run_pack
 from bayanalytics.config import Settings
 from bayanalytics.context import AnalysisContext
@@ -38,6 +38,7 @@ from bayanalytics.laya.schemas import (
 )
 from bayanalytics.laya.wrapper import LayaFinanceWrapper
 from bayanalytics.normalization import NORMALIZATION_VERSION
+from bayanalytics.normalization.corporate_actions import comparable_periods
 from bayanalytics.normalization.facts import (
     build_facts,
     derive_fourth_quarter_rows,
@@ -55,10 +56,11 @@ from bayanalytics.research.intents import (
 )
 from bayanalytics.research.provider import EvidenceRecord, ResearchProviderError
 from bayanalytics.research.runner import ResearchRunner, RoundResult
-from bayanalytics.schemas.common import ErrorCode, new_id, source_rank
+from bayanalytics.schemas.common import ErrorCode, source_rank, stable_id
 from bayanalytics.schemas.decisions import ChoiceAnswer, LayaDecision, LayaQuestionSet, NoulAnswer
 from bayanalytics.schemas.evidence import (
     BenchmarkRef,
+    CorporateAction,
     EventSegment,
     NormalizedEvidence,
     NormalizedFact,
@@ -92,6 +94,9 @@ class RetrievalState:
     termination_reason: str | None = None
     source_by_id: dict[str, SourceRecord] = field(default_factory=dict)
     evidence_by_source: dict[str, EvidenceRecord] = field(default_factory=dict)
+    notes: list[str] = field(default_factory=list)  # provider outages, dropped rows, gaps
+    queries_failed: int = 0
+    structured_failures: int = 0
 
     def absorb(self, result: RoundResult) -> None:
         for source in result.sources:
@@ -111,6 +116,14 @@ class RetrievalState:
             if all(r.symbol != ref.symbol for r in self.benchmark_refs):
                 self.benchmark_refs.append(ref)
         self.rejected.extend(result.rejected)
+        for note in result.notes:
+            if note not in self.notes:
+                self.notes.append(note)
+            lowered = note.lower()
+            if lowered.startswith("search failed"):
+                self.queries_failed += 1
+            elif "unavailable" in lowered or "failed" in lowered:
+                self.structured_failures += 1
 
 
 class EquityAnalyzer:
@@ -200,7 +213,7 @@ class EquityAnalyzer:
         gaps: list[str],
     ) -> None:
         budget = request.budget
-        if True:
+        if budget.max_rounds > 0:
             while self.state.rounds < budget.max_rounds:
                 ctx.check_cancelled()
                 self.state.rounds += 1
@@ -266,6 +279,8 @@ class EquityAnalyzer:
         merged = runner_stats.model_copy()
         merged.evidence_gaps_remaining = len(gaps)
         merged.search_rounds = self.state.rounds
+        merged.queries_failed = self.state.queries_failed
+        merged.structured_failures = self.state.structured_failures
         return merged
 
     def compute_gaps(self, horizon: str, as_of: datetime) -> list[str]:
@@ -338,16 +353,17 @@ class EquityAnalyzer:
         question_set = LayaQuestionSet(
             stage="research_plan", state=state, questions=research_plan_questions()
         )
-        decisions = await self.laya.ask(question_set, ctx)
         await ctx.event(
             "laya.started", stage="research_plan", questions=len(question_set.questions)
         )
+        decisions = await self.laya.ask(question_set, ctx)
         for decision in decisions:
             await ctx.event("laya.decision", **decision.event_view())
         await ctx.event("laya.completed", stage="research_plan", decisions=len(decisions))
         self.research_decisions.extend(decisions)
         intent = ResearchIntent.stop_research
         sufficient = 0.0
+        stale_matters = 0.0
         for decision in decisions:
             if decision.decision_type == "research_intent" and isinstance(
                 decision.answer, ChoiceAnswer
@@ -360,6 +376,25 @@ class EquityAnalyzer:
                 decision.answer, NoulAnswer
             ):
                 sufficient = decision.answer.noul
+            if decision.decision_type == "stale_evidence_matters" and isinstance(
+                decision.answer, NoulAnswer
+            ):
+                stale_matters = decision.answer.noul
+        # Laya judged the staleness material: refresh coverage once, and say so.
+        if (
+            stale_matters >= 0.6
+            and str(ResearchIntent.retrieve_recent_news) not in self.state.executed
+        ):
+            self.state.notes.append(
+                "Laya judged the available evidence stale enough to matter; "
+                "recent coverage was refreshed"
+            )
+            return ResearchIntent.retrieve_recent_news, min(sufficient, 0.5)
+        if stale_matters >= 0.6:
+            self.state.notes.append(
+                "Laya judged the available evidence stale enough to matter (confidence "
+                f"{stale_matters:.2f}); treat the assessment with caution"
+            )
         # Laya's stop is honoured unless a gap remains whose intent has not been tried yet.
         if intent != ResearchIntent.stop_research or not gaps:
             return intent, sufficient
@@ -390,17 +425,23 @@ class EquityAnalyzer:
                 key: label_series(series, as_of)
                 for key, series in self.state.benchmark_series.items()
             }
-            uncertainties: list[str] = list(fact_build.notes)
+            uncertainties: list[str] = list(fact_build.notes) + [
+                n for n in self.state.notes if not n.lower().startswith("no cik")
+            ]
             if prices is not None:
                 uncertainties.extend(detect_stale_mix(prices, fact_build.facts, as_of))
             summary = freshness_summary(fact_build.facts, prices, as_of)
             uncertainties.extend(summary.get("warnings", []))
-            if fact_build.dropped:
-                uncertainties.append(
-                    f"{len(fact_build.dropped)} facts published after the as-of date were excluded"
-                )
             text_evidence = self._text_evidence(records)
-            segments = self._segments(fact_build.facts)
+            actions = self._corporate_actions()
+            # comparable_periods also reports every identity break among the actions
+            comparable, comparability_notes = comparable_periods(fact_build.facts, actions)
+            uncertainties.extend(comparability_notes)
+            if prices is not None:
+                uncertainties.append(
+                    "price returns exclude dividends (price return, not total return)"
+                )
+            segments = self._segments(comparable, prices)
             evidence = NormalizedEvidence(
                 symbol=self.identity.symbol,
                 as_of=as_of,
@@ -412,11 +453,38 @@ class EquityAnalyzer:
                 conflicts=fact_build.conflicts,
                 uncertainties=_dedupe(uncertainties),
                 segments=segments,
+                corporate_actions=actions,
                 text_evidence=text_evidence,
                 freshness_summary=summary,
                 normalization_version=NORMALIZATION_VERSION,
             )
         return evidence
+
+    def _corporate_actions(self) -> list[CorporateAction]:
+        """Identity events the vertical slice can see: EDGAR's former-name history (the
+        entity is unchanged; older material is filed under the former name). Splits, mergers
+        and spin-offs need a corporate-actions source that is not retrieved yet."""
+        submissions = getattr(self, "_submissions", None)
+        actions: list[CorporateAction] = []
+        for item in getattr(submissions, "former_names", None) or []:
+            name = item.get("name") if isinstance(item, dict) else None
+            if not name:
+                continue
+            until = item.get("to") if isinstance(item, dict) else None
+            effective = None
+            if isinstance(until, str) and len(until) >= 10:
+                try:
+                    effective = date.fromisoformat(until[:10])
+                except ValueError:
+                    effective = None
+            actions.append(
+                CorporateAction(
+                    kind="name_change",
+                    effective=effective,
+                    detail=f"formerly {name}",
+                )
+            )
+        return actions
 
     @property
     def _as_of(self) -> datetime:
@@ -444,10 +512,23 @@ class EquityAnalyzer:
                     "freshness": source.freshness,
                 }
             )
-        items.sort(key=lambda i: (i["rank"], i["published_at"] or ""))
-        return items
+        # Most authoritative rank first; within a rank the newest coverage first (section 6),
+        # undated items last.
+        items.sort(key=lambda i: (i["rank"], i["published_at"] is None, i["published_at"] or ""))
+        by_rank: dict[int, list[dict[str, Any]]] = {}
+        for item in items:
+            by_rank.setdefault(item["rank"], []).append(item)
+        ordered: list[dict[str, Any]] = []
+        for rank in sorted(by_rank):
+            dated = [i for i in by_rank[rank] if i["published_at"]]
+            undated = [i for i in by_rank[rank] if not i["published_at"]]
+            ordered.extend(sorted(dated, key=lambda i: i["published_at"], reverse=True))
+            ordered.extend(undated)
+        return ordered
 
-    def _segments(self, facts: list[NormalizedFact]) -> list[EventSegment]:
+    def _segments(
+        self, facts: list[NormalizedFact], prices: PriceSeries | None = None
+    ) -> list[EventSegment]:
         by_period: dict[str, dict[str, NormalizedFact]] = {}
         periods: dict[str, Period] = {}
         for fact in facts:
@@ -483,10 +564,13 @@ class EquityAnalyzer:
                 m = margin(metrics["operating_income"].value, metrics["revenue"].value)
                 if m is not None:
                     summary["operating_margin_pct"] = round(m * 100, 2)
+            vol = _segment_volatility(prices, period)
+            if vol is not None:
+                summary["volatility_annualized_pct"] = round(vol * 100, 2)
             prev_year[(period.fiscal_year, period.fiscal_period)] = metrics
             segments.append(
                 EventSegment(
-                    segment_id=new_id("seg"),
+                    segment_id=stable_id("seg", self.identity.symbol, period_label(period)),
                     period=period,
                     summary=summary,
                     source_ids=sorted({f.source_id for f in metrics.values()}),
@@ -521,7 +605,9 @@ class EquityAnalyzer:
                 LayaQuestionSet(
                     stage="history_scan",
                     state={"instrument": evidence.symbol, **segment.summary},
-                    questions=history_segment_questions(),
+                    questions=history_segment_questions(
+                        include_volatility="volatility_annualized_pct" in segment.summary
+                    ),
                     segment_id=segment.segment_id,
                 )
             )
@@ -705,7 +791,7 @@ class EquityAnalyzer:
             laya_assessments=laya_assessments,
             important_events=[e for e in important_events if e["material"]]
             or important_events[-3:],
-            historical_analogues=[],
+            historical_analogues=_historical_analogues(evidence, decisions),
             calculated_metrics={"computed": computed, "unavailable": unavailable},
             benchmark_context={
                 "benchmarks": [r.model_dump() for r in evidence.benchmark_refs],
@@ -762,3 +848,65 @@ def _dedupe(items: list[str]) -> list[str]:
             seen.add(item)
             out.append(item)
     return out
+
+
+def _segment_volatility(prices: PriceSeries | None, period: Period) -> float | None:
+    """Annualized volatility of daily closes inside the period (None below 20 closes)."""
+    if prices is None or period.start is None or period.end is None:
+        return None
+    closes = [p.close for p in prices.points if period.start <= p.date <= period.end]
+    if len(closes) < 20:
+        return None
+    return annualized_volatility(closes)
+
+
+def _historical_analogues(
+    evidence: NormalizedEvidence, decisions: LayaDecisions, limit: int = 3
+) -> list[dict[str, Any]]:
+    """Past periods most similar to the latest one on the deterministic segment summary
+    (revenue growth, operating margin, volatility), preferring periods Laya scored as
+    material or unusual. A heuristic over retrieved history, not a model judgement."""
+    segments = [s for s in evidence.segments if s.summary.get("revenue_growth_yoy") is not None]
+    if len(segments) < 2:
+        return []
+    latest = segments[-1]
+    flags: dict[str, float] = {}
+    for decision in decisions.decisions:
+        if decision.stage != "history_scan" or decision.segment_id is None:
+            continue
+        if decision.decision_type in {"historically_unusual", "material_change"} and isinstance(
+            decision.answer, NoulAnswer
+        ):
+            flags[decision.segment_id] = max(
+                flags.get(decision.segment_id, 0.0), decision.answer.noul
+            )
+
+    def distance(seg: EventSegment) -> float:
+        d = abs(
+            float(seg.summary.get("revenue_growth_yoy", 0.0))
+            - float(latest.summary.get("revenue_growth_yoy", 0.0))
+        )
+        lm, sm = latest.summary.get("operating_margin_pct"), seg.summary.get("operating_margin_pct")
+        if lm is not None and sm is not None:
+            d += abs(float(sm) - float(lm))
+        lv, sv = (
+            latest.summary.get("volatility_annualized_pct"),
+            seg.summary.get("volatility_annualized_pct"),
+        )
+        if lv is not None and sv is not None:
+            d += abs(float(sv) - float(lv)) / 2
+        return d - 5.0 * flags.get(seg.segment_id, 0.0)
+
+    ranked = sorted(segments[:-1], key=distance)[:limit]
+    return [
+        {
+            "period": seg.summary.get("period"),
+            "label": seg.summary.get("period"),
+            "summary": {k: v for k, v in seg.summary.items() if k != "period"},
+            "similarity_distance": round(distance(seg), 3),
+            "laya_material_or_unusual": round(flags.get(seg.segment_id, 0.0), 3),
+            "source_ids": seg.source_ids,
+            "method": "deterministic nearest-neighbour on growth/margin/volatility",
+        }
+        for seg in ranked
+    ]

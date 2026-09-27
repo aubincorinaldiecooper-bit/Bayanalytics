@@ -4,9 +4,11 @@
 Measures, never estimates (AGENT.md sections 9, 29, 35). Writes bench/benchmark_<ts>.json with:
   laya_load_ms, laya_warm_inference_ms, laya_resident_ram_mb
   per profile: spark_load_ms, spark_time_to_first_token_ms, spark_total_inference_ms,
-               tokens_per_second, spark_resident_ram_mb, context_ceiling, kv_cache_type
+               tokens_per_second, prompt_tokens (server usage) and
+               prompt_tokens_measured_before_run (/apply-template + /tokenize; must match),
+               spark_resident_ram_mb, context_ceiling, kv_cache_type
   whisper_transcription_ms (when a WAV is given)
-  system_total_ram_mb, system_peak_ram_mb, swap_used_mb, process_peak_rss_mb
+  peaks: system peak RAM and swap for the whole run (not per profile), process_peak_rss_mb
 
 Run on the reference machine with the real runtimes configured in .env:
     set -a; source .env; set +a; python scripts/benchmark_local.py --profiles fast deep
@@ -19,19 +21,20 @@ import asyncio
 import json
 import sys
 import time
+from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from bayanalytics.config import Settings  # noqa: E402
-from bayanalytics.context import AnalysisContext  # noqa: E402
-from bayanalytics.laya.schemas import evidence_scan_questions  # noqa: E402
-from bayanalytics.spark.base import SparkMessage, SparkRunOptions  # noqa: E402
-from bayanalytics.telemetry.memory import sample_process, sample_system  # noqa: E402
-from bayanalytics.telemetry.tracker import PeakTracker  # noqa: E402
-from bayanalytics.wiring import build_laya, build_spark  # noqa: E402
-from bayanalytics.whisper import build_transcriber  # noqa: E402
+from bayanalytics.config import Settings
+from bayanalytics.context import AnalysisContext
+from bayanalytics.laya.schemas import evidence_scan_questions
+from bayanalytics.spark.base import SparkMessage, SparkRunOptions
+from bayanalytics.telemetry.memory import sample_process, sample_system
+from bayanalytics.telemetry.tracker import PeakTracker
+from bayanalytics.whisper import build_transcriber
+from bayanalytics.wiring import build_laya, build_spark
 
 BENCH_STATE = {
     "instrument": "AAPL",
@@ -41,7 +44,7 @@ BENCH_STATE = {
     "primary_sources": 3,
     "conflicts": [],
     "freshness_warnings": [],
-    "recent_headlines": ["Fixture results beat expectations", "Guidance unchanged"],
+    "recent_headlines": ["Quarterly results above prior guidance", "Guidance unchanged"],
 }
 
 
@@ -89,10 +92,17 @@ async def bench_spark(settings: Settings, profiles: list[str], out: dict) -> Non
 
             t0 = time.perf_counter()
             try:
-                gen = await spark.run(profile, messages, on_token, ctx, SparkRunOptions(max_tokens=200))  # type: ignore[arg-type]
+                async with spark.session(profile, ctx) as session:  # type: ignore[arg-type]
+                    t_count = time.perf_counter()
+                    measured_prompt = await session.count_prompt_tokens(messages)
+                    entry["prompt_measure_ms"] = round((time.perf_counter() - t_count) * 1000, 1)
+                    gen = await session.generate(
+                        messages, on_token, SparkRunOptions(max_tokens=200)
+                    )
                 stats = gen.stats
                 entry.update(
                     {
+                        "prompt_tokens_measured_before_run": measured_prompt,
                         "context_ceiling": stats.context_ceiling,
                         "kv_cache_type": stats.kv_cache_type,
                         "spark_load_ms": stats.load_ms,
@@ -107,7 +117,7 @@ async def bench_spark(settings: Settings, profiles: list[str], out: dict) -> Non
                         "runtime_version": stats.runtime_version,
                     }
                 )
-            except Exception as exc:  # noqa: BLE001 - benchmark reports, never hides
+            except Exception as exc:
                 entry["error"] = f"{type(exc).__name__}: {exc}"[:300]
         out.setdefault("spark", {})[profile] = entry
     await spark.close()
@@ -118,14 +128,17 @@ async def bench_whisper(settings: Settings, wav: Path | None, out: dict) -> None
     out["whisper_available"] = transcriber.available()
     if wav is None or not transcriber.available():
         return
+    audio = await asyncio.to_thread(wav.read_bytes)
     t0 = time.perf_counter()
-    result = await transcriber.transcribe(wav.read_bytes(), wav.name, "audio/wav")
+    result = await transcriber.transcribe(audio, wav.name, "audio/wav")
     out["whisper_transcription_ms"] = result.transcription_ms
     out["whisper_wall_ms"] = round((time.perf_counter() - t0) * 1000, 1)
     out["whisper_audio_duration_ms"] = result.duration_ms
     out["whisper_text"] = result.text[:200]
     stats = getattr(transcriber, "stats", {})
-    out["whisper_peak_rss_mb"] = stats.get("whisper_peak_rss_mb") if isinstance(stats, dict) else None
+    out["whisper_peak_rss_mb"] = (
+        stats.get("whisper_peak_rss_mb") if isinstance(stats, dict) else None
+    )
 
 
 async def main(argv: list[str] | None = None) -> int:
@@ -139,8 +152,12 @@ async def main(argv: list[str] | None = None) -> int:
     settings = Settings.from_env()
     out: dict = {
         "started_at": datetime.now(tz=UTC).isoformat(),
-        "settings": {k: v for k, v in settings.redacted().items() if k.startswith(("laya", "spark", "whisper"))},
-        "system_before": sample_system().__dict__ if hasattr(sample_system(), "__dict__") else str(sample_system()),
+        "settings": {
+            k: v
+            for k, v in settings.redacted().items()
+            if k.startswith(("laya", "spark", "whisper"))
+        },
+        "system_before": asdict(sample_system()),
     }
     async with PeakTracker(interval_s=0.25) as tracker:
         if not args.skip_laya:
@@ -151,13 +168,17 @@ async def main(argv: list[str] | None = None) -> int:
     out["peaks"] = tracker.snapshot()
     proc = sample_process()
     out["process_peak_rss_mb"] = getattr(proc, "peak_rss_mb", None)
-    out_dir = Path(args.out)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    path = out_dir / f"benchmark_{datetime.now(tz=UTC).strftime('%Y%m%dT%H%M%SZ')}.json"
-    path.write_text(json.dumps(out, indent=2, default=str))
+    path = await asyncio.to_thread(_write_report, Path(args.out), out)
     print(json.dumps(out, indent=2, default=str))
     print("written", path)
     return 0
+
+
+def _write_report(out_dir: Path, out: dict) -> Path:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / f"benchmark_{datetime.now(tz=UTC).strftime('%Y%m%dT%H%M%SZ')}.json"
+    path.write_text(json.dumps(out, indent=2, default=str))
+    return path
 
 
 if __name__ == "__main__":

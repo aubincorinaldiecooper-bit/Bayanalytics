@@ -57,10 +57,6 @@ def _calc_sources(calc: CalculationResult) -> list[str]:
     return sorted({i.source_id for i in calc.inputs if i.source_id})
 
 
-def _pct(calc: CalculationResult) -> float | None:
-    return calc.value
-
-
 def build_structured_sections(
     evidence: NormalizedEvidence,
     decisions: LayaDecisions,
@@ -285,15 +281,6 @@ def build_evidence_lists(
                     source_ids=text_source_ids,
                 )
             )
-        elif guidance.answer.choice == "deteriorating":
-            bear.append(
-                EvidenceItem(
-                    text="Guidance trend classified as deteriorating",
-                    stance="bearish",
-                    decision_id=guidance.decision_id,
-                )
-            )
-
     # Risks: deterministic signals plus conflicts and stale evidence.
     vol = scan.get("volatility_regime")
     if vol is not None and isinstance(vol.answer, ChoiceAnswer) and vol.answer.choice == "elevated":

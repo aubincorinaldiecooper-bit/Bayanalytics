@@ -65,6 +65,8 @@ class HorizonAssessment(BaseModel):
 class ResearchStats(BaseModel):
     search_rounds: int = 0
     queries_issued: int = 0
+    queries_failed: int = 0  # search backend errors (the loop continued without them)
+    structured_failures: int = 0  # EDGAR / price endpoint errors after the first success
     sources_fetched: int = 0
     sources_rejected: int = 0
     duplicate_sources_removed: int = 0
@@ -74,14 +76,29 @@ class ResearchStats(BaseModel):
     termination_reason: str | None = None
 
 
+class ExecutionInfo(BaseModel):
+    """How this backend process is wired: the llama-server mode (managed by the backend or an
+    external server), whether voice input is on, the deployment target and whether a web search
+    backend is configured. Runtime versions are measured separately in ``VersionInfo``."""
+
+    spark_mode: str = "managed"
+    whisper_mode: str = "disabled"
+    deployment: str = "local"
+    search_configured: bool = False
+
+
 class VersionInfo(BaseModel):
     normalization_version: str = ""
     laya_schema_version: str = ""
-    laya_package_version: str = ""
-    spark_artifact: str = ""
+    # Measured at runtime: the worker reports its installed package version, the Spark
+    # artifact comes from the download lockfile and the loaded model, the runtime from
+    # ``llama-server --version`` or ``/props``. ``None`` means not reported, never a default.
+    laya_package_version: str | None = None
+    spark_artifact: str | None = None
     spark_runtime: str | None = None
     spark_gguf_sha256: str | None = None
     spark_hf_revision: str | None = None
+    execution: ExecutionInfo = Field(default_factory=ExecutionInfo)
 
 
 class Telemetry(BaseModel):

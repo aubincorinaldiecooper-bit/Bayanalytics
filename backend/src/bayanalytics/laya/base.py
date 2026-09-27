@@ -1,7 +1,8 @@
-"""Laya client boundary. Implementations: ``LayaWorkerClient`` (Node worker) and ``MockLaya``."""
+"""Laya client boundary, implemented by ``LayaWorkerClient`` (the Node worker)."""
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any, Protocol
 
 from pydantic import BaseModel
@@ -38,6 +39,10 @@ class LayaClient(Protocol):
     async def system_one(
         self, state: dict[str, Any] | str, questions: dict[str, LayaQuestion]
     ) -> LayaResult: ...
+
+    async def count_tokens(self, texts: Sequence[str]) -> list[int]:
+        """Token counts of ``texts`` with the loaded bundle's tokenizer (no special tokens)."""
+        ...
 
     async def health(self) -> LayaHealth: ...
 

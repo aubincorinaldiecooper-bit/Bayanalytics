@@ -4,9 +4,9 @@
 Authoritative artifact (AGENT.md section 1.3): repo XHToken/Spark-X2.5-1.7B-GGUF, quantization
 Q4_K_M, runtime llama.cpp >= b10828. This script never substitutes another repack.
 
-Usage:
-    python scripts/download_spark.py [--dest models/spark] [--revision <commit>]
-Requires: pip install huggingface_hub
+Usage (from backend/, with the project venv; the venv has no pip of its own):
+    uv pip install -p .venv/bin/python huggingface_hub
+    .venv/bin/python scripts/download_spark.py [--dest models/spark] [--revision <commit>]
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ def main() -> int:
     try:
         from huggingface_hub import HfApi, hf_hub_download
     except ImportError:
-        print("pip install huggingface_hub first", file=sys.stderr)
+        print("uv pip install -p .venv/bin/python huggingface_hub first", file=sys.stderr)
         return 2
 
     api = HfApi()
@@ -50,14 +50,14 @@ def main() -> int:
         if s.rfilename.lower().endswith(".gguf") and QUANT.lower() in s.rfilename.lower()
     ]
     if len(candidates) != 1:
-        print(f"expected exactly one {QUANT} GGUF in {HF_REPO}, found: {candidates}", file=sys.stderr)
+        print(
+            f"expected exactly one {QUANT} GGUF in {HF_REPO}, found: {candidates}", file=sys.stderr
+        )
         return 1
     filename = candidates[0]
     dest = Path(args.dest)
     dest.mkdir(parents=True, exist_ok=True)
-    local = Path(
-        hf_hub_download(HF_REPO, filename, revision=info.sha, local_dir=str(dest))
-    )
+    local = Path(hf_hub_download(HF_REPO, filename, revision=info.sha, local_dir=str(dest)))
     digest = sha256_of(local)
     lock_path = Path(args.lockfile)
     existing = json.loads(lock_path.read_text()) if lock_path.exists() else {}

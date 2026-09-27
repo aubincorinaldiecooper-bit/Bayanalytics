@@ -291,17 +291,20 @@ def evidence_scan_questions() -> dict[str, LayaQuestion]:
     )
 
 
-def history_segment_questions() -> dict[str, LayaQuestion]:
-    """Score one normalised historical period or event (section 3.4)."""
-    return _batch(
-        "revenue_momentum",
-        "margin_direction",
-        "guidance_trend",
-        "sentiment_trend",
-        "volatility_regime",
-        "historically_unusual",
-        "material_change",
-    )
+def history_segment_questions(*, include_volatility: bool = False) -> dict[str, LayaQuestion]:
+    """Score one normalised historical period (section 3.4).
+
+    Only questions the segment state can support are asked: the XBRL-derived state carries
+    revenue, income, margins and growth, so momentum / margin direction / unusualness /
+    materiality are always asked; ``volatility_regime`` only when the caller put a measured
+    volatility for the period into the state. Guidance and sentiment per past period would
+    need dated commentary for that period, which the vertical slice does not retrieve, so
+    they are not asked.
+    """
+    keys = ["revenue_momentum", "margin_direction", "historically_unusual", "material_change"]
+    if include_volatility:
+        keys.append("volatility_regime")
+    return _batch(*keys)
 
 
 def calculation_questions() -> dict[str, LayaQuestion]:
@@ -356,7 +359,6 @@ def overall_scan_questions() -> dict[str, LayaQuestion]:
         "sentiment_trend",
         "volatility_regime",
         "evidence_stance",
-        "escalate_to_spark",
         "stale_evidence_matters",
         "calculation_pack",
     )
@@ -386,6 +388,7 @@ BUILDERS = (
     calculation_questions,
     lambda: horizon_questions(SINGLE_HORIZONS),
     synthesis_gate_questions,
+    lambda: history_segment_questions(include_volatility=True),
     overall_scan_questions,
     text_evidence_questions,
     lambda: horizon_context_questions(SINGLE_HORIZONS),

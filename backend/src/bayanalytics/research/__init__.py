@@ -7,11 +7,12 @@ Modules:
     extract          extract_html / extract_json / extract_csv / extract_page -> EvidenceRecord
     sources          classify_source, canonical_url, source_record_from_evidence
     dedup            Deduplicator (content hash, canonical URL, title prefix)
-    edgar            EdgarClient (company_tickers, submissions, company_facts), seed data
+    edgar            EdgarClient (company_tickers, submissions, company_facts)
     prices           StooqPrices, select_benchmarks, to_stooq_symbol
     intents          ResearchIntent, PlannedQuery, build_queries, seed_plan, gap_to_intent
     runner           ResearchRunner.execute(PlannedQuery) -> RoundResult
     http_provider    HttpResearchProvider, build_research_stack(settings)
-    fixture_provider FixtureFetcher, FixtureResearchProvider, RecordingProvider, RecordingFetcher
-    fixtures_build   regenerates tests/fixtures/research/apple deterministically
+
+Test doubles (fixture-backed provider, synthetic Apple data) live under ``tests/doubles`` and
+``tests/fixtures``; nothing in this package serves canned data.
 """

@@ -29,6 +29,10 @@ router = APIRouter(prefix="/analyses", tags=["analyses"])
 async def create_analysis(body: CreateAnalysisRequest, rt: RuntimeDep) -> CreateAnalysisResponse:
     capability = rt.spark.availability(body.profile)
     if not capability.available:
+        # An external llama-server started after this backend is picked up here.
+        await rt.refresh_spark()
+        capability = rt.spark.availability(body.profile)
+    if not capability.available:
         code = capability.code or (
             ErrorCode.DEEP_PROFILE_UNAVAILABLE
             if body.profile == "deep"
@@ -48,6 +52,7 @@ async def create_analysis(body: CreateAnalysisRequest, rt: RuntimeDep) -> Create
         max_rounds=settings.research_max_rounds,
         max_sources=settings.research_max_sources,
         max_fetch_per_round=settings.research_max_fetch_per_round,
+        timeout_s=settings.research_timeout_s,
     )
     job = await rt.runner.submit(
         body, resolved_horizon=resolved, budget=budget, as_of=settings.eval_as_of

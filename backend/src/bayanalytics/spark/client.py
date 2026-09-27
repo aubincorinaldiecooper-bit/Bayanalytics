@@ -1,9 +1,11 @@
 """``LlamaSparkClient``: the llama-server backed ``SparkClient``.
 
-One Spark request at a time (AGENT.md section 38): ``run`` takes an ``asyncio.Lock``, lets the
-manager switch the loaded profile if needed, streams ``POST /v1/chat/completions`` and releases
-the lock. Cancellation mid-stream closes the response and raises ``CANCELLED``; partial text is
-never returned as a completed generation (section 24, model/runtime failure).
+One Spark request at a time (AGENT.md section 38): ``session`` takes an ``asyncio.Lock``, lets
+the manager switch the loaded profile if needed, measures prompts with the server's own chat
+template and tokenizer (``/apply-template`` + ``/tokenize``), streams
+``POST /v1/chat/completions`` and releases the lock. Cancellation mid-stream closes the
+response and raises ``CANCELLED``; partial text is never returned as a completed generation
+(section 24, model/runtime failure).
 
 Error details never contain prompt or evidence content: they carry a reason keyword, an HTTP
 status or an exception class name only.
@@ -120,18 +122,9 @@ class LlamaSparkClient:
         runtime = await self._manager.runtime_version()
         return version_fields(self.lockfile, self._settings, runtime)
 
-    async def run(
-        self,
-        profile: Profile,
-        messages: list[SparkMessage],
-        on_token: TokenCallback,
-        ctx: AnalysisContext,
-        options: SparkRunOptions | None = None,
-    ) -> SparkGeneration:
-        opts = options or SparkRunOptions(
-            max_tokens=self._settings.spark_max_output_tokens,
-            temperature=self._settings.spark_temperature,
-        )
+    @contextlib.asynccontextmanager
+    async def session(self, profile: Profile, ctx: AnalysisContext) -> AsyncIterator[_Session]:
+        """Exclusive turn with ``profile`` resident: prompt measurement, then one generation."""
         ctx.check_cancelled()
         async with self._lock:
             ctx.check_cancelled()
@@ -142,10 +135,70 @@ class LlamaSparkClient:
             if load_ms is not None:
                 ctx.diagnostics["spark_load_ms"] = load_ms
             ctx.diagnostics["spark_loaded_now"] = bool(outcome.loaded_now)
-            with self._manager.request_scope():
-                return await self._generate(
-                    profile, spec, messages, on_token, ctx, opts, load_ms, runtime_version
+            yield _Session(self, profile, spec, ctx, load_ms, runtime_version)
+
+    async def run(
+        self,
+        profile: Profile,
+        messages: list[SparkMessage],
+        on_token: TokenCallback,
+        ctx: AnalysisContext,
+        options: SparkRunOptions | None = None,
+    ) -> SparkGeneration:
+        async with self.session(profile, ctx) as session:
+            return await session.generate(messages, on_token, options)
+
+    def _default_options(self, options: SparkRunOptions | None) -> SparkRunOptions:
+        return options or SparkRunOptions(
+            max_tokens=self._settings.spark_max_output_tokens,
+            temperature=self._settings.spark_temperature,
+        )
+
+    # --- measured prompt size -------------------------------------------------------------
+
+    async def _count_prompt_tokens(self, messages: list[SparkMessage]) -> int:
+        """Tokens the server will see for ``messages``: the chat template applied by the server
+        itself, tokenised by the server with the same special-token handling as a request."""
+        base = self._manager.base_url
+        timeout = httpx.Timeout(self._settings.spark_request_timeout_s, connect=CONNECT_TIMEOUT_S)
+        try:
+            templated = await self._http.post(
+                f"{base}/apply-template",
+                json={"messages": [m.model_dump() for m in messages]},
+                timeout=timeout,
+                headers=self._manager.auth_headers,
+            )
+            if templated.status_code != 200:
+                raise AnalysisError(
+                    ErrorCode.SPARK_INFERENCE_FAILED,
+                    details={"reason": "apply_template_status", "status": templated.status_code},
                 )
+            prompt = templated.json().get("prompt")
+            if not isinstance(prompt, str):
+                raise AnalysisError(
+                    ErrorCode.SPARK_INFERENCE_FAILED, details={"reason": "apply_template_shape"}
+                )
+            tokenized = await self._http.post(
+                f"{base}/tokenize",
+                json={"content": prompt, "add_special": True, "parse_special": True},
+                timeout=timeout,
+                headers=self._manager.auth_headers,
+            )
+            if tokenized.status_code != 200:
+                raise AnalysisError(
+                    ErrorCode.SPARK_INFERENCE_FAILED,
+                    details={"reason": "tokenize_status", "status": tokenized.status_code},
+                )
+            tokens = tokenized.json().get("tokens")
+        except (httpx.HTTPError, ValueError) as exc:
+            raise AnalysisError(
+                ErrorCode.SPARK_INFERENCE_FAILED, details={"reason": type(exc).__name__}
+            ) from exc
+        if not isinstance(tokens, list):
+            raise AnalysisError(
+                ErrorCode.SPARK_INFERENCE_FAILED, details={"reason": "tokenize_shape"}
+            )
+        return len(tokens)
 
     # --- streaming ----------------------------------------------------------------------
 
@@ -188,7 +241,9 @@ class LlamaSparkClient:
         started = time.perf_counter()
         ctx.timers.start("spark")
         try:
-            async with self._http.stream("POST", url, json=payload, timeout=timeout) as response:
+            async with self._http.stream(
+                "POST", url, json=payload, timeout=timeout, headers=self._manager.auth_headers
+            ) as response:
                 if response.status_code != 200:
                     raise AnalysisError(
                         ErrorCode.SPARK_INFERENCE_FAILED,
@@ -287,6 +342,60 @@ class LlamaSparkClient:
         )
 
 
+class _Session:
+    """``SparkSession`` for ``LlamaSparkClient`` (valid only inside ``session``)."""
+
+    def __init__(
+        self,
+        client: LlamaSparkClient,
+        profile: Profile,
+        spec: ProfileSpec,
+        ctx: AnalysisContext,
+        load_ms: float | None,
+        runtime_version: str | None,
+    ) -> None:
+        self._client = client
+        self._profile = profile
+        self._spec = spec
+        self._ctx = ctx
+        self._load_ms = load_ms
+        self._runtime_version = runtime_version
+        self.generated = False
+
+    @property
+    def spec(self) -> ProfileSpec:
+        return self._spec
+
+    async def count_prompt_tokens(self, messages: list[SparkMessage]) -> int:
+        self._ctx.check_cancelled()
+        return await self._client._count_prompt_tokens(messages)
+
+    async def generate(
+        self,
+        messages: list[SparkMessage],
+        on_token: TokenCallback,
+        options: SparkRunOptions | None = None,
+    ) -> SparkGeneration:
+        if self.generated:
+            raise AnalysisError(
+                ErrorCode.INTERNAL_ERROR, details={"reason": "one generation per spark session"}
+            )
+        self.generated = True
+        opts = self._client._default_options(options)
+        self._ctx.check_cancelled()
+        with self._client.manager.request_scope():
+            return await self._client._generate(
+                self._profile,
+                self._spec,
+                messages,
+                on_token,
+                self._ctx,
+                opts,
+                self._load_ms,
+                self._runtime_version,
+            )
+
+
 def _parse_chunk(data: str) -> dict[str, Any]:
     try:
         chunk = json.loads(data)
@@ -307,9 +416,8 @@ def _token_stats(
     """Prompt / output token counts and tokens per second.
 
     Token counts come from llama-server's ``usage`` (or ``timings``); tokens per second only
-    from ``timings``. When neither is present the output count falls back to the number of
-    streamed deltas (an estimate) and tokens per second stays ``None`` so an estimate is never
-    reported as a measurement.
+    from ``timings``. When neither is present every figure stays ``None``: the streamed-delta
+    count is a diagnostic, never reported as a token count.
     """
     prompt_tokens = _int_or_none(usage, "prompt_tokens") or _int_or_none(timings, "prompt_n")
     output_tokens = _int_or_none(usage, "completion_tokens") or _int_or_none(timings, "predicted_n")

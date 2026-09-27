@@ -10,10 +10,10 @@ throws when the options do not fit at all. The spec forbids relying on that sile
 this module compacts states deterministically *before* the call and rejects heads that would be
 truncated.
 
-Every token figure here is an **estimate** (the tokenizer lives in the Node worker); the real
-``usage.input_tokens`` comes back from the worker with each answer. The estimate is deliberately
-conservative (about 1 token per 3.5 characters, plus one per JSON key) so that "fits by estimate"
-implies "fits for the real tokenizer" for English states.
+Every token figure here is **measured** with the loaded bundle's own tokenizer, through the
+``TokenCounter`` the worker exposes (``LayaClient.count_tokens``). Nothing is estimated: the
+sequence arithmetic below mirrors ``@receptron/laya``'s ``buildSequence`` exactly, so "fits here"
+means "fits in the worker".
 """
 
 from __future__ import annotations
@@ -21,27 +21,27 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 from bayanalytics.laya.base import LAYA_HEAD_MAX_LEN, LAYA_MAX_CHOICE_OPTIONS, LAYA_MAX_LEN
 from bayanalytics.schemas.decisions import LayaQuestion
 
-CHARS_PER_TOKEN = 3.5
+TokenCounter = Callable[[Sequence[str]], Awaitable[list[int]]]
+"""Measured token counts for a batch of texts (no special tokens), in order."""
 
-# Header allowance: the fixed frame around the state. "<type> question: " plus the finance
-# schemas' instructions (20-45 tokens), the option markers and texts of the compact trend /
-# stance questions (20-50 tokens) and the three [SEP]/[CLS] specials fit comfortably in 96
-# tokens. Batches with a longer head (``research_intent`` renders ten described options) must
-# use ``state_budget_for`` which subtracts the largest estimated head in the batch instead.
-HEADER_ALLOWANCE_TOKENS = 96
-DEFAULT_STATE_BUDGET_TOKENS = LAYA_MAX_LEN - HEADER_ALLOWANCE_TOKENS  # 416
+# Sequence frame around head + state: [CLS], [SEP] after the instructions, [SEP] after the
+# options and the final [SEP] (``buildSequence``: ``room = maxLen - seq.length - 1``).
+SEQUENCE_SPECIALS = 4
 MIN_STATE_BUDGET_TOKENS = 64
 
 MAX_STRING_CHARS = 240
 MAX_LIST_ITEMS = 8
 # Laya keeps at most 48 tokens per option text before it starts shrinking heads.
 LAYA_MAX_OPTION_TOKENS = 48
+# Below this many tokens left for the instructions Laya shrinks every option evenly.
+MIN_INSTRUCTION_TOKENS = 16
 ELLIPSIS = "…"
 
 # Keys kept first (in this order) when nothing more specific is requested. Unknown keys follow
@@ -68,6 +68,7 @@ DEFAULT_STATE_PRIORITY: tuple[str, ...] = (
 )
 
 _NOUL_OPTIONS = ("false: no, the statement does not hold", "true: yes, the statement holds")
+_MASK = "[MASK]"
 
 
 # ---- serialisation ------------------------------------------------------------------------
@@ -90,26 +91,12 @@ def state_digest(state: Any) -> str:
     return hashlib.sha256(canonical_json(state).encode("utf-8")).hexdigest()
 
 
-# ---- token estimates ----------------------------------------------------------------------
+def _scrub(text: str) -> str:
+    """``buildSequence`` replaces literal ``[MASK]`` markers in text with a space."""
+    return text.replace(_MASK, " ")
 
 
-def _count_keys(obj: Any) -> int:
-    if isinstance(obj, Mapping):
-        return len(obj) + sum(_count_keys(v) for v in obj.values())
-    if isinstance(obj, (list, tuple)):
-        return sum(_count_keys(v) for v in obj)
-    return 0
-
-
-def estimate_tokens(text_or_obj: Any) -> int:
-    """Conservative token estimate: ceil(chars / 3.5) plus one token per JSON key.
-
-    A heuristic only. Objects are measured as Laya serialises them; the authoritative count is
-    the ``usage.input_tokens`` the worker returns.
-    """
-    if isinstance(text_or_obj, str):
-        return math.ceil(len(text_or_obj) / CHARS_PER_TOKEN)
-    return math.ceil(len(laya_json(text_or_obj)) / CHARS_PER_TOKEN) + _count_keys(text_or_obj)
+# ---- question rendering (exactly as Laya renders it) --------------------------------------
 
 
 def rendered_options(question: LayaQuestion) -> list[str]:
@@ -124,18 +111,88 @@ def rendered_options(question: LayaQuestion) -> list[str]:
     return list(_NOUL_OPTIONS)
 
 
-def estimate_head_tokens(question: LayaQuestion) -> int:
-    """Estimated tokens of the question head: instructions plus one marker and text per option."""
-    head = estimate_tokens(f"{question.type} question: {question.instructions}")
-    options = sum(1 + estimate_tokens(" " + text) for text in rendered_options(question))
-    return head + options
+def instruction_text(question: LayaQuestion) -> str:
+    """The instruction part of the head, as encoded by ``buildSequence``."""
+    instructions = question.instructions
+    if not isinstance(instructions, str):
+        instructions = json.dumps(instructions, ensure_ascii=False, default=str)
+    return _scrub(f"{question.type} question: {instructions}")
 
 
-def state_budget_for(questions: Mapping[str, LayaQuestion], max_len: int = LAYA_MAX_LEN) -> int:
-    """State token budget for a batch: ``max_len`` minus the largest head, capped at the default."""
-    largest = max((estimate_head_tokens(q) for q in questions.values()), default=0)
-    room = max_len - largest - 4  # [CLS] + three [SEP]
-    return max(MIN_STATE_BUDGET_TOKENS, min(DEFAULT_STATE_BUDGET_TOKENS, room))
+def option_texts(question: LayaQuestion) -> list[str]:
+    """Option texts as encoded (each is prefixed with a space before tokenisation)."""
+    return [" " + _scrub(text) for text in rendered_options(question)]
+
+
+@dataclass(frozen=True)
+class HeadMeasure:
+    """Measured head of one question: instruction tokens and per-option tokens."""
+
+    instruction_tokens: int
+    option_tokens: tuple[int, ...]
+
+    @property
+    def options_total(self) -> int:
+        # one [MASK] marker per option plus its text
+        return sum(1 + n for n in self.option_tokens)
+
+    @property
+    def total(self) -> int:
+        return self.instruction_tokens + self.options_total
+
+    def truncation(self) -> str | None:
+        """Why Laya would silently squeeze this head, or ``None`` when it fits intact."""
+        if any(n > LAYA_MAX_OPTION_TOKENS for n in self.option_tokens):
+            return f"an option exceeds {LAYA_MAX_OPTION_TOKENS} tokens"
+        room = LAYA_HEAD_MAX_LEN - self.options_total
+        if room < MIN_INSTRUCTION_TOKENS:
+            return (
+                f"options take {self.options_total} of {LAYA_HEAD_MAX_LEN} head tokens; "
+                f"fewer than {MIN_INSTRUCTION_TOKENS} left for the instructions"
+            )
+        if self.instruction_tokens > room:
+            return (
+                f"instructions of {self.instruction_tokens} tokens exceed the {room} tokens "
+                f"left in head_max_len={LAYA_HEAD_MAX_LEN}"
+            )
+        return None
+
+
+async def measure_heads(
+    questions: Mapping[str, LayaQuestion], counter: TokenCounter
+) -> dict[str, HeadMeasure]:
+    """Measure every question head in one tokenizer round trip and reject heads Laya would
+    truncate (``ValueError`` names the question and the reason)."""
+    texts: list[str] = []
+    layout: list[tuple[str, int]] = []
+    for key, question in questions.items():
+        if not isinstance(question, LayaQuestion):
+            question = LayaQuestion.model_validate(question)
+        options = option_texts(question)
+        texts.append(instruction_text(question))
+        texts.extend(options)
+        layout.append((key, len(options)))
+    counts = await counter(texts)
+    if len(counts) != len(texts):
+        raise ValueError("token counter returned the wrong number of counts")
+    measured: dict[str, HeadMeasure] = {}
+    cursor = 0
+    for key, n_options in layout:
+        head = HeadMeasure(counts[cursor], tuple(counts[cursor + 1 : cursor + 1 + n_options]))
+        cursor += 1 + n_options
+        problem = head.truncation()
+        if problem is not None:
+            raise ValueError(f"question {key!r}: {problem}")
+        measured[key] = head
+    return measured
+
+
+def state_budget_for(heads: Mapping[str, HeadMeasure], max_len: int = LAYA_MAX_LEN) -> int:
+    """State token budget for a batch: ``max_len`` minus the frame and the largest measured head
+    (every question's sequence carries the whole state, so the largest head binds)."""
+    largest = max((h.total for h in heads.values()), default=0)
+    room = max_len - SEQUENCE_SPECIALS - largest
+    return max(MIN_STATE_BUDGET_TOKENS, room)
 
 
 # ---- compaction ---------------------------------------------------------------------------
@@ -170,8 +227,18 @@ def _ordered_keys(state: Mapping[str, Any], priority: Sequence[str] | None) -> l
     return ordered
 
 
-def _compact(
-    state: Mapping[str, Any], budget_tokens: int, priority: Sequence[str] | None
+async def _count_one(counter: TokenCounter, obj: Any) -> int:
+    counts = await counter([_scrub(laya_json(obj))])
+    if len(counts) != 1:
+        raise ValueError("token counter returned the wrong number of counts")
+    return counts[0]
+
+
+async def _compact(
+    state: Mapping[str, Any],
+    budget_tokens: int,
+    counter: TokenCounter,
+    priority: Sequence[str] | None,
 ) -> tuple[dict[str, Any], list[str]]:
     budget = max(1, int(budget_tokens))
     ordered = _ordered_keys(state, priority)
@@ -179,40 +246,56 @@ def _compact(
         key: _shrink(state[key], MAX_STRING_CHARS, MAX_LIST_ITEMS) for key in ordered
     }
     dropped: list[str] = []
-    while len(compacted) > 1 and estimate_tokens(compacted) > budget:
+    if not compacted:
+        return compacted, dropped
+    total = await _count_one(counter, compacted)
+    if total <= budget:
+        return compacted, dropped
+
+    # Over budget: measure every key on its own (one round trip), drop from the tail until the
+    # per-key sum fits, then confirm with a measurement of the assembled state.
+    per_key = await counter([_scrub(laya_json({k: v})) for k, v in compacted.items()])
+    if len(per_key) != len(compacted):
+        raise ValueError("token counter returned the wrong number of counts")
+    sizes = dict(zip(compacted, per_key, strict=True))
+    running = sum(per_key)
+    while len(compacted) > 1 and running > budget:
         key = next(reversed(compacted))
         del compacted[key]
         dropped.append(key)
-    if compacted and estimate_tokens(compacted) > budget:
+        running -= sizes[key]
+    total = await _count_one(counter, compacted)
+    while len(compacted) > 1 and total > budget:
+        key = next(reversed(compacted))
+        del compacted[key]
+        dropped.append(key)
+        total = await _count_one(counter, compacted)
+    if total > budget:
         # One oversized key left: tighten it rather than sending an empty state.
         key = next(iter(compacted))
         compacted[key] = _shrink(compacted[key], max(32, budget * 2), 4)
     return compacted, dropped
 
 
-def compact_state(
+async def compact_state(
     state: Mapping[str, Any] | str,
-    budget_tokens: int = DEFAULT_STATE_BUDGET_TOKENS,
+    budget_tokens: int,
+    counter: TokenCounter,
     priority: Sequence[str] | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
-    """Deterministically shrink ``state`` under ``budget_tokens`` (estimated).
+    """Deterministically shrink ``state`` under ``budget_tokens`` as measured by ``counter``.
 
     Keys are kept in ``priority`` order (then alphabetically); long strings are cut to
     ``MAX_STRING_CHARS`` with an ellipsis, lists to ``MAX_LIST_ITEMS`` items, and the lowest
-    priority keys are dropped until the estimate fits. Returns the compact state and the dropped
-    keys, in drop order. Never raises: on an unexpected input it returns a best-effort copy.
+    priority keys are dropped until the measured state fits. Returns the compact state and the
+    dropped keys, in drop order. Counter failures propagate (the caller reports them as a Laya
+    failure); malformed input degrades to a best-effort copy.
     """
-    try:
-        if isinstance(state, str):
-            return _compact({"text": state}, budget_tokens, priority)
-        if not isinstance(state, Mapping):
-            return _compact({"value": state}, budget_tokens, priority)
-        return _compact(state, budget_tokens, priority)
-    except Exception:  # pragma: no cover - defensive; compaction must never break an analysis
-        try:
-            return dict(state) if isinstance(state, Mapping) else {"value": str(state)}, []
-        except Exception:
-            return {}, []
+    if isinstance(state, str):
+        return await _compact({"text": state}, budget_tokens, counter, priority)
+    if not isinstance(state, Mapping):
+        return await _compact({"value": state}, budget_tokens, counter, priority)
+    return await _compact(state, budget_tokens, counter, priority)
 
 
 # ---- question validation ------------------------------------------------------------------
@@ -223,13 +306,11 @@ def normalise_option(key: str) -> str:
 
 
 def validate_questions(questions: Mapping[str, LayaQuestion]) -> None:
-    """Reject question batches Laya would truncate or refuse.
+    """Structural checks that need no tokenizer: reject question batches Laya would refuse.
 
-    Raises ``ValueError`` when a choice has ``LAYA_MAX_CHOICE_OPTIONS`` (20) or more options, when
-    option keys collide after normalisation, when a single option would exceed Laya's 48-token
-    cap, or when the estimated head (instructions plus rendered options) exceeds
-    ``head_max_len`` (192). Runs before every ``system_one`` and at import time on the finance
-    schemas.
+    Raises ``ValueError`` when a choice has ``LAYA_MAX_CHOICE_OPTIONS`` (20) or more options,
+    when option keys collide after normalisation, when a score has fewer than two levels or when
+    instructions are empty. Token-length checks are ``measure_heads`` (measured, per call).
     """
     if not questions:
         raise ValueError("at least one Laya question is required")
@@ -264,15 +345,3 @@ def validate_questions(questions: Mapping[str, LayaQuestion]) -> None:
                 )
         if not str(question.instructions).strip():
             raise ValueError(f"question {key!r}: instructions are empty")
-        for text in rendered_options(question):
-            if estimate_tokens(" " + text) > LAYA_MAX_OPTION_TOKENS:
-                raise ValueError(
-                    f"question {key!r}: option {text[:40]!r} exceeds "
-                    f"{LAYA_MAX_OPTION_TOKENS} tokens"
-                )
-        head = estimate_head_tokens(question)
-        if head > LAYA_HEAD_MAX_LEN:
-            raise ValueError(
-                f"question {key!r}: estimated head of {head} tokens exceeds "
-                f"head_max_len={LAYA_HEAD_MAX_LEN}"
-            )

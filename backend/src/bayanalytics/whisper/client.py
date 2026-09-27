@@ -14,7 +14,13 @@ Guarantees:
 - the child's peak RSS and timings are measured (``PeakTracker`` + wall clock) and exposed in
   ``stats`` so the API can report ``whisper_peak_rss_mb`` / ``whisper_load_ms`` truthfully,
 - one transcription at a time (``asyncio.Lock``): whisper.cpp is CPU bound and the reference
-  machine has 8 GB.
+  machine has 8 GB,
+- the upload's file suffix only steers ffmpeg's demuxer when it is a known audio suffix
+  (anything else is written as ``.bin`` and probed), and ffmpeg runs with
+  ``-protocol_whitelist file,crypto,data`` so a container can never make it open a network or
+  device protocol,
+- both children (ffmpeg and whisper-cli) run with the allow-listed environment from
+  :mod:`bayanalytics.procenv`, never the backend's own settings or secrets.
 
 The legacy whisper.cpp binary name ``main`` is supported by setting ``BAY_WHISPER_BIN=main``
 (or a path to it); the argument syntax is identical.
@@ -35,6 +41,7 @@ from typing import Any
 
 from bayanalytics.config import Settings
 from bayanalytics.errors import AnalysisError
+from bayanalytics.procenv import child_env
 from bayanalytics.schemas.common import ErrorCode
 from bayanalytics.schemas.transcriptions import Transcription
 from bayanalytics.telemetry.memory import forget_process
@@ -44,8 +51,30 @@ from bayanalytics.whisper.audio import WavInfo, inspect_wav_file
 logger = logging.getLogger(__name__)
 
 _STDERR_LIMIT = 200
-_SAFE_SUFFIX = re.compile(r"^\.[a-z0-9]{1,5}$")
 _LOAD_TIME = re.compile(r"load time\s*=\s*([0-9]+(?:\.[0-9]+)?)\s*ms")
+
+AUDIO_SUFFIXES: frozenset[str] = frozenset(
+    {
+        ".wav",
+        ".webm",
+        ".ogg",
+        ".oga",
+        ".opus",
+        ".mp3",
+        ".m4a",
+        ".aac",
+        ".flac",
+        ".mp4",
+        ".caf",
+        ".aiff",
+        ".aif",
+    }
+)
+"""Upload suffixes ffmpeg may see. Anything else becomes ``.bin`` (ffmpeg probes the content)."""
+
+FFMPEG_PROTOCOL_WHITELIST = "file,crypto,data"
+"""ffmpeg protocols allowed while demuxing an upload: local files only, no network or devices."""
+
 _CONTENT_TYPE_SUFFIX = {
     "audio/wav": ".wav",
     "audio/x-wav": ".wav",
@@ -58,10 +87,15 @@ _CONTENT_TYPE_SUFFIX = {
     "audio/mpeg": ".mp3",
     "audio/mp3": ".mp3",
     "audio/mp4": ".m4a",
+    "video/mp4": ".mp4",
     "audio/x-m4a": ".m4a",
     "audio/aac": ".aac",
+    "audio/x-aac": ".aac",
     "audio/flac": ".flac",
     "audio/x-flac": ".flac",
+    "audio/x-caf": ".caf",
+    "audio/aiff": ".aiff",
+    "audio/x-aiff": ".aiff",
 }
 
 
@@ -78,16 +112,49 @@ def resolve_binary(name: str | None) -> str | None:
 
 
 def input_suffix(filename: str | None, content_type: str | None) -> str:
-    """A safe file suffix for the uploaded audio (helps ffmpeg pick a demuxer)."""
+    """The suffix the upload is written with, from an allow list of audio suffixes only.
+
+    The suffix is what ffmpeg uses to pick a demuxer before probing, so a client must not be
+    able to choose an arbitrary one: the upload filename counts only when its suffix is in
+    :data:`AUDIO_SUFFIXES`, then the declared content type is mapped, and anything else is
+    ``.bin`` (ffmpeg then probes the bytes).
+    """
     if filename:
         suffix = Path(filename).suffix.lower()
-        if _SAFE_SUFFIX.match(suffix):
+        if suffix in AUDIO_SUFFIXES:
             return suffix
     if content_type:
         mapped = _CONTENT_TYPE_SUFFIX.get(content_type.split(";", 1)[0].strip().lower())
         if mapped:
             return mapped
     return ".bin"
+
+
+def ffmpeg_argv(ffmpeg: str, source: Path, target: Path) -> list[str]:
+    """ffmpeg command line converting ``source`` to a 16 kHz mono s16 WAV at ``target``.
+
+    ``-protocol_whitelist`` precedes ``-i`` so it applies to the input (and to anything the
+    container references): only local files, the crypto wrapper and data URLs are allowed.
+    """
+    return [
+        ffmpeg,
+        "-y",
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-protocol_whitelist",
+        FFMPEG_PROTOCOL_WHITELIST,
+        "-i",
+        str(source),
+        "-ar",
+        "16000",
+        "-ac",
+        "1",
+        "-c:a",
+        "pcm_s16le",
+        str(target),
+    ]
 
 
 def _failed(reason: str, **extra: Any) -> AnalysisError:
@@ -193,23 +260,7 @@ class WhisperCliTranscriber:
         ffmpeg = resolve_binary(self._settings.ffmpeg_bin)
         if ffmpeg is None:
             raise _failed("ffmpeg_missing")
-        argv = [
-            ffmpeg,
-            "-y",
-            "-nostdin",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-i",
-            str(source),
-            "-ar",
-            "16000",
-            "-ac",
-            "1",
-            "-c:a",
-            "pcm_s16le",
-            str(target),
-        ]
+        argv = ffmpeg_argv(ffmpeg, source, target)
         code, stderr, _tracker = await self._run(argv, tmp, "ffmpeg", "ffmpeg_timeout")
         if code != 0:
             self._log_stderr("ffmpeg", code, stderr, tmp)
@@ -259,6 +310,7 @@ class WhisperCliTranscriber:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=str(cwd),
+                env=child_env(),
             )
         except OSError as exc:
             raise _failed(f"{track_as}_spawn_failed", error=type(exc).__name__) from exc
@@ -317,4 +369,12 @@ async def _terminate(proc: asyncio.subprocess.Process) -> None:
         logger.warning("whisper child did not exit after kill")
 
 
-__all__ = ["WavInfo", "WhisperCliTranscriber", "input_suffix", "resolve_binary"]
+__all__ = [
+    "AUDIO_SUFFIXES",
+    "FFMPEG_PROTOCOL_WHITELIST",
+    "WavInfo",
+    "WhisperCliTranscriber",
+    "ffmpeg_argv",
+    "input_suffix",
+    "resolve_binary",
+]

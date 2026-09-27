@@ -143,14 +143,10 @@ def check_availability(
       arithmetic (FAST_/DEEP_PROFILE_UNAVAILABLE);
     - external mode: availability comes from the last health check (``external_healthy``) and
       the context size the external server reports (``external_n_ctx``), never from memory
-      arithmetic, because that server's memory is not ours to reason about;
-    - mock mode: always available.
+      arithmetic, because that server's memory is not ours to reason about.
     """
     spec = profile_specs(settings)[profile]
     ceiling = spec.context_ceiling
-
-    if settings.spark_mode == "mock":
-        return ProfileCapability(available=True, context_ceiling=ceiling)
 
     if settings.spark_mode == "external":
         if external_healthy is False:
@@ -267,9 +263,13 @@ def version_fields(
     settings: Settings,
     runtime_version: str | None = None,
 ) -> dict[str, str | None]:
-    """The ``VersionInfo`` fields Spark is responsible for (``VersionInfo(**fields)`` works)."""
+    """The ``VersionInfo`` fields Spark is responsible for (``VersionInfo(**fields)`` works).
+
+    The artifact is named only from the download lockfile (a record of a verified download);
+    without a lockfile it is ``None``, never a configured label.
+    """
     lock = lock or {}
-    artifact = settings.spark_artifact
+    artifact: str | None = None
     if lock.get("hf_repo") and lock.get("gguf_quantization"):
         artifact = f"{lock['hf_repo']}:{lock['gguf_quantization']}"
     runtime = runtime_version or _as_str(lock.get("llama_cpp_version"))

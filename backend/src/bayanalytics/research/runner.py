@@ -9,7 +9,8 @@ Events emitted HERE (the analyzer emits ``research.started`` / ``research.comple
 
 * ``research.query``            {intent, kind, query, label, round}
 * ``research.source_found``     SourceRecord.public_view() + {intent, round}
-* ``research.source_rejected``  {url, title, reason, intent, round}
+* ``research.source_rejected``  {url, title, reason, intent, round}; ``reason`` is always one
+  of ``REJECTION_REASONS`` (fixed keywords, never transport error text)
 
 Call sequence for the orchestrator::
 
@@ -54,11 +55,12 @@ from bayanalytics.research.provider import (
     SearchResult,
 )
 from bayanalytics.research.sources import (
+    canonical_url,
     classify_freshness,
     classify_source,
     source_record_from_evidence,
 )
-from bayanalytics.schemas.common import ErrorCode, new_id, utcnow
+from bayanalytics.schemas.common import ErrorCode, stable_id, utcnow
 from bayanalytics.schemas.evidence import BenchmarkRef, PriceSeries, SourceRecord
 from bayanalytics.schemas.results import ResearchStats
 
@@ -69,7 +71,39 @@ REASON_LEAKAGE = "published_after_as_of"
 REASON_PAYWALLED = "paywalled"
 REASON_THIN = "thin_content"
 REASON_FETCH_FAILED = "fetch_failed"
+REASON_BLOCKED = "blocked_target"
+REASON_TIMEOUT = "timeout"
+REASON_EXTRACT_FAILED = "extract_failed"
+REASON_ROBOTS = "robots_disallowed"
+REASON_SEARCH_FAILED = "search_failed"
 TERMINATION_MAX_SOURCES = "max_sources"
+
+# The only rejection / failure reasons that leave the runner (events, error details). Raw
+# exception text and URLs go to the log, never to clients.
+REJECTION_REASONS: frozenset[str] = frozenset(
+    {
+        REASON_LEAKAGE,
+        REASON_PAYWALLED,
+        REASON_THIN,
+        REASON_FETCH_FAILED,
+        REASON_BLOCKED,
+        REASON_TIMEOUT,
+        REASON_EXTRACT_FAILED,
+        REASON_ROBOTS,
+        REASON_SEARCH_FAILED,
+    }
+)
+
+
+def reject_reason(exc: BaseException) -> str:
+    """Map a provider failure to a fixed reason keyword (default ``fetch_failed``)."""
+    tagged = getattr(exc, "reason", None)
+    if isinstance(tagged, str) and tagged in REJECTION_REASONS:
+        return tagged
+    message = str(exc)
+    if message in REJECTION_REASONS:
+        return message
+    return REASON_FETCH_FAILED
 
 
 class RoundResult(BaseModel):
@@ -215,11 +249,13 @@ class ResearchRunner:
             round=self._round,
         )
 
-    def _structured_failure(self, exc: Exception, planned: PlannedQuery, url: str) -> None:
+    def _structured_failure(self, exc: Exception, planned: PlannedQuery, what: str) -> None:
+        reason = reject_reason(exc)
+        log.warning("structured research failed (%s, %s): %s", planned.kind, what, exc)
         if not self._structured_ok:
             raise AnalysisError(
                 ErrorCode.RESEARCH_UNAVAILABLE,
-                details={"kind": planned.kind, "url": url, "reason": str(exc)[:300]},
+                details={"kind": planned.kind, "stage": planned.kind, "reason": reason},
             ) from exc
 
     # -- search ---------------------------------------------------------------------------
@@ -247,8 +283,8 @@ class ResearchRunner:
         try:
             results = await self._search(planned)
         except ResearchProviderError as exc:
-            result.notes.append(f"search failed: {exc}")
-            log.info("search failed for %r: %s", planned.query, exc)
+            result.notes.append(f"{REASON_SEARCH_FAILED}: {planned.label or planned.kind}")
+            log.warning("search failed for %r: %s", planned.query, exc)
             return
         attempts = 0
         for hit in results:
@@ -272,11 +308,10 @@ class ResearchRunner:
             try:
                 record = await self.provider.extract(hit.url)
             except ResearchProviderError as exc:
+                reason = reject_reason(exc)
+                log.debug("source %s rejected (%s): %s", hit.url, reason, exc)
                 await self._reject(
-                    self._source_from_hit(hit, identity, result, as_of),
-                    f"{REASON_FETCH_FAILED}: {str(exc)[:160]}",
-                    ctx,
-                    result,
+                    self._source_from_hit(hit, identity, result, as_of), reason, ctx, result
                 )
                 continue
             self.stats.sources_fetched += 1
@@ -304,7 +339,7 @@ class ResearchRunner:
     ) -> SourceRecord:
         source_type, publisher, redistribution, note = classify_source(hit.url)
         return SourceRecord(
-            source_id=new_id("src"),
+            source_id=stable_id("src", canonical_url(hit.url)),
             url=hit.url,
             title=hit.title,
             publisher=publisher,
@@ -344,7 +379,7 @@ class ResearchRunner:
             subs = await self.edgar.submissions(cik)
         except ResearchProviderError as exc:
             self._structured_failure(exc, planned, f"submissions CIK {cik}")
-            result.notes.append(f"EDGAR submissions unavailable: {exc}")
+            result.notes.append(f"EDGAR submissions unavailable ({reject_reason(exc)})")
             return
         self._structured_ok = True
         self.stats.sources_fetched += 1
@@ -368,8 +403,10 @@ class ResearchRunner:
                     excerpt = await self.edgar.fetch_filing_excerpt(filing)
                     self.stats.sources_fetched += 1
                 except ResearchProviderError as exc:
+                    log.debug("filing excerpt %s unavailable: %s", filing.url, exc)
                     result.notes.append(
-                        f"{filing.form} {filing.accession}: excerpt unavailable ({exc})"
+                        f"{filing.form} {filing.accession}: excerpt unavailable"
+                        f" ({reject_reason(exc)})"
                     )
             source = self.edgar.filing_source_record(
                 filing,
@@ -416,7 +453,7 @@ class ResearchRunner:
             f" fiscal year end {subs.fiscal_year_end or '?'}; tickers {tickers}"
         ).strip()
         return SourceRecord(
-            source_id=new_id("src"),
+            source_id=stable_id("src", canonical_url(subs.url)),
             url=subs.url,
             title="SEC EDGAR submissions",
             publisher="SEC EDGAR",
@@ -458,7 +495,7 @@ class ResearchRunner:
             )
         except ResearchProviderError as exc:
             self._structured_failure(exc, planned, f"companyfacts CIK {cik}")
-            result.notes.append(f"EDGAR company facts unavailable: {exc}")
+            result.notes.append(f"EDGAR company facts unavailable ({reject_reason(exc)})")
             return
         self._structured_ok = True
         self.stats.sources_fetched += 1
@@ -499,11 +536,10 @@ class ResearchRunner:
                 intent=result.intent,
             )
         except ResearchProviderError as exc:
+            reason = reject_reason(exc)
+            log.debug("prices for %s rejected (%s): %s", symbol, reason, exc)
             await self._reject(
-                self._price_failure_source(symbol, identity, result.intent),
-                f"{REASON_FETCH_FAILED}: {str(exc)[:160]}",
-                ctx,
-                result,
+                self._price_failure_source(symbol, identity, result.intent), reason, ctx, result
             )
             return
         self.stats.sources_fetched += 1
@@ -532,9 +568,11 @@ class ResearchRunner:
                     stooq_symbol, as_of, self._days(planned), label=ref.name, intent=result.intent
                 )
             except ResearchProviderError as exc:
+                reason = reject_reason(exc)
+                log.debug("benchmark %s rejected (%s): %s", stooq_symbol, reason, exc)
                 await self._reject(
                     self._price_failure_source(stooq_symbol, identity, result.intent),
-                    f"{REASON_FETCH_FAILED}: {str(exc)[:160]}",
+                    reason,
                     ctx,
                     result,
                 )
@@ -551,7 +589,7 @@ class ResearchRunner:
         self, stooq_symbol: str, identity: InstrumentIdentity, intent: str
     ) -> SourceRecord:
         return SourceRecord(
-            source_id=new_id("src"),
+            source_id=stable_id("src", canonical_url(self.prices.url_for(stooq_symbol))),
             url=self.prices.url_for(stooq_symbol),
             title=f"Stooq daily prices {stooq_symbol}",
             publisher="Stooq",

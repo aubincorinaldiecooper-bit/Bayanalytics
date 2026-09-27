@@ -14,7 +14,8 @@ from datetime import UTC, date, datetime, timedelta
 from bayanalytics.research.dates import ensure_utc
 from bayanalytics.research.fetch import PRICE_CSV_TTL_S, PageFetcher
 from bayanalytics.research.provider import ResearchProviderError
-from bayanalytics.schemas.common import new_id
+from bayanalytics.research.sources import canonical_url
+from bayanalytics.schemas.common import stable_id
 from bayanalytics.schemas.evidence import BenchmarkRef, PricePoint, PriceSeries, SourceRecord
 
 STOOQ_DAILY_URL = "https://stooq.com/q/d/l/?s={symbol}&i=d"
@@ -196,7 +197,7 @@ class StooqPrices:
         session_date = points[-1].date
         published = datetime(session_date.year, session_date.month, session_date.day, tzinfo=UTC)
         source = SourceRecord(
-            source_id=new_id("src"),
+            source_id=stable_id("src", canonical_url(url)),
             url=url,
             title=f"Stooq daily prices {symbol_stooq}",
             publisher="Stooq",

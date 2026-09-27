@@ -11,6 +11,7 @@ rounds. The conventions:
   (``18.2`` -> ``18.2%``, ``-7.4`` -> ``-7.4%``).
 * ``percentile``: an ordinal rank (``72nd percentile``).
 * ``ratio``: one decimal and the multiplication sign U+00D7 (``34.1x`` with that sign).
+* ``coefficient``: two decimals, no sign (``1.15`` for a beta).
 * ``shares``: compact scale plus the word (``15.3B shares``).
 * ``days``: whole days (``42 days``).
 * ``bp``: whole basis points with an explicit sign (``+120 bp``).
@@ -143,6 +144,9 @@ def format_value(
     if unit == "ratio":
         digits = 1 if decimals is None else decimals
         return f"{number:.{digits}f}{MULTIPLY_SIGN}"
+    if unit == "coefficient":  # beta and other dimensionless coefficients
+        digits = 2 if decimals is None else decimals
+        return f"{number:.{digits}f}"
     if unit == "bp":
         whole = round(number)
         sign = "+" if whole > 0 else ""

@@ -1,10 +1,12 @@
 """``LayaFinanceWrapper``: turns question sets into auditable ``LayaDecision`` records.
 
-Per call: cancellation check, head/option validation, deterministic state compaction (dropped
-keys go to ``ctx.diagnostics["laya_dropped_keys"]``), one ``system_one`` round trip, one decision
-per answer. The wrapper emits no events (the orchestrator owns ``laya.*`` events) and accumulates
-wall-clock Laya time in ``ctx.timers`` under ``"laya"``. Failures propagate as
-``AnalysisError(LAYA_INFERENCE_FAILED)``; state contents never appear in an error.
+Per call: cancellation check, structural question validation, measured head sizing (the
+worker's tokenizer; cached per question batch), deterministic state compaction under the
+measured budget (dropped keys go to ``ctx.diagnostics["laya_dropped_keys"]``), one
+``system_one`` round trip, one decision per answer. The wrapper emits no events (the
+orchestrator owns ``laya.*`` events) and accumulates wall-clock Laya time in ``ctx.timers``
+under ``"laya"``. Failures propagate as ``AnalysisError(LAYA_INFERENCE_FAILED)``; state
+contents never appear in an error.
 """
 
 from __future__ import annotations
@@ -17,13 +19,15 @@ from bayanalytics.context import AnalysisContext
 from bayanalytics.errors import AnalysisError
 from bayanalytics.laya.base import LAYA_MAX_LEN, LayaClient
 from bayanalytics.laya.compaction import (
+    HeadMeasure,
     compact_state,
+    measure_heads,
     state_budget_for,
     state_digest,
     validate_questions,
 )
 from bayanalytics.laya.schemas import LAYA_SCHEMA_VERSION
-from bayanalytics.schemas.common import ErrorCode, new_id, utcnow
+from bayanalytics.schemas.common import ErrorCode, stable_id, utcnow
 from bayanalytics.schemas.decisions import (
     LayaDecision,
     LayaQuestionSet,
@@ -48,6 +52,9 @@ class LayaFinanceWrapper:
         self._schema_version = schema_version
         self._state_priority = list(state_priority) if state_priority is not None else None
         self._state_budget = state_budget_tokens
+        # Measured head sizes per question batch (the finance schemas are static, so a batch
+        # is measured once per process); keyed by the batch's canonical JSON digest.
+        self._head_cache: dict[str, dict[str, HeadMeasure]] = {}
 
     @property
     def client(self) -> LayaClient:
@@ -69,8 +76,33 @@ class LayaFinanceWrapper:
                 details={"reason": "invalid_questions", "message": str(exc)[:300]},
             ) from exc
 
-        budget = self._state_budget or state_budget_for(questions)
-        state, dropped = compact_state(question_set.state, budget, self._state_priority)
+        try:
+            heads = await self._measured_heads(questions)
+        except AnalysisError:
+            raise
+        except ValueError as exc:
+            raise AnalysisError(
+                ErrorCode.LAYA_INFERENCE_FAILED,
+                retryable=False,
+                details={"reason": "invalid_questions", "message": str(exc)[:300]},
+            ) from exc
+        except Exception as exc:
+            raise AnalysisError(
+                ErrorCode.LAYA_INFERENCE_FAILED,
+                details={"reason": "client_failure", "exception": type(exc).__name__},
+            ) from exc
+        budget = self._state_budget or state_budget_for(heads)
+        try:
+            state, dropped = await compact_state(
+                question_set.state, budget, self._client.count_tokens, self._state_priority
+            )
+        except AnalysisError:
+            raise
+        except Exception as exc:
+            raise AnalysisError(
+                ErrorCode.LAYA_INFERENCE_FAILED,
+                details={"reason": "client_failure", "exception": type(exc).__name__},
+            ) from exc
         if dropped:
             entries = ctx.diagnostics.setdefault(DROPPED_KEYS_DIAGNOSTIC, [])
             entries.append(
@@ -108,7 +140,9 @@ class LayaFinanceWrapper:
             answer = result.answers[key]
             decisions.append(
                 LayaDecision(
-                    decision_id=new_id("dec"),
+                    decision_id=stable_id(
+                        "dec", digest, question_set.stage, question_set.segment_id, key
+                    ),
                     stage=question_set.stage,
                     decision_type=key,
                     question=question,
@@ -123,6 +157,17 @@ class LayaFinanceWrapper:
             )
         self._check_truncation(question_set, result, ctx)
         return decisions
+
+    async def _measured_heads(self, questions: dict[str, Any]) -> dict[str, HeadMeasure]:
+        key = state_digest(
+            {k: (q.to_laya() if hasattr(q, "to_laya") else q) for k, q in questions.items()}
+        )
+        cached = self._head_cache.get(key)
+        if cached is not None:
+            return cached
+        heads = await measure_heads(questions, self._client.count_tokens)
+        self._head_cache[key] = heads
+        return heads
 
     async def ask_many(
         self, sets: Sequence[LayaQuestionSet], ctx: AnalysisContext

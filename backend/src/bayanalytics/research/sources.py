@@ -14,7 +14,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from bayanalytics.research.dates import ensure_utc
 from bayanalytics.research.extract import excerpt_of, registrable_domain
 from bayanalytics.research.provider import EvidenceRecord
-from bayanalytics.schemas.common import Freshness, Redistribution, SourceType, new_id
+from bayanalytics.schemas.common import Freshness, Redistribution, SourceType, stable_id
 from bayanalytics.schemas.evidence import SourceRecord
 
 CURRENT_MAX_DAYS = 3
@@ -181,7 +181,7 @@ def source_record_from_evidence(
         if key in record.metadata:
             metadata[key] = record.metadata[key]
     return SourceRecord(
-        source_id=new_id("src"),
+        source_id=stable_id("src", canonical_url(record.final_url or record.url)),
         url=record.final_url or record.url,
         title=record.title,
         publisher=publisher,
