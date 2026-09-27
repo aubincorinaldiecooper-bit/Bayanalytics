@@ -50,8 +50,35 @@ class AnalysisRunner:
         interrupted = await self._store.mark_interrupted()
         if interrupted:
             log.warning("marked %d analyses INTERRUPTED from a previous process", len(interrupted))
+        for analysis_id in interrupted:
+            await self._close_interrupted(analysis_id)
         self._accepting = True
         return interrupted
+
+    async def _close_interrupted(self, analysis_id: str) -> None:
+        """Append the terminal event for a job a previous process left running, so a client
+        that reconnects to its event stream sees ``analysis.failed`` instead of waiting."""
+        events = await self._store.list_events(analysis_id)
+        if events and events[-1].terminal:
+            return
+        last_seq = events[-1].seq if events else 0
+        self._bus.register(analysis_id, last_seq=last_seq)
+        job = await self._store.get_job(analysis_id)
+        error = (job.error if job and job.error else None) or AnalysisError(
+            ErrorCode.INTERRUPTED
+        ).payload()
+        try:
+            await self._bus.publish(
+                analysis_id,
+                "analysis.failed",
+                {"status": "failed", "error": error.model_dump(mode="json"), "partial": True},
+            )
+        except RuntimeError:
+            return  # already terminal in this bus
+        if job is not None:
+            job.last_seq = self._bus.last_seq(analysis_id)
+            job.touch()
+            await self._store.update_job(job)
 
     async def shutdown(self, timeout_s: float = 10.0) -> None:
         self._accepting = False

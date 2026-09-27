@@ -417,3 +417,63 @@ async def test_api_validation_and_transcription() -> None:
             "/api/v1/transcriptions", files={"audio": ("a.wav", b"", "audio/wav")}
         )
         assert empty.status_code == 422
+
+
+# ---------------------------------------------------------------- regressions (PR review)
+
+
+async def test_sse_keepalive_does_not_close_the_stream() -> None:
+    """A quiet stretch longer than the keepalive interval must not end the stream."""
+    from bayanalytics.api.sse import event_stream
+
+    store = FakeStore()
+    bus = AnalysisEventBus(store)
+    bus.register("an_slow")
+
+    async def publisher() -> None:
+        await bus.publish("an_slow", "analysis.started", {"query": "q"})
+        await asyncio.sleep(0.12)  # longer than two keepalive intervals
+        await bus.publish("an_slow", "spark.token", {"text": "late"})
+        await asyncio.sleep(0.07)
+        await bus.publish("an_slow", "analysis.completed", {"status": "completed"})
+
+    task = asyncio.create_task(publisher())
+    frames = [frame async for frame in event_stream(bus, "an_slow", 0, keepalive_s=0.05)]
+    await task
+    assert frames.count(": keepalive\n\n") >= 2
+    events = [f for f in frames if f.startswith("id: ")]
+    assert "event: spark.token" in events[1]
+    assert "event: analysis.completed" in events[-1]
+    assert len(events) == 3
+
+
+async def test_interrupted_jobs_get_a_terminal_event_on_startup() -> None:
+    rt = _runtime(_pipeline_ok)
+    stale = AnalysisJob(
+        analysis_id="an_stale2",
+        query="q",
+        profile="fast",
+        requested_horizon="auto",
+        resolved_horizon="multi_horizon",
+        status="synthesizing",
+    )
+    await rt.store.create_job(stale)
+    await rt.store.append_event(
+        AnalysisEvent(event="analysis.started", analysis_id="an_stale2", seq=1, data={})
+    )
+    await rt.store.append_event(
+        AnalysisEvent(event="spark.token", analysis_id="an_stale2", seq=2, data={"text": "x"})
+    )
+    assert await rt.runner.start() == ["an_stale2"]
+    events = await rt.store.list_events("an_stale2")
+    assert [e.seq for e in events] == [1, 2, 3]
+    assert events[-1].event == "analysis.failed"
+    assert events[-1].data["error"]["code"] == "INTERRUPTED"
+    job = await rt.store.get_job("an_stale2")
+    assert job is not None and job.status == "failed" and job.last_seq == 3
+    # A reconnecting client replays and terminates instead of hanging.
+    replayed = [e async for e in rt.bus.stream("an_stale2", after_seq=2)]
+    assert [e.event for e in replayed] == ["analysis.failed"]
+    # Starting again is idempotent: no second terminal event.
+    await rt.runner.start()
+    assert len(await rt.store.list_events("an_stale2")) == 3
