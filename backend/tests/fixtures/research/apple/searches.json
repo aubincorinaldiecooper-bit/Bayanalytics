@@ -1,0 +1,158 @@
+{
+ "fixture": true,
+ "searches": {
+  "\"Apple Inc.\" earnings OR guidance OR outlook": [
+   {
+    "url": "https://www.cnbc.com/2026/09/18/fixture-apple-quarter-preview.html",
+    "title": "[Fixture] Apple quarter preview: what the synthetic numbers imply",
+    "content": "Fixture preview of the September quarter: what the synthetic numbers imply.",
+    "engine": "fixture",
+    "score": 1.0,
+    "publishedDate": "2026-09-18T12:30:00Z"
+   },
+   {
+    "url": "https://www.cnbc.com/2026/09/18/fixture-apple-quarter-preview.html?utm_source=newsletter&utm_medium=email",
+    "title": "[Fixture] Apple quarter preview: what the synthetic numbers imply",
+    "content": "Same fixture preview reached through a tracking link (canonical-URL duplicate).",
+    "engine": "fixture",
+    "score": 1.0,
+    "publishedDate": "2026-09-18T12:30:00Z"
+   },
+   {
+    "url": "https://www.marketwatch.com/story/fixture-apple-outlook-2026-09-12",
+    "title": "[Fixture] Opinion: the outlook for the next cycle",
+    "content": "Fixture outlook column: guidance framing for the next cycle.",
+    "engine": "fixture",
+    "score": 1.0
+   },
+   {
+    "url": "https://www.businesswire.com/news/home/20260730001234/en/Fixture-Apple-Reports-Third-Quarter-Results",
+    "title": "[Fixture] Apple Reports Third Quarter Results",
+    "content": "Fixture earnings release for the June quarter (synthetic figures).",
+    "engine": "fixture",
+    "score": 1.0,
+    "publishedDate": "2026-07-30T20:05:00Z"
+   },
+   {
+    "url": "https://www.fool.com/investing/2026/09/20/fixture-apple-what-to-watch/",
+    "title": "[Fixture] 3 things to watch this quarter",
+    "content": "Fixture commentary: three things to watch in the synthetic quarter.",
+    "engine": "fixture",
+    "score": 1.0,
+    "publishedDate": "2026-09-20"
+   },
+   {
+    "url": "https://www.reuters.com/technology/fixture-apple-october-event-2026-10-02/",
+    "title": "[Fixture] October event recap",
+    "content": "Fixture article dated after the evaluation as_of; must be rejected by the leakage guard.",
+    "engine": "fixture",
+    "score": 1.0
+   },
+   {
+    "url": "https://investor.example-fixture.com/news/short-notice",
+    "title": "[Fixture] Investor notice",
+    "content": "Fixture investor-relations notice that is too short to be evidence.",
+    "engine": "fixture",
+    "score": 1.0,
+    "publishedDate": "2026-09-15"
+   },
+   {
+    "url": "https://www.prnewswire.com/news-releases/fixture-apple-reports-third-quarter-results-301234567.html",
+    "title": "[Fixture] Apple Reports Third Quarter Results",
+    "content": "Syndicated copy of the fixture earnings release (content-hash duplicate).",
+    "engine": "fixture",
+    "score": 1.0,
+    "publishedDate": "2026-07-30T20:07:00Z"
+   }
+  ],
+  "\"Apple Inc.\" stock 2025 results": [
+   {
+    "url": "https://www.marketwatch.com/story/fixture-apple-outlook-2026-09-12",
+    "title": "[Fixture] Opinion: the outlook for the next cycle",
+    "content": "Fixture outlook column: guidance framing for the next cycle.",
+    "engine": "fixture",
+    "score": 1.0
+   },
+   {
+    "url": "https://www.businesswire.com/news/home/20260730001234/en/Fixture-Apple-Reports-Third-Quarter-Results",
+    "title": "[Fixture] Apple Reports Third Quarter Results",
+    "content": "Fixture earnings release for the June quarter (synthetic figures).",
+    "engine": "fixture",
+    "score": 1.0,
+    "publishedDate": "2026-07-30T20:05:00Z"
+   },
+   {
+    "url": "https://www.fool.com/investing/2026/09/20/fixture-apple-what-to-watch/",
+    "title": "[Fixture] 3 things to watch this quarter",
+    "content": "Fixture commentary: three things to watch in the synthetic quarter.",
+    "engine": "fixture",
+    "score": 1.0,
+    "publishedDate": "2026-09-20"
+   }
+  ],
+  "*": [
+   {
+    "url": "https://www.cnbc.com/2026/09/18/fixture-apple-quarter-preview.html",
+    "title": "[Fixture] Apple quarter preview: what the synthetic numbers imply",
+    "content": "Fixture preview of the September quarter: what the synthetic numbers imply.",
+    "engine": "fixture",
+    "score": 1.0,
+    "publishedDate": "2026-09-18T12:30:00Z"
+   },
+   {
+    "url": "https://www.cnbc.com/2026/09/18/fixture-apple-quarter-preview.html?utm_source=newsletter&utm_medium=email",
+    "title": "[Fixture] Apple quarter preview: what the synthetic numbers imply",
+    "content": "Same fixture preview reached through a tracking link (canonical-URL duplicate).",
+    "engine": "fixture",
+    "score": 1.0,
+    "publishedDate": "2026-09-18T12:30:00Z"
+   },
+   {
+    "url": "https://www.marketwatch.com/story/fixture-apple-outlook-2026-09-12",
+    "title": "[Fixture] Opinion: the outlook for the next cycle",
+    "content": "Fixture outlook column: guidance framing for the next cycle.",
+    "engine": "fixture",
+    "score": 1.0
+   },
+   {
+    "url": "https://www.businesswire.com/news/home/20260730001234/en/Fixture-Apple-Reports-Third-Quarter-Results",
+    "title": "[Fixture] Apple Reports Third Quarter Results",
+    "content": "Fixture earnings release for the June quarter (synthetic figures).",
+    "engine": "fixture",
+    "score": 1.0,
+    "publishedDate": "2026-07-30T20:05:00Z"
+   },
+   {
+    "url": "https://www.fool.com/investing/2026/09/20/fixture-apple-what-to-watch/",
+    "title": "[Fixture] 3 things to watch this quarter",
+    "content": "Fixture commentary: three things to watch in the synthetic quarter.",
+    "engine": "fixture",
+    "score": 1.0,
+    "publishedDate": "2026-09-20"
+   },
+   {
+    "url": "https://www.reuters.com/technology/fixture-apple-october-event-2026-10-02/",
+    "title": "[Fixture] October event recap",
+    "content": "Fixture article dated after the evaluation as_of; must be rejected by the leakage guard.",
+    "engine": "fixture",
+    "score": 1.0
+   },
+   {
+    "url": "https://investor.example-fixture.com/news/short-notice",
+    "title": "[Fixture] Investor notice",
+    "content": "Fixture investor-relations notice that is too short to be evidence.",
+    "engine": "fixture",
+    "score": 1.0,
+    "publishedDate": "2026-09-15"
+   },
+   {
+    "url": "https://www.prnewswire.com/news-releases/fixture-apple-reports-third-quarter-results-301234567.html",
+    "title": "[Fixture] Apple Reports Third Quarter Results",
+    "content": "Syndicated copy of the fixture earnings release (content-hash duplicate).",
+    "engine": "fixture",
+    "score": 1.0,
+    "publishedDate": "2026-07-30T20:07:00Z"
+   }
+  ]
+ }
+}

@@ -1,0 +1,47 @@
+[project]
+name = "bayanalytics-backend"
+version = "0.1.0"
+description = "BayAnalytics backend: CPU-only public-equity analysis (public research + Laya + deterministic math + Spark + Whisper)"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Proprietary" }
+dependencies = [
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.30",
+  "pydantic>=2.8",
+  "httpx>=0.27",
+  "asyncpg>=0.29",
+  "psutil>=6.0",
+  "python-multipart>=0.0.9",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3",
+  "pytest-asyncio>=0.24",
+  "ruff>=0.6",
+]
+
+[project.scripts]
+bayanalytics = "bayanalytics.cli:main"
+
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/bayanalytics"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+filterwarnings = ["error::RuntimeWarning"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "ASYNC", "RUF"]
+ignore = ["RUF012"]
