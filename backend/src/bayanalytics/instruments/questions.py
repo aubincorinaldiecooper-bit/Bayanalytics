@@ -374,8 +374,9 @@ REQUIREMENTS: dict[str, _Row] = {
         operands=("revenue", "eps_diluted", "operating_income", PRICE_OPERAND),
         focus=(
             "The analyst asks whether the latest reported period changes the investment thesis. "
-            "Contrast the newest quarter with the prior trend, the guidance direction and the "
-            "market's reaction, and say explicitly what changed and what did not."
+            "Contrast the newest quarter with the prior trend, the guidance direction, the "
+            "market's reaction and, when one is given, the prior completed assessment, and say "
+            "explicitly what changed and what did not."
         ),
         horizons=("next_cycle", "medium_term"),
         recent_period=True,
@@ -387,12 +388,21 @@ REQUIREMENTS: dict[str, _Row] = {
             _I.retrieve_latest_filing,
             _I.retrieve_historical_coverage,
         ),
-        calculations=("market_cap", "pe_ttm", "ps_ttm", "fcf_yield_ttm", "pe_5y_percentile"),
+        calculations=(
+            "market_cap",
+            "pe_ttm",
+            "ps_ttm",
+            "fcf_yield_ttm",
+            "pe_5y_percentile",
+            "pe_history_percentile",
+            "valuation_reconciliation_1y",
+        ),
         operands=(PRICE_OPERAND, "shares_outstanding", "eps_diluted", "revenue"),
         focus=(
             "The analyst asks about valuation: whether the shares look expensive or cheap. "
-            "Anchor on the computed multiples and where the trailing P/E sits within the "
-            "company's own history; never state a target price."
+            "Anchor on the computed multiples, where the trailing P/E sits within the "
+            "company's own history and how much of the price move the multiple explains (the "
+            "reconciliation verdict, restated as given); never state a target price."
         ),
         horizons=("medium_term", "long_term"),
     ),
@@ -755,6 +765,9 @@ _CALC_LABELS: dict[str, str] = {
     "ev_ebitda_ttm": "EV/EBITDA",
     "fcf_yield_ttm": "the free-cash-flow yield",
     "pe_5y_percentile": "the P/E's five-year percentile",
+    "pe_history_percentile": "the P/E's percentile over its full available history",
+    "valuation_reconciliation_1y": "the one-year price-versus-earnings reconciliation",
+    "valuation_reconciliation_3y": "the three-year price-versus-earnings reconciliation",
     "market_cap": "the market cap",
     "enterprise_value": "the enterprise value",
     "revenue_growth_yoy": "year-over-year revenue growth",

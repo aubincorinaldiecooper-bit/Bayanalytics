@@ -12,6 +12,7 @@ from typing import Any
 
 import pytest
 
+from bayanalytics.calculations.reconciliation import VERDICTS as RECONCILIATION_VERDICTS
 from bayanalytics.calculations.registry import CALCULATION_PACKS, SPECS, compute
 from bayanalytics.config import Settings
 from bayanalytics.context import AnalysisContext
@@ -686,7 +687,14 @@ def test_check_requirements_surfaces_missing_operands_and_calculations() -> None
     ]
     assert report.satisfied_calculations == ["market_cap"]
     missing = {m.name: m for m in report.missing_calculations}
-    assert set(missing) == {"pe_ttm", "ps_ttm", "fcf_yield_ttm", "pe_5y_percentile"}
+    assert set(missing) == {
+        "pe_ttm",
+        "ps_ttm",
+        "fcf_yield_ttm",
+        "pe_5y_percentile",
+        "pe_history_percentile",
+        "valuation_reconciliation_1y",
+    }
     assert missing["pe_ttm"].reason == "missing eps_ttm" and missing["pe_ttm"].missing_inputs == [
         "eps_ttm"
     ]
@@ -720,7 +728,7 @@ def test_check_requirements_surfaces_missing_operands_and_calculations() -> None
     # nothing here fails: an empty analysis is simply an entirely unmet report
     empty = check_requirements(requirements, None, CalculatedMetrics())
     assert not empty.satisfied and len(empty.missing_operands) == 4
-    assert len(empty.missing_calculations) == 5
+    assert len(empty.missing_calculations) == len(REQUIREMENTS["valuation"].calculations) == 7
     # and general_assessment has nothing to miss
     general = check_requirements(_requirements("general_assessment"), None, CalculatedMetrics())
     assert general.satisfied and general.uncertainties == []
@@ -781,9 +789,12 @@ async def test_spark_bundle_carries_the_focus_and_the_unmet_requirements() -> No
         "recent_period": False,
         "unmet_requirements": report.uncertainties,
     }
-    # the fixture has no four consecutive EPS quarters, so the percentile is honestly unmet
-    assert [m.name for m in report.missing_calculations] == ["pe_5y_percentile"]
-    assert report.missing_calculations[0].missing_inputs == ["eps_ttm", "pe_history"]
+    # the fixture has no four consecutive EPS quarters, so both percentiles are honestly unmet
+    assert [m.name for m in report.missing_calculations] == [
+        "pe_5y_percentile",
+        "pe_history_percentile",
+    ]
+    assert all(m.missing_inputs == ["eps_ttm", "pe_history"] for m in report.missing_calculations)
     assert report.missing_operands == [] and report.missing_research_intents == []
     # without requirements the bundle is exactly as before
     bare = _bare()
@@ -819,9 +830,16 @@ async def test_valuation_question_end_to_end() -> None:
         "pe_ttm",
         "ps_ttm",
         "fcf_yield_ttm",
+        "valuation_reconciliation_1y",
     ]
-    assert [m["name"] for m in requirements["missing_calculations"]] == ["pe_5y_percentile"]
-    assert requirements["missing_calculations"][0]["missing_inputs"] == ["eps_ttm", "pe_history"]
+    assert [m["name"] for m in requirements["missing_calculations"]] == [
+        "pe_5y_percentile",
+        "pe_history_percentile",
+    ]
+    assert all(
+        m["missing_inputs"] == ["eps_ttm", "pe_history"]
+        for m in requirements["missing_calculations"]
+    )
     assert requirements["satisfied_operands"] == list(REQUIREMENTS["valuation"].operands)
     assert requirements["missing_operands"] == [] and requirements["missing_research_intents"] == []
     assert requirements["executed_research_intents"] == list(
@@ -831,7 +849,11 @@ async def test_valuation_question_end_to_end() -> None:
         "the question asks about valuation but the P/E's five-year percentile could not be "
         "computed: missing eps_ttm, pe_history"
     )
-    assert requirements["uncertainties"] == [unmet]
+    unmet_history = (
+        "the question asks about valuation but the P/E's percentile over its full available "
+        "history could not be computed: missing eps_ttm, pe_history"
+    )
+    assert requirements["uncertainties"] == [unmet, unmet_history]
     assert unmet in result["assessment"]["uncertainties"]
     # the classification is on research.started and no question_scan stage ran
     started = [e["data"] for e in events if e["event"] == "research.started"]
@@ -855,7 +877,12 @@ async def test_valuation_question_end_to_end() -> None:
     # every required valuation calculation is in the result, computed or honestly unavailable
     by_name = {c["name"]: c for c in result["calculations"]}
     assert by_name["pe_5y_percentile"]["status"] == "unavailable"
+    assert by_name["pe_history_percentile"]["status"] == "unavailable"
     assert by_name["pe_ttm"]["status"] == "computed"
+    # the reconciliation the valuation question requires is PR E's record, not a second copy
+    reconciliation = by_name["valuation_reconciliation_1y"]
+    assert reconciliation["status"] == "computed"
+    assert reconciliation["meta"]["reconciliation"]["verdict"] in RECONCILIATION_VERDICTS
 
 
 async def test_thesis_change_question_end_to_end() -> None:
