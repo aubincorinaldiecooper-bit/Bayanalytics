@@ -9,9 +9,9 @@ overrides them with Laya's recorded decision (Spark explains, it does not decide
 from __future__ import annotations
 
 import re
-from typing import Any, Literal, cast
+from typing import Any, cast
 
-from bayanalytics.schemas.common import Stance
+from bayanalytics.schemas.common import SINGLE_HORIZONS, Stance
 from bayanalytics.schemas.results import Assessment, EvidenceItem, HorizonAssessment
 from bayanalytics.spark.prompt import SECTION_HEADINGS, STANCES
 
@@ -53,6 +53,10 @@ def canonical_heading(text: str) -> str | None:
     horizon = _HORIZON_RE.match(raw)
     if horizon:
         name = re.sub(r"[^a-z0-9]+", "_", horizon.group(1).lower()).strip("_")
+        for known in (*SINGLE_HORIZONS, "multi_horizon"):
+            if name == known or name.startswith(f"{known}_"):
+                name = known
+                break
         return f"{HORIZON_KEY_PREFIX}{name}" if name else None
     return _NORMALIZED_HEADINGS.get(re.sub(r"[^a-z0-9]+", "", raw.lower()))
 
@@ -221,6 +225,3 @@ def to_assessment(
     for source_id in unknown:
         warnings.append(f"spark cited unknown source [{source_id}]")
     return assessment, horizons, warnings
-
-
-ParsedKey = Literal["summary"]

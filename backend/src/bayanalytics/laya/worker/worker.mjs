@@ -48,8 +48,8 @@ function send(obj, cb) {
   process.stdout.write(JSON.stringify(obj) + "\n", cb);
 }
 
-function ok(id, result) {
-  send({ id, ok: true, result });
+function ok(id, result, cb) {
+  send({ id, ok: true, result }, cb);
 }
 
 function fail(id, code, message) {

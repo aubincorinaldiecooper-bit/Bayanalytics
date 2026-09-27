@@ -93,7 +93,7 @@ _UNIT_WORDS: dict[str, str] = {
     "percent": "percent",
     "pct": "percent",
     "x": "ratio",
-    "×": "ratio",
+    "\u00d7": "ratio",
     "times": "ratio",
     "shares": "shares",
     "share": "shares",
@@ -104,7 +104,7 @@ _UNIT_WORDS: dict[str, str] = {
     "bps": "bp",
 }
 
-_MINUS_CHARS = "−–—-"  # unicode minus, en dash, em dash, hyphen-minus
+_MINUS_CHARS = "\u2212\u2013\u2014-"  # unicode minus, en dash, em dash, hyphen-minus
 
 
 class ParsedNumber(NamedTuple):
@@ -193,19 +193,19 @@ def parse_number(text: str) -> ParsedNumber:
 
     Handles currency symbols and codes (``$1.2B``, ``€3.4M``, ``USD 1,234``, ``1,234 USD``),
     thousands separators (``12,345.67``), accounting negatives ``(1,234)``, unicode minus
-    ``−7.4%``, percent, multiples (``1.5x`` / ``1.5×``), share counts (``15.3B shares``), and
-    scale suffixes or words (``K/M/B/T``, ``mn/bn``, ``million``, ``billion``). ``value`` is the
-    number in base units (``$1.2B`` -> ``1.2e9``) and ``scale_applied`` records the canonical
-    scale (``"B"``) that was multiplied in, or ``""``.
+    ``-7.4%`` written with U+2212, percent, multiples (``1.5x`` or U+00D7), share counts
+    (``15.3B shares``), and scale suffixes or words (``K/M/B/T``, ``mn/bn``, ``million``,
+    ``billion``). ``value`` is the number in base units (``$1.2B`` -> ``1.2e9``) and
+    ``scale_applied`` records the canonical scale (``"B"``) that was multiplied in, or ``""``.
 
     Raises ``ValueError`` when the text is not a number; see :func:`try_parse_number` for the
-    non-raising form. Nothing is ever guessed: a currency is reported only when one is
-    written in the text.
+    non-raising form. Nothing is ever guessed: a currency is reported only when one is written
+    in the text.
     """
     if text is None:
         raise ValueError("no text to parse")
     original = text
-    text = text.strip().replace(" ", " ")
+    text = text.strip().replace("\u00a0", " ")
     if not text:
         raise ValueError("empty text")
 
@@ -224,7 +224,8 @@ def parse_number(text: str) -> ParsedNumber:
 
     if currency is None:
         text, currency = _strip_currency(text)
-        if text and text[0] in _MINUS_CHARS:
+        if currency is not None and text and text[0] in _MINUS_CHARS:
+            # "-$1.2B": the sign preceded the symbol; "$-1.2B" was handled above.
             negative = True
             text = text[1:].lstrip()
 
@@ -250,7 +251,7 @@ def parse_number(text: str) -> ParsedNumber:
     text = " ".join(tokens)
 
     # Attached suffixes: "1.2B", "1.5x", "18.2pct", "1.2bn", "3.4M".
-    match = re.fullmatch(r"([^A-Za-z×%]+?)\s*([A-Za-z×]+)?", text)
+    match = re.fullmatch(r"([^A-Za-z\u00d7%]+?)\s*([A-Za-z\u00d7]+)?", text)
     if match is None:
         raise ValueError(f"not a number: {original!r}")
     number_text, suffix = match.group(1).strip(), match.group(2)

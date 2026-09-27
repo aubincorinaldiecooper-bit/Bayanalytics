@@ -89,8 +89,8 @@ class AnalysisContext:
     timers: StageTimers = field(default_factory=StageTimers)
     diagnostics: dict[str, Any] = field(default_factory=dict)
 
-    async def event(self, name: str, **data: Any) -> None:
-        await self.emit(name, data)
+    async def event(self, event_name: str, /, **data: Any) -> None:
+        await self.emit(event_name, data)
 
     def check_cancelled(self) -> None:
         self.cancel.check()

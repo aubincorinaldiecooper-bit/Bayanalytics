@@ -345,6 +345,40 @@ def synthesis_gate_questions() -> dict[str, LayaQuestion]:
     )
 
 
+def overall_scan_questions() -> dict[str, LayaQuestion]:
+    """One batch over the whole normalised evidence summary (orchestrator "evidence_scan").
+
+    State: latest metrics, source/primary counts, conflicts, freshness warnings, headlines.
+    """
+    return _batch(
+        "material_change",
+        "guidance_trend",
+        "sentiment_trend",
+        "volatility_regime",
+        "evidence_stance",
+        "escalate_to_spark",
+        "stale_evidence_matters",
+        "calculation_pack",
+    )
+
+
+def text_evidence_questions() -> dict[str, LayaQuestion]:
+    """Judge one retrieved text source: is it material, and which way does it point."""
+    return _batch("source_is_material", "evidence_stance")
+
+
+def horizon_context_questions(horizons: Iterable[str]) -> dict[str, LayaQuestion]:
+    """Horizon stances plus the valuation / benchmark / drawdown / durability judgements that
+    are only answerable once the deterministic calculations are in the state."""
+    batch = horizon_questions(horizons)
+    batch.update(
+        _batch(
+            "valuation_extremeness", "benchmark_relative", "drawdown_nature", "growth_durability"
+        )
+    )
+    return batch
+
+
 BUILDERS = (
     research_plan_questions,
     evidence_scan_questions,
@@ -352,6 +386,9 @@ BUILDERS = (
     calculation_questions,
     lambda: horizon_questions(SINGLE_HORIZONS),
     synthesis_gate_questions,
+    overall_scan_questions,
+    text_evidence_questions,
+    lambda: horizon_context_questions(SINGLE_HORIZONS),
 )
 
 

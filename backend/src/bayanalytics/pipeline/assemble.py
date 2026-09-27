@@ -418,11 +418,22 @@ def finalize_assessment(
     def cited(items: list[EvidenceItem]) -> list[EvidenceItem]:
         return [i for i in items if i.source_ids and all(s in known for s in i.source_ids)]
 
-    assessment.fundamentals = sections["fundamentals"]
-    assessment.valuation = sections["valuation"]
-    assessment.benchmark_context = sections["benchmark_context"]
-    assessment.historical_context = sections["historical_context"]
-    assessment.market_context = sections["market_context"]
+    for key in (
+        "fundamentals",
+        "valuation",
+        "benchmark_context",
+        "historical_context",
+        "market_context",
+    ):
+        structured = sections[key]
+        narrative = getattr(assessment, key)
+        if isinstance(narrative, dict) and (narrative.get("text") or narrative.get("items")):
+            structured["narrative"] = {
+                "text": narrative.get("text", ""),
+                "items": narrative.get("items", []),
+                "source_ids": [s for s in narrative.get("source_ids", []) if s in known],
+            }
+        setattr(assessment, key, structured)
     assessment.bull_evidence = bull + cited(assessment.bull_evidence)
     assessment.bear_evidence = bear + cited(assessment.bear_evidence)
     assessment.risks = risks + [r for r in assessment.risks if r.text]

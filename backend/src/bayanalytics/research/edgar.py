@@ -172,6 +172,43 @@ class EdgarSubmissions(BaseModel):
         return rows[:limit]
 
 
+def select_filings(
+    submissions: EdgarSubmissions,
+    forms: tuple[str, ...] = DEFAULT_FILING_FORMS,
+    limit: int = 6,
+    as_of: datetime | date | None = None,
+    *,
+    per_form_caps: dict[str, int] | None = None,
+) -> list[Filing]:
+    """Latest filings with guaranteed coverage: one 10-K, two 10-Qs, then newest of the rest.
+
+    ``latest_filings`` alone lets a run of 8-Ks crowd out the annual report; this keeps the
+    most recent annual and quarterly reports (when requested) and fills the remaining slots by
+    date. The result is sorted newest first and capped at ``limit``.
+    """
+    caps = {"10-K": 1, "10-Q": 2, "20-F": 1, "40-F": 1}
+    if per_form_caps:
+        caps.update(per_form_caps)
+    chosen: list[Filing] = []
+    seen: set[str] = set()
+    for form in forms:
+        cap = caps.get(form)
+        if cap is None:
+            continue
+        for filing in submissions.latest_filings((form,), cap, as_of):
+            if filing.accession not in seen and len(chosen) < limit:
+                chosen.append(filing)
+                seen.add(filing.accession)
+    for filing in submissions.latest_filings(forms, limit + len(chosen), as_of):
+        if len(chosen) >= limit:
+            break
+        if filing.accession not in seen:
+            chosen.append(filing)
+            seen.add(filing.accession)
+    chosen.sort(key=lambda f: (f.filing_date, f.accession), reverse=True)
+    return chosen[:limit]
+
+
 class CompanyFacts(BaseModel):
     cik: int
     entity_name: str | None = None

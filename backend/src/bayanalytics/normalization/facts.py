@@ -44,10 +44,16 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
-from bayanalytics.normalization.periods import classify_duration, period_from_xbrl
+from bayanalytics.normalization.periods import (
+    NINE_MONTH_DAYS,
+    QUARTER_DAYS,
+    YEAR_DAYS,
+    classify_duration,
+    period_from_xbrl,
+)
 from bayanalytics.schemas.common import Freshness
 from bayanalytics.schemas.evidence import (
     Conflict,
@@ -153,7 +159,7 @@ def default_fact_id(row: dict[str, Any]) -> str:
         repr(row.get("value")),
         str(row.get("filed")),
     ]
-    digest = hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()  # noqa: S324
+    digest = hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()
     return f"fact_{digest[:12]}"
 
 
@@ -185,9 +191,7 @@ class _Row:
         return self.metric, self.period.key(), self.basis
 
 
-def _prepare_rows(
-    rows: Iterable[dict[str, Any]], as_of: datetime, build: FactBuild
-) -> list[_Row]:
+def _prepare_rows(rows: Iterable[dict[str, Any]], as_of: datetime, build: FactBuild) -> list[_Row]:
     as_of_date = as_of.date() if isinstance(as_of, datetime) else as_of
     prepared: list[_Row] = []
     for index, row in enumerate(rows):
@@ -361,11 +365,14 @@ def build_facts(
         leaked = sum(1 for d in build.dropped if "after as_of" in d["reason"])
         if leaked:
             build.notes.append(
-                f"{leaked} row(s) dated after as_of {as_of.date().isoformat()} dropped (leakage guard)"
+                f"{leaked} row(s) dated after as_of {as_of.date().isoformat()} dropped "
+                "(leakage guard)"
             )
         other = len(build.dropped) - leaked
         if other:
-            build.notes.append(f"{other} row(s) dropped as unusable (missing metric, value or date)")
+            build.notes.append(
+                f"{other} row(s) dropped as unusable (missing metric, value or date)"
+            )
     return build
 
 
@@ -425,7 +432,8 @@ def _resolve_group(
                 )
     # Restatement chain across filing dates: the latest filed value wins.
     dated = sorted(
-        (r for r in members if r.filed is not None), key=lambda r: (r.filed, r.source_id)  # type: ignore[arg-type,return-value]
+        (r for r in members if r.filed is not None),
+        key=lambda r: (r.filed, r.source_id),  # type: ignore[arg-type,return-value]
     )
     undated = [r for r in members if r.filed is None]
     if len(dated) >= 2 and dated[0].filed != dated[-1].filed:
@@ -465,7 +473,8 @@ def _resolve_group(
                             for r in (original, latest)
                         ],
                         material=True,
-                        note="material restatement; the later filing is used, the original is preserved",
+                        note="material restatement; the later filing is used, "
+                        "the original is preserved",
                     )
                 )
         else:
@@ -749,7 +758,8 @@ def freshness_summary(
         elif fact_block["latest_quarter_freshness"] != "current":
             warnings.append(
                 f"latest quarterly fundamentals are {age(quarter_end)} days old "
-                f"(period ended {quarter_end.isoformat()}; {fact_block['latest_quarter_freshness']})"
+                f"(period ended {quarter_end.isoformat()}; "
+                f"{fact_block['latest_quarter_freshness']})"
             )
         if annual_end is not None and fact_block["latest_annual_freshness"] == "stale":
             warnings.append(
@@ -802,7 +812,9 @@ def detect_stale_mix(
     as_of_date = as_of.date()
     latest_price_date = max(point.date for point in price_series.points)
     price_freshness = classify_freshness(latest_price_date, as_of, "price")
-    price_desc = f"{price_series.price_type.replace('_', ' ')} price dated {latest_price_date.isoformat()}"
+    price_desc = (
+        f"{price_series.price_type.replace('_', ' ')} price dated {latest_price_date.isoformat()}"
+    )
     if price_series.price_type in ("intraday", "pre_market", "after_hours"):
         warnings.append(
             f"latest price is a {price_series.price_type.replace('_', ' ')} print, not a "
@@ -842,3 +854,119 @@ def detect_stale_mix(
     else:
         warnings.append(f"{price_desc} has no fundamentals to pair with")
     return warnings
+
+
+# Flow metrics that add across periods; per-share and instant metrics are never derived.
+ADDITIVE_METRICS: frozenset[str] = frozenset(
+    {
+        "revenue",
+        "gross_profit",
+        "operating_income",
+        "net_income",
+        "operating_cash_flow",
+        "capex",
+        "research_and_development",
+        "depreciation_amortization",
+    }
+)
+
+
+def derive_fourth_quarter_rows(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    """EDGAR company facts never tag a Q4 duration: the 10-K carries the fiscal year and the
+    Q3 10-Q carries the nine-month year-to-date figure. For additive flow metrics this derives
+    ``Q4 = FY - nine-month YTD`` when both share the same fiscal-year start, basis and currency,
+    and no explicit fourth quarter already exists. Derived rows carry ``fp="Q4"``, the 10-K's
+    ``filed``/``accn``/``source_id`` and ``extraction_method="derived_q4"`` with the two
+    contributing rows listed under ``derived_from``. Input rows are returned unchanged first.
+    """
+    rows = list(rows)
+    out = list(rows)
+    fy_rows: dict[tuple[str, str, str, int, str], list[dict[str, Any]]] = {}
+    ytd_rows: dict[tuple[str, str, str, int, str], list[dict[str, Any]]] = {}
+    explicit_q4: set[tuple[str, str, str, int]] = set()
+    for row in rows:
+        metric = row.get("metric")
+        if metric not in ADDITIVE_METRICS or row.get("value") is None:
+            continue
+        try:
+            start = _iso_date(row.get("start"))
+            end = _iso_date(row.get("end"))
+        except ValueError:
+            continue
+        if start is None or end is None:
+            continue
+        fy = row.get("fy")
+        if not isinstance(fy, int):
+            continue
+        basis = str(row.get("basis") or "gaap")
+        currency = str(row.get("currency") or "USD").upper()
+        days = (end - start).days + 1
+        key = (str(metric), basis, currency, fy, start.isoformat())
+        if YEAR_DAYS[0] <= days <= YEAR_DAYS[1]:
+            fy_rows.setdefault(key, []).append(row)
+        elif NINE_MONTH_DAYS[0] <= days <= NINE_MONTH_DAYS[1]:
+            ytd_rows.setdefault(key, []).append(row)
+        elif QUARTER_DAYS[0] <= days <= QUARTER_DAYS[1] and (
+            str(row.get("fp") or "").upper() == "Q4"
+        ):
+            explicit_q4.add((str(metric), basis, currency, fy))
+
+    def _filed(row: dict[str, Any]) -> date:
+        try:
+            return _iso_date(row.get("filed")) or date.min
+        except ValueError:
+            return date.min
+
+    for key, candidates in fy_rows.items():
+        metric, basis, currency, fy, _start = key
+        if (metric, basis, currency, fy) in explicit_q4:
+            continue
+        ytd = ytd_rows.get(key)
+        if not ytd:
+            continue
+        fy_row = max(candidates, key=_filed)
+        ytd_row = max(ytd, key=_filed)
+        fy_end = _iso_date(fy_row.get("end"))
+        ytd_end = _iso_date(ytd_row.get("end"))
+        if fy_end is None or ytd_end is None or ytd_end >= fy_end:
+            continue
+        q4_days = (fy_end - ytd_end).days
+        if not (QUARTER_DAYS[0] <= q4_days <= QUARTER_DAYS[1] + 3):
+            continue
+        try:
+            value = float(fy_row["value"]) - float(ytd_row["value"])
+        except (TypeError, ValueError, KeyError):
+            continue
+        out.append(
+            {
+                "concept": f"{fy_row.get('concept')} (derived Q4)",
+                "metric": metric,
+                "value": value,
+                "unit": fy_row.get("unit"),
+                "start": (ytd_end + timedelta(days=1)).isoformat(),
+                "end": fy_end.isoformat(),
+                "fy": fy,
+                "fp": "Q4",
+                "form": fy_row.get("form"),
+                "filed": fy_row.get("filed"),
+                "accn": fy_row.get("accn"),
+                "frame": None,
+                "source_id": fy_row.get("source_id"),
+                "basis": basis,
+                "currency": currency,
+                "extraction_method": "derived_q4",
+                "derived_from": [
+                    {
+                        "concept": fy_row.get("concept"),
+                        "end": fy_row.get("end"),
+                        "accn": fy_row.get("accn"),
+                    },
+                    {
+                        "concept": ytd_row.get("concept"),
+                        "end": ytd_row.get("end"),
+                        "accn": ytd_row.get("accn"),
+                    },
+                ],
+            }
+        )
+    return out

@@ -292,6 +292,9 @@ class LayaWorkerClient:
             finally:
                 if acquired:
                     self._lock.release()
+            # Nothing more will be written; an ended stdin also makes the worker exit by itself.
+            if proc.stdin is not None and not proc.stdin.is_closing():
+                proc.stdin.close()
             try:
                 await asyncio.wait_for(proc.wait(), CLOSE_TIMEOUT_S)
             except TimeoutError:

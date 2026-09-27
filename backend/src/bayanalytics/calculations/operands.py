@@ -24,13 +24,16 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
+from itertools import pairwise
 from typing import Any
 
 from bayanalytics.normalization.periods import (
     is_consecutive_quarters,
-    label as period_label_of,
     ttm_period,
     ttm_window,
+)
+from bayanalytics.normalization.periods import (
+    label as period_label_of,
 )
 from bayanalytics.normalization.sessions import latest_completed_close
 from bayanalytics.schemas.calculations import CalculationInput
@@ -223,7 +226,8 @@ class OperandResolver:
             )
         if fact.restated:
             notes.append(
-                f"restated from {fact.original_value!r} ({fact.original_source_id}) to {fact.value!r}"
+                f"restated from {fact.original_value!r} ({fact.original_source_id}) "
+                f"to {fact.value!r}"
             )
         if fact.extraction_method == "derived":
             notes.append("derived fact: " + "; ".join(fact.notes))
@@ -251,7 +255,7 @@ class OperandResolver:
         chosen = self._choose(same_period)
         return self._operand(chosen, same_period) if chosen else None
 
-    def _for_period(self, metric: str, period: Period) -> Operand | None:
+    def for_period(self, metric: str, period: Period) -> Operand | None:
         facts = [f for f in self.facts(metric) if f.period.key() == period.key()]
         if not facts:
             # Same labelled period under a different key (e.g. dates differ by a day).
@@ -269,14 +273,16 @@ class OperandResolver:
         return self._latest_of_kind(metric, "fiscal_year")
 
     def fy(self, metric: str, fiscal_year: int) -> Operand | None:
-        facts = [f for f in self.facts(metric, "fiscal_year") if f.period.fiscal_year == fiscal_year]
+        facts = [
+            f for f in self.facts(metric, "fiscal_year") if f.period.fiscal_year == fiscal_year
+        ]
         chosen = self._choose(facts)
         return self._operand(chosen, facts) if chosen else None
 
     def fy_years_before(self, metric: str, latest: Operand, years: int) -> Operand | None:
         """The fiscal-year fact ``years`` before ``latest`` (by fiscal_year, else by end date)."""
         facts = self.facts(metric, "fiscal_year")
-        fy = self._period_of(latest)
+        fy = self.period_of(latest)
         if fy is not None and fy.fiscal_year is not None:
             target = [f for f in facts if f.period.fiscal_year == fy.fiscal_year - years]
         else:
@@ -291,7 +297,7 @@ class OperandResolver:
     def latest_fq(self, metric: str) -> Operand | None:
         return self._latest_of_kind(metric, "fiscal_quarter")
 
-    def _period_of(self, operand: Operand) -> Period | None:
+    def period_of(self, operand: Operand) -> Period | None:
         for fact in self.facts(operand.metric):
             if fact.fact_id == operand.fact_id:
                 return fact.period
@@ -299,7 +305,7 @@ class OperandResolver:
 
     def prior_year_quarter(self, metric: str, quarter: Operand) -> Operand | None:
         """The same fiscal quarter one year earlier (fy - 1, same fp; else end ~365 days back)."""
-        period = self._period_of(quarter)
+        period = self.period_of(quarter)
         facts = self.facts(metric, "fiscal_quarter")
         target: list[NormalizedFact] = []
         if period is not None and period.fiscal_year is not None and period.fiscal_period:
@@ -318,13 +324,15 @@ class OperandResolver:
 
     def previous_quarter(self, metric: str, quarter: Operand) -> Operand | None:
         """The fiscal quarter immediately before ``quarter`` (consecutive by end date)."""
-        period = self._period_of(quarter)
+        period = self.period_of(quarter)
         if period is None:
             return None
         facts = [
             f
             for f in self.facts(metric, "fiscal_quarter")
-            if f.period.end and period.end and f.period.end < period.end
+            if f.period.end
+            and period.end
+            and f.period.end < period.end
             and is_consecutive_quarters(f.period, period)
         ]
         chosen = self._choose(facts)
@@ -403,7 +411,9 @@ class OperandResolver:
         chosen = self._choose(same)
         return self._operand(chosen, same) if chosen else None
 
-    def aligned(self, metrics: Sequence[str], kinds: Sequence[str] = ("ttm", "fiscal_year")) -> Aligned:
+    def aligned(
+        self, metrics: Sequence[str], kinds: Sequence[str] = ("ttm", "fiscal_year")
+    ) -> Aligned:
         """Operands for all ``metrics`` sharing one period, trying ``kinds`` in order.
 
         ``"ttm"`` requires every metric to have a TTM ending on the same date; ``"fiscal_year"``
@@ -433,13 +443,15 @@ class OperandResolver:
             candidates = self._common_periods(metrics, kind)
             if candidates:
                 period = candidates[-1]
-                ops = {m: self._for_period(m, period) for m in metrics}
+                ops = {m: self.for_period(m, period) for m in metrics}
                 if all(ops.values()):
                     result.operands = ops  # type: ignore[assignment]
                     result.basis = kind
                     result.period_label = period.label
                     if kind != kinds[0]:
-                        result.notes.append(f"{kinds[0]} unavailable; {period.label} used for all operands")
+                        result.notes.append(
+                            f"{kinds[0]} unavailable; {period.label} used for all operands"
+                        )
                     return result
             result.notes.append(f"no {kind} period has all of: {', '.join(metrics)}")
         result.missing = list(metrics)
@@ -495,8 +507,13 @@ class OperandResolver:
         if point is None or series is None:
             return None
         notes = [f"latest completed close as of {self.as_of.isoformat()}"]
-        if series.price_type in ("intraday", "pre_market", "after_hours") and series.session_date == point.date:
-            notes.append(f"series latest point is labelled {series.price_type}; the completed close was used")
+        if (
+            series.price_type in ("intraday", "pre_market", "after_hours")
+            and series.session_date == point.date
+        ):
+            notes.append(
+                f"series latest point is labelled {series.price_type}; the completed close was used"
+            )
         if not series.split_adjusted:
             notes.append("price series is not split-adjusted")
         return Operand(
@@ -650,7 +667,7 @@ class OperandResolver:
             window = ordered[index - 3 : index + 1]
             if not all(
                 is_consecutive_quarters(earlier.period, later.period)
-                for earlier, later in zip(window, window[1:], strict=False)
+                for earlier, later in pairwise(window)
             ):
                 continue
             quarter_end = window[-1].period.end

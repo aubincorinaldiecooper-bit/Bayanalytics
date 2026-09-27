@@ -99,9 +99,7 @@ def margin(numerator: Number | None, revenue: Number | None) -> float | None:
     return float(numerator) / float(revenue)
 
 
-def margin_change_bp(
-    current_margin: Number | None, previous_margin: Number | None
-) -> float | None:
+def margin_change_bp(current_margin: Number | None, previous_margin: Number | None) -> float | None:
     """Margin expansion (+) or contraction (-) in basis points.
 
     Both margins are fractions (``0.182`` for 18.2 %); ``1 bp = 0.0001``, so the result is
@@ -229,9 +227,7 @@ def returns_series(closes: Sequence[Number | None] | None) -> list[float] | None
     return [float(closes[i]) / float(closes[i - 1]) - 1.0 for i in range(1, len(closes))]
 
 
-def relative_return(
-    asset_return: Number | None, benchmark_return: Number | None
-) -> float | None:
+def relative_return(asset_return: Number | None, benchmark_return: Number | None) -> float | None:
     """Asset return minus benchmark return, in percentage points.
 
     Both inputs are fractions (``0.08`` for +8 %); the result is ``(asset - benchmark) * 100``
@@ -321,9 +317,7 @@ def zscore(value: Number | None, history: Sequence[Number | None] | None) -> flo
     return (float(value) - statistics.fmean(values)) / spread
 
 
-def percentile_rank(
-    value: Number | None, history: Sequence[Number | None] | None
-) -> float | None:
+def percentile_rank(value: Number | None, history: Sequence[Number | None] | None) -> float | None:
     """Percentile rank of ``value`` within ``history`` on a 0..100 scale.
 
     Uses the mid-rank convention for ties: ``(count_below + 0.5 * count_equal) / n * 100``, so a

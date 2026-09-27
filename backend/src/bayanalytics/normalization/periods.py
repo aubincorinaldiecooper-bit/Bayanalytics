@@ -15,6 +15,7 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable, Sequence
 from datetime import date, timedelta
+from itertools import pairwise
 
 from bayanalytics.schemas.evidence import Period, PeriodKind
 
@@ -254,7 +255,7 @@ def ttm_window(quarters: Iterable[Period]) -> list[Period] | None:
     if len(ordered) < 4:
         return None
     window = ordered[-4:]
-    for earlier, later in zip(window, window[1:], strict=False):
+    for earlier, later in pairwise(window):
         if not is_consecutive_quarters(earlier, later):
             return None
     return window

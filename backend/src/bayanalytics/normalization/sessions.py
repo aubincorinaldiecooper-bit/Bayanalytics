@@ -134,9 +134,7 @@ def classify_price_timestamp(
         price_type = "latest_close"
         session_date = completed
         why = "weekend" if today.weekday() >= 5 else ("holiday" if not trading else "closed")
-        text = (
-            f"latest close {completed.isoformat()} (market {why} at {stamp} {exchange_timezone})"
-        )
+        text = f"latest close {completed.isoformat()} (market {why} at {stamp} {exchange_timezone})"
     return SessionInfo(
         price_type=price_type,
         session_date=session_date,
@@ -250,7 +248,9 @@ class TimestampSet:
         return min(known) if known else None
 
 
-def session_view(price: float, series: PriceSeries, retrieved_at: datetime | None) -> dict[str, Any]:
+def session_view(
+    price: float, series: PriceSeries, retrieved_at: datetime | None
+) -> dict[str, Any]:
     """The section-34 example shape for one price: type, exchange, timezone, session date."""
     return {
         "price": price,

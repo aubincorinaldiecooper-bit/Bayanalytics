@@ -160,7 +160,7 @@ async def run_analysis(job: AnalysisJob, ctx: AnalysisContext, rt: Runtime) -> A
                 uncertainties=len(evidence.uncertainties),
                 sources=len(evidence.sources),
                 segments=len(evidence.segments),
-                freshness=evidence.freshness_summary.get("buckets", {}),
+                freshness=_freshness_view(evidence.freshness_summary),
             )
             _evidence_gate(evidence)
             # 4. Laya scoring -----------------------------------------------------------
@@ -216,19 +216,30 @@ async def run_analysis(job: AnalysisJob, ctx: AnalysisContext, rt: Runtime) -> A
             draft.extra_uncertainties.extend(trims)
             messages: list[SparkMessage] = build_messages(fitted, options)
             prompt_estimate = sum(estimate_tokens(m.content) for m in messages)
-            await ctx.event(
-                "spark.started",
-                profile=job.profile,
-                context_ceiling=spec.context_ceiling,
-                prompt_tokens_estimate=prompt_estimate,
-                horizons=horizons,
-            )
+            started = False
+
+            async def emit_started() -> None:
+                nonlocal started
+                if started:
+                    return
+                started = True
+                await ctx.event(
+                    "spark.started",
+                    profile=job.profile,
+                    context_ceiling=spec.context_ceiling,
+                    prompt_tokens_estimate=prompt_estimate,
+                    horizons=horizons,
+                )
 
             async def on_token(text: str) -> None:
+                # spark.loading (if a load happens) is emitted by the client before the first
+                # token, so the answer state begins here, at the first real token.
+                await emit_started()
                 draft.streamed_text += text
                 await ctx.event("spark.token", text=text)
 
             generation = await rt.spark.run(job.profile, messages, on_token, ctx, options)
+            await emit_started()  # an empty generation still marks the answer state
             stats = generation.stats
             await ctx.event(
                 "spark.completed",
@@ -264,6 +275,7 @@ async def run_analysis(job: AnalysisJob, ctx: AnalysisContext, rt: Runtime) -> A
         ctx.timers.stop("total")
         status = "cancelled" if exc.code == ErrorCode.CANCELLED else "failed"
         log.info("analysis %s %s: %s", job.analysis_id, status, exc.code)
+        await _salvage(rt, job, draft, analyzer)
         draft.telemetry = _telemetry(rt, ctx, draft, analyzer, tracker, None)
         if draft.evidence is not None:
             draft.assessment.conflicts = list(draft.evidence.conflicts)
@@ -272,11 +284,32 @@ async def run_analysis(job: AnalysisJob, ctx: AnalysisContext, rt: Runtime) -> A
     except Exception as exc:
         ctx.timers.stop("total")
         log.exception("analysis %s crashed", job.analysis_id)
+        await _salvage(rt, job, draft, analyzer)
         draft.telemetry = _telemetry(rt, ctx, draft, analyzer, tracker, None)
         return draft.result("failed", AnalysisError.from_exception(exc))
 
 
 # ------------------------------------------------------------------------- helpers
+
+
+async def _salvage(rt: Runtime, job: AnalysisJob, draft: _Draft, analyzer: EquityAnalyzer) -> None:
+    """Keep everything already found when a stage fails, so the partial result is inspectable."""
+    if not draft.sources and analyzer.state.sources:
+        draft.sources = list(analyzer.state.sources)
+        job.source_ids = [s.source_id for s in draft.sources]
+    if analyzer.research_decisions and not any(
+        d.stage == "research_plan" for d in draft.decisions.decisions
+    ):
+        draft.decisions.decisions.extend(analyzer.research_decisions)
+    if draft.identity is None and analyzer.identity is not None:
+        draft.identity = analyzer.identity
+    try:
+        if draft.sources:
+            await rt.store.save_sources(job.analysis_id, draft.sources)
+        if draft.decisions.decisions:
+            await rt.store.save_decisions(job.analysis_id, draft.decisions.decisions)
+    except Exception:  # pragma: no cover - persistence of partials is best effort
+        log.exception("could not persist partial artifacts for %s", job.analysis_id)
 
 
 async def _set_status(rt: Runtime, job: AnalysisJob, status: str) -> None:
@@ -305,23 +338,24 @@ def _evidence_gate(evidence: NormalizedEvidence) -> None:
                 "sources": len(evidence.sources),
             },
         )
-    buckets = evidence.freshness_summary.get("buckets", {}) if evidence.freshness_summary else {}
-    if (
-        buckets
-        and buckets.get("stale", 0)
-        and not (buckets.get("current", 0) or buckets.get("recent", 0))
-    ):
-        if not evidence.text_evidence:
-            raise AnalysisError(
-                ErrorCode.STALE_EVIDENCE,
-                details={"freshness": buckets},
-            )
+    facts_buckets = (evidence.freshness_summary or {}).get("facts") or {}
+    prices_fresh = ((evidence.freshness_summary or {}).get("prices") or {}).get("freshness")
+    only_stale_facts = bool(facts_buckets.get("stale")) and not (
+        facts_buckets.get("current") or facts_buckets.get("recent")
+    )
+    if only_stale_facts and prices_fresh in (None, "stale") and not evidence.text_evidence:
+        raise AnalysisError(
+            ErrorCode.STALE_EVIDENCE,
+            details={"freshness": {"facts": facts_buckets, "prices": prices_fresh}},
+        )
 
 
 def _child_pids(rt: Runtime) -> dict[str, int]:
     pids: dict[str, int] = {}
     for name, client in (("laya", rt.laya), ("spark", rt.spark)):
         pid = getattr(client, "pid", None)
+        if pid is None:
+            pid = getattr(getattr(client, "manager", None), "pid", None)
         if callable(pid):
             pid = pid()
         if isinstance(pid, int) and pid > 0:
@@ -382,3 +416,15 @@ def _telemetry(
     except Exception:  # pragma: no cover - telemetry must never break a result
         log.exception("telemetry merge failed")
     return telemetry
+
+
+def _freshness_view(summary: dict[str, Any] | None) -> dict[str, Any]:
+    summary = summary or {}
+    facts = summary.get("facts") or {}
+    prices = summary.get("prices") or {}
+    return {
+        "facts": {k: facts.get(k) for k in ("current", "recent", "stale", "unknown", "total")},
+        "latest_quarter_end": facts.get("latest_quarter_end"),
+        "prices": prices.get("freshness"),
+        "warnings": len(summary.get("warnings") or []),
+    }

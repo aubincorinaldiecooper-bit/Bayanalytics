@@ -38,7 +38,12 @@ from bayanalytics.context import AnalysisContext
 from bayanalytics.errors import AnalysisError
 from bayanalytics.instruments.base import InstrumentIdentity, ResearchBudget
 from bayanalytics.research.dedup import Deduplicator
-from bayanalytics.research.edgar import DEFAULT_FILING_FORMS, EdgarClient, EdgarSubmissions
+from bayanalytics.research.edgar import (
+    DEFAULT_FILING_FORMS,
+    EdgarClient,
+    EdgarSubmissions,
+    select_filings,
+)
 from bayanalytics.research.extract import content_hash
 from bayanalytics.research.intents import PlannedQuery
 from bayanalytics.research.prices import StooqPrices, benchmark_stooq_symbol, select_benchmarks
@@ -352,7 +357,7 @@ class ResearchRunner:
         forms = tuple(planned.params.get("forms") or DEFAULT_FILING_FORMS)
         limit = int(planned.params.get("limit") or 6)
         fetch_budget = self.budget.max_fetch_per_round
-        for filing in subs.latest_filings(forms, limit, as_of):
+        for filing in select_filings(subs, forms, limit, as_of):
             if self._check_budget():
                 break
             ctx.check_cancelled()

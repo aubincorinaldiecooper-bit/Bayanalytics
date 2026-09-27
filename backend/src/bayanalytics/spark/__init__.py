@@ -1,5 +1,8 @@
 """Spark synthesis layer: llama-server client, mock, prompt, bundle fitting and parsing."""
 
+from typing import Any
+
+from bayanalytics.config import Settings
 from bayanalytics.spark.base import (
     ProfileSpec,
     SparkClient,
@@ -61,6 +64,7 @@ __all__ = [
     "estimate_tokens",
     "extract_citations",
     "fit_bundle",
+    "make_spark_client",
     "parse_bullets",
     "parse_sections",
     "parse_stance",
@@ -75,7 +79,7 @@ __all__ = [
 ]
 
 
-def make_spark_client(settings, **kwargs):  # type: ignore[no-untyped-def]
+def make_spark_client(settings: Settings, **kwargs: Any) -> SparkClient:
     """``MockSpark`` for ``spark_mode == "mock"``, otherwise ``LlamaSparkClient``."""
     if settings.spark_mode == "mock":
         return MockSpark(settings, **kwargs)

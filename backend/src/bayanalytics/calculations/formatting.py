@@ -10,7 +10,7 @@ rounds. The conventions:
 * ``percent``: one decimal and a percent sign; the value is already in percent units
   (``18.2`` -> ``18.2%``, ``-7.4`` -> ``-7.4%``).
 * ``percentile``: an ordinal rank (``72nd percentile``).
-* ``ratio``: one decimal and the multiplication sign (``34.1×``).
+* ``ratio``: one decimal and the multiplication sign U+00D7 (``34.1x`` with that sign).
 * ``shares``: compact scale plus the word (``15.3B shares``).
 * ``days``: whole days (``42 days``).
 * ``bp``: whole basis points with an explicit sign (``+120 bp``).
@@ -26,7 +26,7 @@ from collections.abc import Sequence
 from bayanalytics.calculations.primitives import is_number
 
 UNAVAILABLE = "unavailable"
-MULTIPLY_SIGN = "×"
+MULTIPLY_SIGN = "\u00d7"
 
 CURRENCY_SYMBOLS: dict[str, str] = {
     "USD": "$",
@@ -139,16 +139,16 @@ def format_value(
         digits = 1 if decimals is None else decimals
         return f"{number:.{digits}f}%"
     if unit == "percentile":
-        return f"{_ordinal(int(round(number)))} percentile"
+        return f"{_ordinal(round(number))} percentile"
     if unit == "ratio":
         digits = 1 if decimals is None else decimals
         return f"{number:.{digits}f}{MULTIPLY_SIGN}"
     if unit == "bp":
-        whole = int(round(number))
+        whole = round(number)
         sign = "+" if whole > 0 else ""
         return f"{sign}{whole} bp"
     if unit == "days":
-        return f"{int(round(number))} days"
+        return f"{round(number)} days"
     if unit == "shares":
         digits = 1 if decimals is None else decimals
         chosen = pick_scale(number) if scale is None else scale
@@ -157,7 +157,7 @@ def format_value(
             return f"{sign}{abs(number):,.0f} shares"
         return f"{sign}{_format_scaled(number, chosen, digits)} shares"
     if unit == "observations":
-        return f"{int(round(number))} observations"
+        return f"{round(number)} observations"
     if _is_per_share_unit(unit):
         symbol = _money_symbol(unit, currency)
         digits = 2 if decimals is None else decimals

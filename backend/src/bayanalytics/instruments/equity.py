@@ -29,9 +29,9 @@ from bayanalytics.instruments.base import (
 )
 from bayanalytics.instruments.identity import InstrumentResolver
 from bayanalytics.laya.schemas import (
-    evidence_scan_questions,
     history_segment_questions,
-    horizon_questions,
+    horizon_context_questions,
+    overall_scan_questions,
     research_plan_questions,
     text_evidence_questions,
 )
@@ -39,6 +39,7 @@ from bayanalytics.laya.wrapper import LayaFinanceWrapper
 from bayanalytics.normalization import NORMALIZATION_VERSION
 from bayanalytics.normalization.facts import (
     build_facts,
+    derive_fourth_quarter_rows,
     detect_stale_mix,
     freshness_summary,
 )
@@ -176,6 +177,7 @@ class EquityAnalyzer:
                 ctx.check_cancelled()
                 self.state.rounds += 1
                 round_no = self.state.rounds
+                runner.begin_round()
                 await ctx.event(
                     "research.started",
                     round=round_no,
@@ -191,11 +193,11 @@ class EquityAnalyzer:
                         ctx.check_cancelled()
                         await self._execute(runner, planned, identity, request, ctx, round_no)
                     self.state.executed.append(str(intent))
-                    if len(self.state.sources) >= budget.max_sources:
+                    if runner.budget_exhausted or len(self.state.sources) >= budget.max_sources:
                         break
                 gaps = self.compute_gaps(request.resolved_horizon, request.as_of)
                 self.stats = self._merge_stats(runner.stats, gaps)
-                if len(self.state.sources) >= budget.max_sources:
+                if runner.budget_exhausted or len(self.state.sources) >= budget.max_sources:
                     self.state.termination_reason = "max_sources"
                     break
                 decision_intent, sufficient = await self._plan_next(identity, request, gaps, ctx)
@@ -211,7 +213,8 @@ class EquityAnalyzer:
                 plan = [decision_intent]
             else:
                 self.state.termination_reason = "max_rounds"
-        self.stats = self._merge_stats(runner.stats, gaps)
+        runner_stats = runner.finish(self.state.termination_reason or "max_rounds")
+        self.stats = self._merge_stats(runner_stats, gaps)
         self.stats.termination_reason = self.state.termination_reason
         self.stats.search_rounds = self.state.rounds
         self.stats.intents = list(self.state.executed)
@@ -343,7 +346,7 @@ class EquityAnalyzer:
     # ------------------------------------------------------------------ normalize
     def _quick_facts(self, as_of: datetime) -> list[NormalizedFact]:
         try:
-            return build_facts(self.state.rows, as_of).facts
+            return build_facts(derive_fourth_quarter_rows(self.state.rows), as_of).facts
         except Exception:  # pragma: no cover - defensive; normalize() surfaces real errors
             return []
 
@@ -353,7 +356,7 @@ class EquityAnalyzer:
         assert self.identity is not None
         as_of = self._as_of
         with ctx.timers.span("normalization"):
-            fact_build = build_facts(self.state.rows, as_of)
+            fact_build = build_facts(derive_fourth_quarter_rows(self.state.rows), as_of)
             prices = (
                 label_series(self.state.price_series, as_of) if self.state.price_series else None
             )
@@ -484,7 +487,7 @@ class EquityAnalyzer:
         }
         sets.append(
             LayaQuestionSet(
-                stage="evidence_scan", state=scan_state, questions=evidence_scan_questions()
+                stage="evidence_scan", state=scan_state, questions=overall_scan_questions()
             )
         )
         for segment in evidence.segments[-_MAX_SEGMENTS_FOR_LAYA:]:
@@ -545,7 +548,9 @@ class EquityAnalyzer:
             "freshness_warnings": evidence.freshness_summary.get("warnings", [])[:2],
         }
         return [
-            LayaQuestionSet(stage="horizon", state=state, questions=horizon_questions(horizons))
+            LayaQuestionSet(
+                stage="horizon", state=state, questions=horizon_context_questions(horizons)
+            )
         ]
 
     # ------------------------------------------------------------------ calculate
@@ -595,12 +600,21 @@ class EquityAnalyzer:
         }
         unavailable = [c.name for c in calculations.calculations if c.status != "computed"]
         laya_assessments: dict[str, Any] = {}
+        scan_view: dict[str, Any] = {}
         for decision in decisions.decisions:
-            if decision.stage in {"evidence_scan", "horizon"}:
-                laya_assessments[decision.decision_type] = {
+            if decision.stage not in {"evidence_scan", "horizon"}:
+                continue
+            if decision.decision_type.startswith("horizon_stance_"):
+                laya_assessments[decision.decision_type.removeprefix("horizon_stance_")] = {
+                    "stance": decision.decision,
+                    "confidence": round(decision.confidence, 3),
+                }
+            else:
+                scan_view[decision.decision_type] = {
                     "decision": decision.decision,
                     "confidence": round(decision.confidence, 3),
                 }
+        laya_assessments["scan"] = scan_view
         important_events = []
         for segment in evidence.segments:
             seg_decisions = [d for d in decisions.decisions if d.segment_id == segment.segment_id]
