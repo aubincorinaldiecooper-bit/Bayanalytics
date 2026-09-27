@@ -93,7 +93,9 @@ for the newest completed result of the same instrument created before the curren
 (`AnalysisStore.latest_completed_result(symbol, before=job.created_at)`; Postgres joins
 `results` with the job's resolved symbol and uses `analyses_instrument_symbol_idx`, schema
 version 2). `pipeline/thesis.py::diff_assessments` compares structured fields only: the
-overall and per-horizon stances (previous, current, changed), every calculation in
+overall and per-horizon stances (previous, current, changed; the overall stance only over
+the horizons both runs assessed, so a narrower or different scope is not a change of thesis
+and `horizon_scope_changed` records it), every calculation in
 `THESIS_METRICS` that both runs computed (value then, value now, delta), conflicts and
 uncertainties that appeared or went away, and the freshness change (new quarter, newer
 prices). The result carries it as `thesis_diff` (recomputed once the final stances and

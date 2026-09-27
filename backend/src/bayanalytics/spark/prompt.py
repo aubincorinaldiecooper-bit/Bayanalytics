@@ -15,8 +15,9 @@ Bundle entry shapes this module reads (all keys optional, unknown keys ignored):
 - ``conflicts``: ``Conflict.model_dump()`` dicts;
 - ``laya_assessments``: ``{horizon: {"stance": ..., "confidence": ...}}`` or ``{horizon: stance}``;
 - ``prior_assessment``: ``pipeline.thesis.prior_assessment_block`` (``analysis_id``, ``as_of``,
-  ``stances``, ``metrics``, ``new_conflicts``, ``resolved_conflicts``, ``freshness``,
-  ``summary``), rendered as at most ``PRIOR_MAX_LINES`` lines.
+  ``stances``, ``horizon_scope_changed``, ``overall_compared_horizons``, ``metrics``,
+  ``new_conflicts``, ``resolved_conflicts``, ``freshness``, ``summary``), rendered as at most
+  ``PRIOR_MAX_LINES`` lines.
 """
 
 from __future__ import annotations
@@ -244,6 +245,16 @@ def render_prior_assessment(prior: dict[str, Any] | None) -> list[str]:
         if not isinstance(stance, dict):
             continue
         scope = clean_text(stance.get("scope") or "", 30)
+        if scope == "overall" and prior.get("horizon_scope_changed"):
+            shared = [
+                clean_text(h, 20)
+                for h in prior.get("overall_compared_horizons") or []
+                if isinstance(h, str)
+            ]
+            if not shared:
+                lines.append("- stance overall: not compared (the runs share no horizon)")
+                continue
+            scope = f"overall over the horizons both runs assessed ({', '.join(shared)})"
         previous = clean_text(stance.get("previous") or "not assessed", 20)
         current = clean_text(stance.get("current") or "not assessed", 20)
         flag = "changed" if stance.get("changed") else "unchanged"

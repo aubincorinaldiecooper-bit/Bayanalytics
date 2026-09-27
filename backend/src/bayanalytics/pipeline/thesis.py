@@ -196,10 +196,16 @@ def diff_assessments(
     before = snapshot_of_result(previous)
     now = current if isinstance(current, ThesisSnapshot) else snapshot_of_result(current)
 
+    ordered = [h for h in SINGLE_HORIZONS if h in before.stances or h in now.stances]
+    ordered += sorted((set(before.stances) | set(now.stances)) - set(ordered))
+    # The overall stance is compared over the horizons both runs assessed: a near-term run
+    # after a multi-horizon one covers less, which is a change of scope, not of thesis.
+    shared = [h for h in ordered if h in before.stances and h in now.stances]
     overall = StanceChange(
         scope="overall",
-        previous=overall_stance(before.stances),
-        current=overall_stance(now.stances),
+        previous=overall_stance({h: before.stances[h] for h in shared}),
+        current=overall_stance({h: now.stances[h] for h in shared}),
+        compared_horizons=shared,
     )
     overall.changed = (
         overall.previous is not None
@@ -207,8 +213,6 @@ def diff_assessments(
         and overall.previous != overall.current
     )
     horizons: list[StanceChange] = []
-    ordered = [h for h in SINGLE_HORIZONS if h in before.stances or h in now.stances]
-    ordered += sorted((set(before.stances) | set(now.stances)) - set(ordered))
     for horizon in ordered:
         item = StanceChange(
             scope=horizon, previous=before.stances.get(horizon), current=now.stances.get(horizon)
@@ -278,6 +282,7 @@ def diff_assessments(
         resolved_uncertainties=[u for u in before.uncertainties if u not in cur_unc],
         freshness=freshness,
         stance_changed=overall.changed or any(h.changed for h in horizons),
+        horizon_scope_changed=set(before.stances) != set(now.stances),
     )
     diff.summary = summarize(diff)
     return diff
@@ -288,7 +293,7 @@ def summarize(diff: ThesisDiff) -> list[str]:
     lines: list[str] = []
     when = diff.previous_as_of.date().isoformat()
     lines.append(f"prior assessment {diff.previous_analysis_id} as of {when}")
-    lines.append(_stance_line("overall stance", diff.overall))
+    lines.append(_overall_line(diff))
     for item in diff.horizons:
         lines.append(_stance_line(HORIZON_LABELS.get(item.scope, item.scope), item))
     for metric in diff.metrics:
@@ -314,6 +319,15 @@ def summarize(diff: ThesisDiff) -> list[str]:
     if f.newer_prices:
         lines.append(f"prices now to {f.current_price_date} (were to {f.previous_price_date})")
     return lines
+
+
+def _overall_line(diff: ThesisDiff) -> str:
+    if not diff.horizon_scope_changed:
+        return _stance_line("overall stance", diff.overall)
+    if not diff.overall.compared_horizons:
+        return "overall stance: not compared (the two assessments share no horizon)"
+    shared = ", ".join(diff.overall.compared_horizons)
+    return _stance_line(f"overall stance over the horizons both assessed ({shared})", diff.overall)
 
 
 def _stance_line(label: str, item: StanceChange) -> str:
@@ -351,6 +365,8 @@ def prior_assessment_block(diff: ThesisDiff) -> dict[str, Any]:
         "as_of": diff.previous_as_of.isoformat(),
         "horizon": diff.previous_horizon,
         "stance_changed": diff.stance_changed,
+        "horizon_scope_changed": diff.horizon_scope_changed,
+        "overall_compared_horizons": list(diff.overall.compared_horizons),
         "stances": [
             {
                 "scope": s.scope,

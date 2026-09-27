@@ -175,8 +175,10 @@ Notes for the client (from a real-HTTP simulation of the frontend reducer):
   `current`, `changed`), `metrics` (each calculation both runs computed: `previous_value`,
   `current_value`, `delta`, displays, period labels, calc ids), `new_conflicts` /
   `resolved_conflicts`, `new_uncertainties` / `resolved_uncertainties`, `freshness`
-  (`new_quarter`, `newer_prices` with both dates), `stance_changed` and a deterministic
-  `summary` list. It is `null` when no prior assessment exists, and `assessment.uncertainties`
+  (`new_quarter`, `newer_prices` with both dates), `stance_changed`, `horizon_scope_changed`
+  and a deterministic `summary` list. The overall stance is compared over the horizons both
+  runs assessed (`overall.compared_horizons`), so a run that covers fewer or other horizons
+  is not reported as a change of thesis. It is `null` when no prior assessment exists, and `assessment.uncertainties`
   then says so. Only structured fields are compared; the earlier narrative is never reused.
   Spark receives the same comparison as a bounded "Prior assessment" block in its evidence.
   The lookup is single-tenant: analyses carry no owner yet, so it spans the whole store;

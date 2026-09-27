@@ -177,7 +177,9 @@ def test_changed_stance_is_reported_with_previous_values() -> None:
         "previous": "bullish",
         "current": "mixed",
         "changed": True,
+        "compared_horizons": ["near_term", "next_cycle", "medium_term", "long_term"],
     }
+    assert diff.horizon_scope_changed is False
     by_scope = {h.scope: h for h in diff.horizons}
     assert list(by_scope) == ["near_term", "next_cycle", "medium_term", "long_term"]
     assert by_scope["medium_term"].previous == "bullish"
@@ -257,12 +259,17 @@ def test_new_and_resolved_conflicts_uncertainties_and_freshness() -> None:
         "current_price_date": "2026-09-25",
         "newer_prices": True,
     }
-    # A horizon assessed only now is recorded, not counted as a change; overall stays neutral
-    # -> bearish is a change of the overall stance.
+    # A horizon assessed only now is recorded, not counted as a change, and the overall stance
+    # compares the one horizon both runs assessed: a wider scope is not a change of thesis.
     by_scope = {h.scope: h for h in diff.horizons}
     assert by_scope["next_cycle"].previous is None and by_scope["next_cycle"].changed is False
-    assert diff.overall.previous == "neutral" and diff.overall.current == "bearish"
-    assert diff.stance_changed is True
+    assert diff.overall.previous == "neutral" and diff.overall.current == "neutral"
+    assert diff.overall.compared_horizons == ["near_term"] and diff.overall.changed is False
+    assert diff.horizon_scope_changed is True and diff.stance_changed is False
+    assert (
+        "overall stance over the horizons both assessed (near_term): neutral (unchanged)"
+        in diff.summary
+    )
     assert "new conflicts: eps_diluted; net_income Q3 FY2026" in diff.summary
     assert "conflicts no longer present: revenue Q2 FY2026" in diff.summary
     assert (
@@ -271,6 +278,51 @@ def test_new_and_resolved_conflicts_uncertainties_and_freshness() -> None:
     )
     assert "prices now to 2026-09-25 (were to 2026-06-30)" in diff.summary
     assert "Next cycle (next earnings / quarter): bearish (not assessed previously)" in diff.summary
+
+
+def test_narrower_horizon_scope_is_not_a_change_of_overall_stance() -> None:
+    # A multi-horizon run that aggregates to mixed, then a near-term run that is still
+    # bullish on the near term: the scope narrowed, the thesis did not change.
+    previous = make_result(
+        "an_prev", T0, {"near_term": "bullish", "long_term": "bearish"}, _baseline_calcs()
+    )
+    current = make_result(
+        "an_cur", T1, {"near_term": "bullish"}, _baseline_calcs(), horizon="near_term"
+    )
+    diff = diff_assessments(previous, current)
+    assert diff.overall.previous == "bullish" and diff.overall.current == "bullish"
+    assert diff.overall.compared_horizons == ["near_term"] and diff.overall.changed is False
+    assert diff.horizon_scope_changed is True and diff.stance_changed is False
+    by_scope = {h.scope: h for h in diff.horizons}
+    assert by_scope["long_term"].current is None and by_scope["long_term"].changed is False
+    assert (
+        "overall stance over the horizons both assessed (near_term): bullish (unchanged)"
+        in diff.summary
+    )
+    lines = render_prior_assessment(prior_assessment_block(diff))
+    assert (
+        "- stance overall over the horizons both runs assessed (near_term): then bullish, "
+        "now bullish (unchanged)"
+    ) in lines
+    assert not any("mixed" in line and "overall" in line for line in lines)
+    # A real change on the shared horizon is still reported.
+    moved = make_result("an_cur", T1, {"near_term": "bearish"}, _baseline_calcs())
+    diff = diff_assessments(previous, moved)
+    assert diff.overall.previous == "bullish" and diff.overall.current == "bearish"
+    assert diff.overall.changed is True and diff.stance_changed is True
+
+
+def test_disjoint_horizon_scopes_are_not_compared_overall() -> None:
+    previous = make_result("an_prev", T0, {"long_term": "bearish"}, _baseline_calcs())
+    current = make_result("an_cur", T1, {"near_term": "bullish"}, _baseline_calcs())
+    diff = diff_assessments(previous, current)
+    assert diff.overall.previous is None and diff.overall.current is None
+    assert diff.overall.compared_horizons == [] and diff.overall.changed is False
+    assert diff.horizon_scope_changed is True and diff.stance_changed is False
+    assert "overall stance: not compared (the two assessments share no horizon)" in diff.summary
+    lines = render_prior_assessment(prior_assessment_block(diff))
+    assert "- stance overall: not compared (the runs share no horizon)" in lines
+    assert "- stance long_term: then bearish, now not assessed (unchanged)" in lines
 
 
 def test_metrics_are_compared_only_when_computed_in_both_with_one_unit() -> None:
@@ -338,7 +390,12 @@ def test_snapshot_input_and_prior_block_are_bounded() -> None:
     assert lines[0].startswith(
         "Prior assessment (deterministic comparison with analysis an_prev as of 2026-06-30"
     )
-    assert "- stance overall: then bullish, now bearish (changed)" in lines
+    assert (
+        "- stance overall over the horizons both runs assessed (near_term): then bullish, "
+        "now bearish (changed)"
+    ) in lines
+    assert block["horizon_scope_changed"] is True
+    assert block["overall_compared_horizons"] == ["near_term"]
     assert "- stance near_term: then bullish, now bearish (changed)" in lines
     assert "- revenue_growth_yoy: then 1.0%, now 2.0% (+1.0 points) [p -> q]" in lines
     assert "- new conflict: n0 Q3 FY2026" in lines and "- conflict gone: m0 Q3 FY2026" in lines
