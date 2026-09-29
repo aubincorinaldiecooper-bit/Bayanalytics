@@ -880,3 +880,28 @@ def test_redacted_settings_hide_paths_and_email() -> None:
     assert red["database_url"] == "***" and red["api_key"] == "***"
     assert red["spark_model_path"] == ".../model-q4.gguf"
     assert red["research_contact_email"] == "***"
+
+
+async def test_healthz_is_unauthed_but_versioned_health_stays_protected() -> None:
+    rt = _runtime(_pipeline_ok)
+    rt.settings = rt.settings.model_copy(update={"api_key": "s3cret"})
+    async with _client(rt) as client:
+        ready = await client.get("/healthz")
+        assert ready.status_code == 200
+        assert ready.json() == {"status": "ok"}
+        assert ready.headers["cache-control"] == "no-store"
+        assert (await client.get("/api/v1/health")).status_code == 401
+
+
+async def test_healthz_returns_503_when_runtime_is_degraded() -> None:
+    rt = _runtime(_pipeline_ok, deep=False)
+    # Fast availability remains healthy in the normal test fake, so make the real readiness
+    # path degraded by exposing a Laya health result that is alive but not loaded.
+    async def degraded_health() -> LayaHealth:
+        return LayaHealth(ok=True, loaded=False)
+
+    rt.laya.health = degraded_health  # type: ignore[method-assign]
+    async with _client(rt) as client:
+        ready = await client.get("/healthz")
+        assert ready.status_code == 503
+        assert ready.json() == {"status": "unavailable"}
