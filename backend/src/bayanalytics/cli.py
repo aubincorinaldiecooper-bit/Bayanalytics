@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import socket
 import sys
 
 from bayanalytics import __version__
@@ -22,7 +23,7 @@ def _serve(args: argparse.Namespace) -> int:
     if args.port:
         settings = settings.model_copy(update={"port": args.port})
     set_settings(settings)
-    uvicorn.run(
+    config = uvicorn.Config(
         create_app(settings),
         host=settings.host,
         port=settings.port,
@@ -31,7 +32,34 @@ def _serve(args: argparse.Namespace) -> int:
         # grace the lifespan shuts down and running analyses are reported INTERRUPTED.
         timeout_graceful_shutdown=settings.graceful_shutdown_s,
     )
-    return 0
+    server = uvicorn.Server(config)
+    sockets = [dual_stack_socket(settings.port)] if settings.host == "::" else None
+    try:
+        server.run(sockets=sockets)
+    except KeyboardInterrupt:
+        pass
+    # uvicorn.run's exit status when the lifespan startup fails.
+    return 0 if server.started else 3
+
+
+def dual_stack_socket(port: int) -> socket.socket:
+    """A socket on ``[::]:port`` that also accepts IPv4 connections.
+
+    uvicorn binds a host through asyncio's ``create_server``, which sets ``IPV6_V6ONLY`` on an
+    IPv6 socket, so ``--host ::`` alone refuses IPv4 clients (Railway's healthcheck among them).
+    Clearing the option serves both families from one socket: IPv4 peers arrive as
+    ``::ffff:a.b.c.d``, and IPv6-only private networks keep working.
+    """
+    sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        sock.bind(("::", port))
+    except OSError:
+        sock.close()
+        raise
+    sock.set_inheritable(True)
+    return sock
 
 
 def _migrate(_args: argparse.Namespace) -> int:

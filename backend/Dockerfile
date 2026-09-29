@@ -116,7 +116,7 @@ RUN set -eux; \
 
 EXPOSE 8000
 # A shell so ${PORT} expands (Railway sets PORT); exec so uvicorn is PID 1 and gets SIGTERM.
-# 0.0.0.0, not "::": uvicorn binds "::" through asyncio, which sets IPV6_V6ONLY, so IPv4 clients
-# (Railway's healthcheck among them) are refused. A non-loopback host requires BAY_API_KEY (the
+# "::" makes `bayanalytics serve` open one dual-stack socket: IPv4 for Railway's healthcheck and
+# the public edge, IPv6 for the private network. A non-loopback host requires BAY_API_KEY (the
 # backend refuses to start without it).
-CMD ["sh", "-c", "exec bayanalytics serve --host 0.0.0.0 --port \"${PORT:-8000}\""]
+CMD ["sh", "-c", "exec bayanalytics serve --host :: --port \"${PORT:-8000}\""]
