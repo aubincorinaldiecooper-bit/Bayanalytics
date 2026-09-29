@@ -1,4 +1,5 @@
-# BayAnalytics backend image. Railway builds it from backend/ (railway.json: builder DOCKERFILE).
+# BayAnalytics backend image. Railway detects it at the root of the service's source directory
+# (/backend); the service settings are in README.md, "Deploying on Railway".
 #
 # The image holds everything the managed runtime needs, all inside the image rather than a
 # build-only interpreter or $HOME cache:
@@ -115,6 +116,7 @@ RUN set -eux; \
 
 EXPOSE 8000
 # A shell so ${PORT} expands (Railway sets PORT); exec so uvicorn is PID 1 and gets SIGTERM.
-# "::" listens on IPv4 and IPv6; a non-loopback host requires BAY_API_KEY (the backend refuses
-# to start without it).
-CMD ["sh", "-c", "exec bayanalytics serve --host :: --port \"${PORT:-8000}\""]
+# 0.0.0.0, not "::": uvicorn binds "::" through asyncio, which sets IPV6_V6ONLY, so IPv4 clients
+# (Railway's healthcheck among them) are refused. A non-loopback host requires BAY_API_KEY (the
+# backend refuses to start without it).
+CMD ["sh", "-c", "exec bayanalytics serve --host 0.0.0.0 --port \"${PORT:-8000}\""]
