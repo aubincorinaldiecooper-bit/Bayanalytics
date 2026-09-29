@@ -6,7 +6,7 @@ import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
 
 from bayanalytics import __version__
@@ -81,8 +81,6 @@ def create_app(settings: Settings | None = None, runtime: Runtime | None = None)
         readiness signal so infrastructure probes can verify that the real runtime is usable
         without learning component details or requiring access to the API credential.
         """
-        from fastapi import Response
-
         rt: Runtime = app.state.runtime
         health = await rt.health(__version__)
         status_code = 200 if health.status == "ok" else 503
