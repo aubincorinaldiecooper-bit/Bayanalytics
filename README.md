@@ -125,9 +125,29 @@ image uses a self-signed certificate, so
 `sslmode=require` encrypts without verifying the CA (`verify-full` needs the CA via
 `?sslrootcert=`). Without a database URL the backend uses an in-memory store (development only;
 finished analyses are evicted after 200). The Postgres store, migrations and the INTERRUPTED
-recovery path have been exercised against a local PostgreSQL 16 (see below); the Railway
-instance itself has not been connected to yet. The Postgres tests run when
-`BAY_TEST_DATABASE_URL` points at a disposable database.
+recovery path have been exercised against a local PostgreSQL 16 (see below) and the Railway
+deploy runs `bayanalytics migrate` against the Railway instance before each release. The Postgres
+tests run when `BAY_TEST_DATABASE_URL` points at a disposable database.
+
+## Deploying on Railway
+
+The backend service (`bayanalytics-api-live`) builds `backend/Dockerfile`, which Railway detects at
+the root of the service's source directory. Railway's `railway.json` config-as-code is deprecated,
+so the settings live on the service:
+
+| Setting | Value |
+| --- | --- |
+| Source | this repository, branch `main`, root directory `/backend` |
+| Start command | `/bin/sh -c "exec bayanalytics serve --host 0.0.0.0 --port ${PORT:-8000}"` |
+| Pre-deploy command | `bayanalytics migrate` |
+| Healthcheck | `/healthz`, timeout 1200 s (200 only when every component reports `ok`) |
+| Variables | `BAY_API_KEY`, `DATABASE_URL` (the Postgres service's private URL), `BAY_DEPLOYMENT=cloud`, `PORT=8000` |
+
+Railway runs a Dockerfile service's start command in exec form, hence the `sh -c` for `${PORT}`.
+Bind `0.0.0.0`, not `::`: uvicorn binds `::` through asyncio, which sets `IPV6_V6ONLY`, so the
+IPv4 healthcheck is refused. The frontend reaches the backend over the private network with
+`BAY_API_URL=http://${{bayanalytics-api-live.RAILWAY_PRIVATE_DOMAIN}}:8000/api/v1` and
+`BAY_API_KEY=${{bayanalytics-api-live.BAY_API_KEY}}`, so the key has one source of truth.
 
 ## API contract (`/api/v1`)
 

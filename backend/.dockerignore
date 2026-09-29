@@ -13,4 +13,3 @@ models/*
 !models/README.md
 Dockerfile
 .dockerignore
-railway.json
