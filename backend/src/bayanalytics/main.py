@@ -6,7 +6,7 @@ import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
 
 from bayanalytics import __version__
@@ -72,6 +72,25 @@ def create_app(settings: Settings | None = None, runtime: Runtime | None = None)
         upload_path_suffix="/transcriptions",
     )
     install_error_handlers(app)
+
+    @app.get("/healthz", include_in_schema=False)
+    async def readiness() -> Response:
+        """Unauthenticated platform readiness probe.
+
+        The versioned API remains API-key protected. This endpoint exposes only a binary
+        readiness signal so infrastructure probes can verify that the real runtime is usable
+        without learning component details or requiring access to the API credential.
+        """
+        rt: Runtime = app.state.runtime
+        health = await rt.health(__version__)
+        status_code = 200 if health.status == "ok" else 503
+        return Response(
+            content='{"status":"ok"}' if status_code == 200 else '{"status":"unavailable"}',
+            status_code=status_code,
+            media_type="application/json",
+            headers={"cache-control": "no-store"},
+        )
+
     app.include_router(build_router(settings.api_prefix))
     return app
 
