@@ -1,0 +1,16 @@
+.venv
+.env
+.env.*
+!.env.example
+**/__pycache__
+**/*.pyc
+**/node_modules
+.pytest_cache
+.ruff_cache
+tests
+bench
+models/*
+!models/README.md
+Dockerfile
+.dockerignore
+railway.json

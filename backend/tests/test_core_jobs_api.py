@@ -895,6 +895,7 @@ async def test_healthz_is_unauthed_but_versioned_health_stays_protected() -> Non
 
 async def test_healthz_returns_503_when_runtime_is_degraded() -> None:
     rt = _runtime(_pipeline_ok, deep=False)
+
     # Fast availability remains healthy in the normal test fake, so make the real readiness
     # path degraded by exposing a Laya health result that is alive but not loaded.
     async def degraded_health() -> LayaHealth:
