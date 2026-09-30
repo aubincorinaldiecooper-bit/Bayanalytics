@@ -6,7 +6,7 @@ Fixture layout (one directory per scenario, e.g. ``tests/fixtures/research/apple
                     "body_file": "relative/path", "final_url": "...", "paywalled": false}}}
     searches.json  {"fixture": true, "searches": {"<query>": [SearXNG-shaped result, ...],
                     "*": [...]}}
-    <body files>   HTML / JSON / CSV bodies referenced from pages.json
+    <body files>   HTML bodies referenced from pages.json (web pages a search returns)
 
 URL keys are matched after ``canonical_url`` so tracking parameters and trailing slashes do
 not matter. Query keys are matched case-insensitively with collapsed whitespace; ``"*"`` is

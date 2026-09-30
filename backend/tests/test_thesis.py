@@ -1,7 +1,7 @@
 """Prior-assessment lookup and the thesis diff.
 
 Unit tests compare two synthetic results (changed stance, unchanged stance, new and resolved
-conflicts, metric deltas, freshness); the end-to-end tests run "Assess Apple." twice through
+conflicts, metric deltas, freshness); the end-to-end tests run "Assess $AAPL." twice through
 the real runtime with the doubles and check that the second result carries a ``thesis_diff``
 referencing the first and that the Spark prompt received the prior-assessment block.
 """
@@ -13,7 +13,6 @@ from typing import Any
 
 import pytest
 
-from bayanalytics.config import Settings
 from bayanalytics.instruments.base import LayaDecisions
 from bayanalytics.pipeline.thesis import (
     THESIS_METRICS,
@@ -84,7 +83,7 @@ def make_result(
     return AnalysisResult(
         analysis_id=analysis_id,
         status="completed",
-        query="Assess Apple.",
+        query="Assess $AAPL.",
         instrument=InstrumentView(symbol="AAPL", name="Apple Inc."),
         profile="fast",
         horizon=horizon,  # type: ignore[arg-type]
@@ -430,7 +429,7 @@ async def test_orchestrator_asks_for_the_prior_assessment_unscoped_and_says_so()
         transcriber=FixedTranscriber(),
         research=fixture_research_stack(settings, FIXTURES),
     )
-    analysis_id, _events, result = await _run_to_completion(rt, {"query": "Assess Apple."})
+    analysis_id, _events, result = await _run_to_completion(rt, {"query": "Assess $AAPL."})
     assert result["status"] == "completed"
     job = await store.get_job(analysis_id)
     assert job is not None
@@ -454,7 +453,7 @@ def _user_prompt(spark: ScriptedSpark, index: int) -> str:
 async def test_second_assessment_carries_the_thesis_diff_against_the_first() -> None:
     spark = ScriptedSpark()
     rt = _runtime(spark=spark)
-    first_id, _events, first = await _run_to_completion(rt, {"query": "Assess Apple."})
+    first_id, _events, first = await _run_to_completion(rt, {"query": "Assess $AAPL."})
     assert first["status"] == "completed" and first["thesis_diff"] is None
     assert no_prior_assessment_note("AAPL") in first["assessment"]["uncertainties"]
     first_prompt = _user_prompt(spark, 0)
@@ -462,7 +461,7 @@ async def test_second_assessment_carries_the_thesis_diff_against_the_first() -> 
     assert no_prior_assessment_note("AAPL") in first_prompt
     assert "A prior assessment block is included" not in first_prompt
 
-    second_id, _events, second = await _run_to_completion(rt, {"query": "Assess Apple."})
+    second_id, _events, second = await _run_to_completion(rt, {"query": "Assess $AAPL."})
     assert second["status"] == "completed" and second_id != first_id
     diff = second["thesis_diff"]
     assert diff is not None
@@ -479,12 +478,11 @@ async def test_second_assessment_carries_the_thesis_diff_against_the_first() -> 
         assert item["current"] == second["horizon_assessments"][item["scope"]]["stance"]
         assert item["changed"] is False
     assert diff["overall"]["previous"] == diff["overall"]["current"]
-    assert diff["metrics"] and all(m["delta"] == 0.0 for m in diff["metrics"])
-    assert {m["name"] for m in diff["metrics"]} <= set(THESIS_METRICS)
-    assert "valuation_reconciliation_1y" in {m["name"] for m in diff["metrics"]}
+    # web pages carry no verified figures, so no deterministic metric exists to compare
+    assert diff["metrics"] == []
     assert diff["new_conflicts"] == [] and diff["resolved_conflicts"] == []
     assert diff["freshness"]["new_quarter"] is False
-    assert diff["freshness"]["current_latest_quarter_end"] == "2026-06-27"
+    assert diff["freshness"]["current_latest_quarter_end"] is None
     assert diff["summary"][0] == f"prior assessment {first_id} as of {first['as_of'][:10]}"
     # Spark received the bounded prior block and the instruction to use it.
     second_prompt = _user_prompt(spark, 1)
@@ -494,15 +492,8 @@ async def test_second_assessment_carries_the_thesis_diff_against_the_first() -> 
     assert 1 < len(block.strip().splitlines()) <= PRIOR_MAX_LINES
     overall = diff["overall"]
     assert f"- stance overall: then {overall['previous']}, now {overall['current']}" in block
-    assert "- revenue_growth_yoy: then " in block
-    assert "- latest quarter end: then 2026-06-27, now 2026-06-27 (no new quarter)" in block
+    assert "- latest quarter end: then unknown, now unknown (no new quarter)" in block
     assert "A prior assessment block is included" in second_prompt
-    # Reconciliation verdicts reach Spark as recorded values, with the restate-only rule.
-    headline = next(c for c in second["calculations"] if c["name"] == "valuation_reconciliation_1y")
-    verdict = headline["meta"]["reconciliation"]["verdict"]
-    assert f'"verdict":"{verdict}"' in second_prompt
-    assert '"verdict_rule":"' in second_prompt
-    assert "restate each verdict and its numbers exactly as given" in second_prompt
     # The stored result and the store's own lookup agree with the API view.
     stored = await rt.store.get_result(second_id)
     assert stored is not None and stored.thesis_diff is not None
@@ -511,53 +502,3 @@ async def test_second_assessment_carries_the_thesis_diff_against_the_first() -> 
     assert latest is not None and latest.analysis_id == second_id
     earlier = await rt.store.latest_completed_result("AAPL", before=stored.created_at)
     assert earlier is not None and earlier.analysis_id == first_id
-
-
-async def test_a_new_quarter_between_assessments_is_visible_in_the_diff() -> None:
-    # Two runtimes over one store: the first frozen at 2026-06-30 (Q2 FY2026 is the latest
-    # quarter), the second at 2026-09-26 after the Q3 10-Q; the diff reports the new quarter
-    # and the moved metrics instead of leaving that to inference.
-    store = InMemoryStore()
-    spark = ScriptedSpark()
-
-    def runtime(settings: Settings):
-        return build_runtime(
-            settings,
-            store=store,
-            laya=RuleLaya(),
-            spark=spark,
-            transcriber=FixedTranscriber(),
-            research=fixture_research_stack(settings, FIXTURES),
-        )
-
-    first_id, _e, first = await _run_to_completion(
-        runtime(_settings(eval_as_of=datetime(2026, 6, 30, tzinfo=UTC))),
-        {"query": "Assess Apple."},
-    )
-    _second_id, _e, second = await _run_to_completion(
-        runtime(_settings(eval_as_of=datetime(2026, 9, 26, tzinfo=UTC))),
-        {"query": "Assess Apple."},
-    )
-    assert first["freshness_summary"]["facts"]["latest_quarter_end"] == "2026-03-28"
-    diff = second["thesis_diff"]
-    assert diff is not None and diff["previous_analysis_id"] == first_id
-    assert diff["previous_as_of"].startswith("2026-06-30")
-    assert diff["freshness"] == {
-        "previous_latest_quarter_end": "2026-03-28",
-        "current_latest_quarter_end": "2026-06-27",
-        "new_quarter": True,
-        "previous_price_date": "2026-06-30",
-        "current_price_date": "2026-09-25",
-        "newer_prices": True,
-    }
-    assert (
-        "new quarter since the prior assessment: latest quarter end 2026-06-27 (was 2026-03-28)"
-        in diff["summary"]
-    )
-    metrics: dict[str, dict[str, Any]] = {m["name"]: m for m in diff["metrics"]}
-    assert metrics["price_return_1y"]["delta"] != 0.0
-    assert metrics["revenue_growth_yoy"]["previous_period"] == "Q2 FY2026 vs Q2 FY2025"
-    assert metrics["revenue_growth_yoy"]["current_period"] == "Q3 FY2026 vs Q3 FY2025"
-    prompt = _user_prompt(spark, 1)
-    assert "- latest quarter end: then 2026-03-28, now 2026-06-27 (new quarter)" in prompt
-    assert "- latest close: then 2026-06-30, now 2026-09-25" in prompt

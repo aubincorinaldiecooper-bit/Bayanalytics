@@ -26,7 +26,6 @@ from bayanalytics.errors import AnalysisError
 from bayanalytics.schemas.calculations import CalculationInput
 from bayanalytics.schemas.common import ErrorCode
 from bayanalytics.schemas.evidence import (
-    BenchmarkRef,
     NormalizedEvidence,
     NormalizedFact,
     Period,
@@ -554,30 +553,20 @@ def build_evidence(
     facts: list[NormalizedFact] | None = None,
     prices: PriceSeries | None = None,
     with_benchmarks: bool = True,
-    benchmark_key: str = "role",
 ) -> NormalizedEvidence:
     facts = quarterly_facts() + annual_facts() + balance_facts() if facts is None else facts
     prices = synthetic_prices("AAPL", 200.0, 0.0006, 1.0) if prices is None else prices
     benchmarks: dict[str, PriceSeries] = {}
-    refs: list[BenchmarkRef] = []
     if with_benchmarks:
         spy = synthetic_prices("SPY", 500.0, 0.0004, 2.0)
         xlk = synthetic_prices("XLK", 200.0, 0.0008, 3.0)
-        refs = [
-            BenchmarkRef(role="broad_market", symbol="SPY", name="S&P 500 ETF"),
-            BenchmarkRef(role="sector", symbol="XLK", name="Technology Select Sector"),
-        ]
-        if benchmark_key == "role":
-            benchmarks = {"broad_market": spy, "sector": xlk}
-        else:
-            benchmarks = {"SPY": spy, "XLK": xlk}
+        benchmarks = {"broad_market": spy, "sector": xlk}
     return NormalizedEvidence(
         symbol="AAPL",
         as_of=AS_OF,
         facts=facts,
         prices=prices,
         benchmarks=benchmarks,
-        benchmark_refs=refs,
     )
 
 
@@ -761,12 +750,8 @@ class TestRunPack:
         market = all_results["relative_return_1y_vs_market"]
         sector = all_results["relative_return_1y_vs_sector"]
         assert market.status == "computed" and sector.status == "computed"
-        assert market.meta["benchmark"] == {
-            "role": "broad_market",
-            "symbol": "SPY",
-            "name": "S&P 500 ETF",
-            "reason": "",
-        }
+        assert market.meta["benchmark"]["role"] == "broad_market"
+        assert market.meta["benchmark"]["symbol"] == "SPY"
         assert sector.meta["benchmark"]["symbol"] == "XLK"
         asset = all_results["price_return_1y"].value
         spy = evidence.benchmarks["broad_market"]
@@ -868,12 +853,6 @@ class TestRunPackDegradation:
         assert rel.meta["benchmark"]["symbol"] is None
         assert results["beta_1y_vs_market"].missing_inputs == ["benchmark_closes"]
         assert results["price_return_1y"].status == "computed"
-
-    def test_benchmarks_keyed_by_symbol_are_found(self):
-        evidence = build_evidence(benchmark_key="symbol")
-        results = {r.name: r for r in run_pack("returns_vs_benchmark", evidence, AS_OF)}
-        assert results["relative_return_1y_vs_sector"].status == "computed"
-        assert results["relative_return_1y_vs_sector"].meta["benchmark"]["symbol"] == "XLK"
 
     def test_no_prices_makes_price_calculations_unavailable(self):
         evidence = build_evidence(prices=None, with_benchmarks=False)

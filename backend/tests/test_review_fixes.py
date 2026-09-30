@@ -109,7 +109,7 @@ async def test_truncated_synthesis_is_marked_partial() -> None:
         return "## Summary\nEvidence suggests signals are mixed [src_x].\n"
 
     rt = _runtime(spark=ScriptedSpark(text_factory=summary_only))
-    _events, result = await _run(rt, {"query": "Assess Apple."})
+    _events, result = await _run(rt, {"query": "Assess $AAPL."})
     assert result["status"] == "completed"
     assert result["partial"] is True
     for horizon in result["horizon_assessments"].values():
@@ -135,7 +135,7 @@ class _TruncatingSpark(ScriptedSpark):
 
 async def test_synthesis_cut_off_by_the_token_limit_is_partial_even_with_every_horizon() -> None:
     rt = _runtime(spark=_TruncatingSpark())
-    events, result = await _run(rt, {"query": "Assess Apple."})
+    events, result = await _run(rt, {"query": "Assess $AAPL."})
     assert result["status"] == "completed"
     assert all(h["synthesized"] for h in result["horizon_assessments"].values())
     assert result["partial"] is True
@@ -163,7 +163,7 @@ async def test_context_overflow_is_a_structured_error(monkeypatch: pytest.Monkey
     monkeypatch.setattr(orch, "fit_bundle", overflow)
     spark = ScriptedSpark()
     rt = _runtime(spark=spark)
-    events, result = await _run(rt, {"query": "Assess Apple."})
+    events, result = await _run(rt, {"query": "Assess $AAPL."})
     names = [e.event for e in events]
     assert names[-1] == "analysis.failed" and "spark.started" not in names
     error = events[-1].data["error"]
@@ -180,11 +180,11 @@ async def test_context_overflow_is_a_structured_error(monkeypatch: pytest.Monkey
 
 async def test_result_exposes_freshness_and_serialized_source_flags() -> None:
     rt = _runtime()
-    _events, result = await _run(rt, {"query": "Assess Apple."})
-    assert result["freshness_summary"]["facts"]["total"] > 0
+    _events, result = await _run(rt, {"query": "Assess $AAPL."})
+    assert result["freshness_summary"]["facts"]["total"] == 0  # web pages carry no facts
     assert "warnings" in result["freshness_summary"]
     assert all("is_primary" in s and "rank" in s for s in result["sources"])
-    assert any(s["is_primary"] for s in result["sources"])
+    assert any(s["is_primary"] for s in result["sources"])  # the fixture's earnings release
     assert result["partial"] is False
 
 
@@ -194,7 +194,7 @@ async def test_result_exposes_freshness_and_serialized_source_flags() -> None:
 async def test_research_loop_honours_laya_stop_and_never_repeats_an_intent() -> None:
     laya = RuleLaya(force={"research_intent": "stop_research", "evidence_sufficient": 0.5})
     rt = _runtime(laya=laya)
-    events, result = await _run(rt, {"query": "Assess Apple."})
+    events, result = await _run(rt, {"query": "Assess $AAPL."})
     assert result["status"] == "completed"
     research = result["telemetry"]["research"]
     assert research["termination_reason"] in {"laya_stop", "no_new_evidence"}
@@ -300,7 +300,7 @@ async def test_an_analysis_without_a_search_backend_fails_before_research() -> N
         transcriber=FixedTranscriber(),
         research=fixture_research_stack(settings, FIXTURES, search_configured=False),
     )
-    events, result = await _run(rt, {"query": "Assess Apple."})
+    events, result = await _run(rt, {"query": "Assess $AAPL."})
     names = [e.event for e in events]
     assert result["status"] == "failed"
     error = result["error"]
@@ -308,7 +308,7 @@ async def test_an_analysis_without_a_search_backend_fails_before_research() -> N
     assert error["details"] == {"reason": "search_not_configured"}
     assert "BAY_RESEARCH_SEARCH_URL" in error["message"]
     assert not any(n.startswith("research.") for n in names) and "spark.loading" not in names
-    assert spark.runs == [] and rt.research[0].queries == []
+    assert spark.runs == [] and rt.research.queries == []
     async with _client(rt) as client:
         caps = (await client.get("/api/v1/capabilities")).json()
     assert caps["web_search"] is False and caps["execution"]["search_configured"] is False
@@ -323,7 +323,7 @@ async def test_an_analysis_whose_every_search_fails_is_a_research_outage() -> No
         transcriber=FixedTranscriber(),
         research=fixture_research_stack(settings, FIXTURES, search_error="backend down"),
     )
-    events, result = await _run(rt, {"query": "Assess Apple."})
+    events, result = await _run(rt, {"query": "Assess $AAPL."})
     assert result["status"] == "failed"
     assert result["error"]["code"] == "RESEARCH_UNAVAILABLE"
     assert result["error"]["details"]["reason"] == "search_failed"
@@ -373,7 +373,7 @@ async def test_shutdown_marks_running_jobs_interrupted_not_cancelled() -> None:
     rt = fake_runtime(_slow_pipeline)
     await rt.runner.start()
     job = await rt.runner.submit(
-        CreateAnalysisRequest(query="Assess Apple."), resolved_horizon="multi_horizon", budget=None
+        CreateAnalysisRequest(query="Assess $AAPL."), resolved_horizon="multi_horizon", budget=None
     )
     await asyncio.sleep(0.05)
     await rt.runner.shutdown(timeout_s=2.0)
@@ -392,7 +392,7 @@ async def test_hard_cancel_on_shutdown_is_reported_as_interrupted() -> None:
     rt = fake_runtime(_stubborn_pipeline)
     await rt.runner.start()
     job = await rt.runner.submit(
-        CreateAnalysisRequest(query="Assess Apple."), resolved_horizon="multi_horizon", budget=None
+        CreateAnalysisRequest(query="Assess $AAPL."), resolved_horizon="multi_horizon", budget=None
     )
     await asyncio.sleep(0.02)
     await rt.runner.shutdown(timeout_s=0.05)  # cooperative cancel ignored -> task.cancel()
@@ -412,7 +412,7 @@ async def test_user_cancel_keeps_the_flag_on_the_final_row() -> None:
     rt = fake_runtime(_slow_pipeline)
     await rt.runner.start()
     job = await rt.runner.submit(
-        CreateAnalysisRequest(query="Assess Apple."), resolved_horizon="multi_horizon", budget=None
+        CreateAnalysisRequest(query="Assess $AAPL."), resolved_horizon="multi_horizon", budget=None
     )
     await asyncio.sleep(0.03)
     await rt.runner.cancel(job.analysis_id)
@@ -648,7 +648,7 @@ async def test_cancel_is_honoured_while_llama_server_is_silent(tmp_path: Path) -
 async def test_reconnect_with_terminal_id_closes_immediately() -> None:
     rt = _runtime()
     async with _client(rt) as client:
-        created = await client.post("/api/v1/analyses", json={"query": "Assess Apple."})
+        created = await client.post("/api/v1/analyses", json={"query": "Assess $AAPL."})
         analysis_id = created.json()["analysis_id"]
         events = [e async for e in rt.bus.stream(analysis_id)]
         terminal_seq = events[-1].seq
@@ -677,8 +677,8 @@ async def test_reconnect_with_terminal_id_closes_immediately() -> None:
 async def test_spark_queued_is_emitted_while_the_lane_is_busy() -> None:
     rt = _runtime(spark=ScriptedSpark(delay_s=0.02))
     async with _client(rt) as client:
-        first = (await client.post("/api/v1/analyses", json={"query": "Assess Apple."})).json()
-        second = (await client.post("/api/v1/analyses", json={"query": "Assess Apple."})).json()
+        first = (await client.post("/api/v1/analyses", json={"query": "Assess $AAPL."})).json()
+        second = (await client.post("/api/v1/analyses", json={"query": "Assess $AAPL."})).json()
         ev1 = [e async for e in rt.bus.stream(first["analysis_id"])]
         ev2 = [e async for e in rt.bus.stream(second["analysis_id"])]
         names2 = [e.event for e in ev2]
@@ -697,8 +697,8 @@ async def test_too_many_analyses_has_retry_after_and_keepalive_setting_is_used()
     rt.runner._max_active = 1
     rt.settings = rt.settings.model_copy(update={"sse_keepalive_s": 0.05})
     async with _client(rt) as client:
-        first = await client.post("/api/v1/analyses", json={"query": "Assess Apple."})
-        second = await client.post("/api/v1/analyses", json={"query": "Assess Apple."})
+        first = await client.post("/api/v1/analyses", json={"query": "Assess $AAPL."})
+        second = await client.post("/api/v1/analyses", json={"query": "Assess $AAPL."})
         assert second.status_code == 429 and second.headers["retry-after"] == "5"
         analysis_id = first.json()["analysis_id"]
         await asyncio.sleep(0.2)

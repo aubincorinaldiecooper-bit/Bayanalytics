@@ -202,13 +202,6 @@ class CorporateAction(BaseModel):
     source_id: str | None = None
 
 
-class BenchmarkRef(BaseModel):
-    role: Literal["broad_market", "sector"]
-    symbol: str
-    name: str
-    reason: str = ""
-
-
 class NormalizedEvidence(BaseModel):
     """Everything the wrapper hands to Laya, the calculators and the Spark bundle builder."""
 
@@ -216,8 +209,7 @@ class NormalizedEvidence(BaseModel):
     as_of: datetime
     facts: list[NormalizedFact] = Field(default_factory=list)
     prices: PriceSeries | None = None
-    benchmarks: dict[str, PriceSeries] = Field(default_factory=dict)
-    benchmark_refs: list[BenchmarkRef] = Field(default_factory=list)
+    benchmarks: dict[str, PriceSeries] = Field(default_factory=dict)  # keyed by role
     sources: list[SourceRecord] = Field(default_factory=list)
     conflicts: list[Conflict] = Field(default_factory=list)
     uncertainties: list[str] = Field(default_factory=list)

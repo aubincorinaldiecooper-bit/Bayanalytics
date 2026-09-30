@@ -16,12 +16,7 @@ from bayanalytics.errors import AnalysisError
 from bayanalytics.jobs.bus import AnalysisEventBus
 from bayanalytics.jobs.runner import AnalysisRunner
 from bayanalytics.laya.base import LayaClient
-from bayanalytics.schemas.capabilities import (
-    Capabilities,
-    ComponentHealth,
-    Health,
-    MarketCapability,
-)
+from bayanalytics.schemas.capabilities import Capabilities, ComponentHealth, Health
 from bayanalytics.schemas.results import ExecutionInfo
 from bayanalytics.spark.base import SparkClient
 from bayanalytics.store.base import AnalysisStore
@@ -39,7 +34,7 @@ class Runtime:
     laya: LayaClient
     spark: SparkClient
     transcriber: Transcriber
-    research: Any = None  # research stack (provider, edgar, prices); opaque to the API layer
+    research: Any = None  # the web research provider; opaque to the API layer
     extras: dict[str, Any] = field(default_factory=dict)
     _started: bool = False
     _health_cache: tuple[float, Health] | None = None
@@ -48,8 +43,7 @@ class Runtime:
     def search_configured(self) -> bool:
         """Whether the research provider has a web search backend to ask (the only source of
         evidence; an analysis cannot run without one)."""
-        provider = self.research[0] if isinstance(self.research, tuple) and self.research else None
-        return bool(getattr(provider, "search_configured", False))
+        return bool(getattr(self.research, "search_configured", False))
 
     def execution_info(self) -> ExecutionInfo:
         s = self.settings
@@ -124,8 +118,7 @@ class Runtime:
         # Stop accepting new jobs, cancel/finish active work, then close runtimes.
         await self.runner.shutdown()
         closers = [("spark", self.spark.close), ("laya", self.laya.close)]
-        provider = self.research[0] if isinstance(self.research, tuple) and self.research else None
-        aclose = getattr(provider, "aclose", None)
+        aclose = getattr(self.research, "aclose", None)
         if callable(aclose):
             closers.append(("research", aclose))
         closers.append(("transcriber", self.transcriber.close))
@@ -150,7 +143,6 @@ class Runtime:
             research=self.research is not None,
             web_search=self.search_configured,
             execution=self.execution_info(),
-            market=MarketCapability(price_display=self.settings.price_display),
         )
 
     async def health(self, version: str) -> Health:

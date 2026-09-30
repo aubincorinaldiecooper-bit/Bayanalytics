@@ -12,7 +12,6 @@ import logging
 from typing import Any
 
 from bayanalytics.config import Settings
-from bayanalytics.errors import AnalysisError
 from bayanalytics.instruments.equity import EquityAnalyzer
 from bayanalytics.instruments.identity import InstrumentResolver
 from bayanalytics.jobs.bus import AnalysisEventBus
@@ -25,7 +24,6 @@ from bayanalytics.normalization import NORMALIZATION_VERSION
 from bayanalytics.pipeline.orchestrator import run_analysis
 from bayanalytics.research.http_provider import build_research_stack
 from bayanalytics.runtime import Runtime
-from bayanalytics.schemas.common import ErrorCode
 from bayanalytics.spark.base import SparkClient
 from bayanalytics.spark.client import LlamaSparkClient
 from bayanalytics.spark.profiles import read_lockfile
@@ -57,23 +55,11 @@ def build_runtime(
     spark = spark or build_spark(settings)
     transcriber = transcriber or build_transcriber(settings)
     research = research or build_research_stack(settings)
-    _provider, edgar, _prices = research
     wrapper = LayaFinanceWrapper(laya, LAYA_SCHEMA_VERSION)
 
     async def resolver_factory() -> InstrumentResolver:
-        """The live SEC ticker directory (disk-cached for a day). When it cannot be fetched the
-        analysis fails as a retryable research outage rather than guessing from a partial list."""
-        try:
-            rows = await edgar.company_tickers()
-        except Exception as exc:
-            log.warning("company ticker directory unavailable: %s", type(exc).__name__)
-            raise AnalysisError(
-                ErrorCode.RESEARCH_UNAVAILABLE,
-                "The public company directory is unavailable, so the company could not be "
-                "looked up. Try again shortly.",
-                details={"stage": "ticker_directory", "reason": "ticker_directory_unavailable"},
-            ) from exc
-        return InstrumentResolver(rows)
+        """The instrument is the ticker in the request: no directory, no network."""
+        return InstrumentResolver()
 
     def analyzer_factory() -> EquityAnalyzer:
         return EquityAnalyzer(settings, research, wrapper, resolver_factory)

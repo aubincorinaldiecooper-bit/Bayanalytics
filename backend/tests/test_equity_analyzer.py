@@ -43,14 +43,7 @@ from test_store_memory import make_source
 
 FIXTURES = Path(__file__).parent / "fixtures" / "research" / "apple"
 AS_OF = datetime(2026, 9, 26, tzinfo=UTC)
-IDENTITY = InstrumentIdentity(
-    symbol="AAPL",
-    exchange="NASDAQ",
-    name="Apple Inc.",
-    cik="320193",
-    sic="3571",
-    fiscal_year_end="0930",
-)
+IDENTITY = InstrumentIdentity(symbol="AAPL", exchange="NASDAQ")
 
 
 def _settings() -> Settings:
@@ -59,18 +52,19 @@ def _settings() -> Settings:
 
 def _analyzer(laya: RuleLaya | None = None) -> EquityAnalyzer:
     settings = _settings()
-    stack = fixture_research_stack(settings, FIXTURES)
-    edgar = stack[1]
+    provider = fixture_research_stack(settings, FIXTURES)
 
     async def resolver_factory() -> InstrumentResolver:
-        return InstrumentResolver(await edgar.company_tickers())
+        return InstrumentResolver()
 
-    return EquityAnalyzer(settings, stack, LayaFinanceWrapper(laya or RuleLaya()), resolver_factory)
+    return EquityAnalyzer(
+        settings, provider, LayaFinanceWrapper(laya or RuleLaya()), resolver_factory
+    )
 
 
 def _bare() -> EquityAnalyzer:
     """An analyzer for the pure helpers: no research stack, no Laya."""
-    analyzer = EquityAnalyzer(Settings(), (None, None, None), None, None)  # type: ignore[arg-type]
+    analyzer = EquityAnalyzer(Settings(), None, None, None)  # type: ignore[arg-type]
     analyzer.identity = IDENTITY
     return analyzer
 
@@ -78,7 +72,7 @@ def _bare() -> EquityAnalyzer:
 def _request(horizon: str = "multi_horizon", **budget: Any) -> AnalysisRequest:
     return AnalysisRequest(
         analysis_id="an_equity",
-        query="Assess Apple.",
+        query="Assess $AAPL.",
         profile="fast",
         requested_horizon="auto",
         resolved_horizon=horizon,  # type: ignore[arg-type]
@@ -111,72 +105,24 @@ def _src(source_id: str, source_type: str, method: str, excerpt: str = "x" * 50)
 # ------------------------------------------------------------------ retrieval state
 
 
-def test_retrieval_state_absorbs_notes_once_and_counts_failures() -> None:
+def test_retrieval_state_absorbs_notes_once_and_counts_failed_searches() -> None:
     state = RetrievalState()
-    state.absorb(
-        RoundResult(
-            intent="retrieve_latest_filing",
-            kind="edgar_submissions",
-            notes=["EDGAR submissions unavailable (fetch_failed)"],
-        )
-    )
-    state.absorb(
-        RoundResult(
-            intent="retrieve_earnings_history",
-            kind="edgar_companyfacts",
-            notes=[
-                "EDGAR company facts unavailable (timeout)",
-                "8 XBRL rows filed after as_of were dropped",
-            ],
-        )
-    )
-    # the same note twice is recorded once but counted every time it happens
-    state.absorb(
-        RoundResult(
-            intent="retrieve_latest_filing",
-            kind="edgar_submissions",
-            notes=["EDGAR submissions unavailable (fetch_failed)"],
-        )
-    )
-    assert state.notes == [
-        "EDGAR submissions unavailable (fetch_failed)",
-        "EDGAR company facts unavailable (timeout)",
-        "8 XBRL rows filed after as_of were dropped",
-    ]
-    assert state.structured_failures == 3 and state.queries_failed == 0
-    assert set(ResearchStats.model_fields) >= {"queries_failed", "structured_failures"}
+    note = "search_failed: recent news for AAPL"
+    for _ in range(2):  # the same note twice is recorded once but counted every time
+        state.absorb(RoundResult(intent="retrieve_recent_news", kind="search", notes=[note]))
+    assert state.notes == [note] and state.queries_failed == 2
     merged = _bare()._merge_stats(ResearchStats(), ["earnings_history"])
-    assert merged.queries_failed == 0 and merged.structured_failures == 0
-    assert merged.evidence_gaps_remaining == 1
+    assert merged.queries_failed == 0 and merged.evidence_gaps_remaining == 1
+    assert "structured_failures" not in ResearchStats.model_fields
 
 
-def test_retrieval_state_counts_a_failed_search_as_a_query_failure() -> None:
-    state = RetrievalState()
-    state.absorb(
-        RoundResult(
-            intent="retrieve_recent_news",
-            kind="search",
-            notes=["search_failed: recent news for Apple Inc."],
-        )
-    )
-    assert state.queries_failed == 1
-    assert state.structured_failures == 0  # a web search outage is not an EDGAR/Stooq outage
-
-
-def test_compute_gaps_reports_earnings_history_until_four_quarters_exist() -> None:
+def test_compute_gaps_report_topics_no_kept_page_covers_yet() -> None:
     analyzer = _bare()
     assert "earnings_history" in analyzer.compute_gaps("multi_horizon", AS_OF)
-    analyzer.state.rows = [
-        {"metric": "revenue", "fy": 2026, "fp": fp, "value": 1.0} for fp in ("Q1", "Q2", "Q3")
-    ]
-    assert "earnings_history" in analyzer.compute_gaps("multi_horizon", AS_OF)
-    analyzer.state.rows.append({"metric": "revenue", "fy": 2025, "fp": "Q4", "value": 1.0})
-    assert "earnings_history" not in analyzer.compute_gaps("multi_horizon", AS_OF)
-    # annual rows never satisfy the quarterly requirement
-    analyzer.state.rows = [
-        {"metric": "revenue", "fy": fy, "fp": "FY", "value": 1.0} for fy in (2022, 2023, 2024, 2025)
-    ]
-    assert "earnings_history" in analyzer.compute_gaps("multi_horizon", AS_OF)
+    page = make_source("src_q").model_copy(update={"research_intent": "retrieve_earnings_history"})
+    analyzer.state.sources.append(page)
+    gaps = analyzer.compute_gaps("multi_horizon", AS_OF)
+    assert "earnings_history" not in gaps and "price_history" in gaps
 
 
 # ------------------------------------------------------------------ planning
@@ -274,50 +220,23 @@ def test_text_evidence_is_ranked_by_source_then_newest_first() -> None:
     assert [i["rank"] for i in items] == sorted(i["rank"] for i in items)
 
 
-async def test_normalize_wires_name_changes_and_the_dividend_caveat() -> None:
+async def test_normalize_keeps_web_pages_as_text_and_says_so() -> None:
     analyzer = _analyzer()
     rec = Recorder()
-    identity = IDENTITY.model_copy()
-    analyzer.identity = identity
-    await analyzer.enrich_identity(identity, rec.ctx)
-    assert identity.sector == "Electronic Computers" and identity.fiscal_year_end == "0930"
-    sources = await analyzer.retrieve(identity, _request(), rec.ctx)
+    analyzer.identity = IDENTITY.model_copy()
+    sources = await analyzer.retrieve(analyzer.identity, _request(), rec.ctx)
     assert sources and analyzer.stats.queries_failed == 0
-    # two filings in the fixture have no primary document: their excerpt fetches fail
-    assert analyzer.stats.structured_failures == 2
-    assert sum("excerpt unavailable" in n for n in analyzer.state.notes) == 2
     evidence = await analyzer.normalize(sources, rec.ctx)
-    # EDGAR's former names become name-change actions (the entity is unchanged) ...
-    actions = evidence.corporate_actions
-    assert [a.kind for a in actions] == ["name_change", "name_change"]
-    assert actions[0].detail == "formerly APPLE COMPUTER INC"
-    assert actions[0].effective == date(2007, 1, 4)
-    assert actions[1].detail == "formerly APPLE COMPUTER INC/ FA"
-    assert actions[1].effective == date(1997, 7, 28)
-    # ... with the mild warning, and prices carry the total-return caveat.
-    renamed = [u for u in evidence.uncertainties if u.startswith("name change on 2007-01-04")]
-    assert len(renamed) == 1 and "the reporting entity is unchanged" in renamed[0]
-    assert evidence.prices is not None
-    assert "price returns exclude dividends (price return, not total return)" in (
-        evidence.uncertainties
+    # Pages are not parsed into figures: no facts, prices, segments or corporate actions ...
+    assert evidence.facts == [] and evidence.prices is None and evidence.benchmarks == {}
+    assert evidence.segments == [] and evidence.corporate_actions == []
+    # ... and the result says what it rests on.
+    assert evidence.uncertainties[0] == (
+        "No verified financial figures: this assessment is based only on "
+        f"{len(sources)} web pages found by search."
     )
+    assert evidence.text_evidence
     assert len(evidence.uncertainties) == len(set(evidence.uncertainties))
-    # segments carry stable ids derived from the symbol and the period label
-    assert evidence.segments
-    for segment in evidence.segments:
-        assert segment.segment_id == stable_id("seg", "AAPL", period_label(segment.period))
-    # Without a price series there is no dividend caveat to give.
-    analyzer.state.price_series = None
-    bare = await analyzer.normalize(sources, rec.ctx)
-    assert bare.prices is None
-    assert not any("exclude dividends" in u for u in bare.uncertainties)
-
-
-async def test_enrich_identity_records_former_names_not_dict_reprs() -> None:
-    analyzer = _analyzer()
-    identity = IDENTITY.model_copy()
-    await analyzer.enrich_identity(identity, Recorder().ctx)
-    assert identity.ticker_history == ["APPLE COMPUTER INC", "APPLE COMPUTER INC/ FA"]
 
 
 # ------------------------------------------------------------------ segments

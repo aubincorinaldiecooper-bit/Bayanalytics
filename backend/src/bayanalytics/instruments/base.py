@@ -18,23 +18,22 @@ from bayanalytics.schemas.questions import AnalyticalRequirements
 class InstrumentCandidate(BaseModel):
     symbol: str
     exchange: str | None = None
-    name: str
+    name: str = ""
     cik: str | None = None
     score: float = 0.0
 
 
 class InstrumentIdentity(BaseModel):
+    """The instrument as the analyst named it (``instruments.identity``). ``name``, ``cik``
+    and ``sector`` stay empty: there is no company directory, only the ticker."""
+
     symbol: str
     exchange: str | None = None
-    name: str
+    name: str = ""
     cik: str | None = None
     instrument_type: Literal["equity"] = "equity"
-    sic: str | None = None
     sector: str | None = None
-    fiscal_year_end: str | None = None  # "MMDD"
     exchange_timezone: str = "America/New_York"
-    aliases: list[str] = Field(default_factory=list)
-    ticker_history: list[str] = Field(default_factory=list)
     confidence: float = 1.0
     resolution_method: str = ""
 

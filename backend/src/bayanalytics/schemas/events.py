@@ -26,8 +26,6 @@ EventName = Literal[
     "research.source_rejected",
     "research.completed",
     "normalization.completed",
-    "market.series",
-    "market.fundamentals",
     "laya.started",
     "laya.decision",
     "laya.completed",

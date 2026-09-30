@@ -6,7 +6,7 @@ No rule here decides what a question is about. Spark pass 1
 (:mod:`bayanalytics.pipeline.questions`); this module only turns what survived into work:
 
     kept requirements -> REQUIREMENT_TABLE rows (union, deduplicated, stable order)
-                      -> research intents (facts first), calculations, operands, price window
+                      -> research intents, calculations, operands
     intent            -> INTENT_TABLE row -> focus sentence and horizons to emphasise
     after the math    -> check_requirements -> satisfied / unmet -> uncertainties (never failures)
 
@@ -21,10 +21,10 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from bayanalytics.calculations.registry import CANONICAL_METRICS, PE_HISTORY_YEARS, SPECS
+from bayanalytics.calculations.registry import CANONICAL_METRICS, SPECS
 from bayanalytics.instruments.base import CalculatedMetrics
 from bayanalytics.laya.schemas import REQUIREMENTS_SUPPORTED_KEY, requirement_key
-from bayanalytics.research.intents import ResearchIntent, facts_first
+from bayanalytics.research.intents import ResearchIntent
 from bayanalytics.schemas.decisions import LayaDecision, NoulAnswer
 from bayanalytics.schemas.evidence import NormalizedEvidence, PriceSeries
 from bayanalytics.schemas.questions import (
@@ -70,12 +70,6 @@ _SERIES_OPERANDS: dict[str, str] = {
 """Non-fact operands and the evidence-gap label the research loop already uses for them."""
 OPERAND_NAMES: frozenset[str] = frozenset(CANONICAL_METRICS) | frozenset(_SERIES_OPERANDS)
 
-LONG_PRICE_WINDOW_DAYS = PE_HISTORY_YEARS * 366
-"""Price window for valuation history and the price-versus-earnings reconciliation: the P/E
-percentiles need at least eight quarter-end P/E observations and the three-year reconciliation
-needs the price three years before the latest trailing period, whatever the horizon."""
-
-
 # ---- tables ---------------------------------------------------------------------------------
 
 
@@ -85,7 +79,6 @@ class RequirementSpec:
     calculations: tuple[str, ...] = ()
     operands: tuple[str, ...] = ()
     also_calculated: tuple[str, ...] = ()
-    min_price_days: int | None = None
 
 
 @dataclass(frozen=True)
@@ -114,14 +107,12 @@ REQUIREMENT_TABLE: dict[str, RequirementSpec] = {
         ),
         calculations=("pe_ttm", "pe_5y_percentile", "pe_history_percentile"),
         operands=(PRICE_OPERAND, "eps_diluted"),
-        min_price_days=LONG_PRICE_WINDOW_DAYS,
     ),
     "price_vs_earnings": RequirementSpec(
         intents=(_I.retrieve_earnings_history, _I.retrieve_price_history),
         calculations=("valuation_reconciliation_1y",),
         operands=(PRICE_OPERAND, "eps_diluted", "revenue"),
         also_calculated=("valuation_reconciliation_3y",),
-        min_price_days=LONG_PRICE_WINDOW_DAYS,
     ),
     "earnings_trajectory": RequirementSpec(
         intents=(
@@ -398,14 +389,12 @@ def build_requirements(
     """Compose the requirements of an interpretation from the tables.
 
     ``kept`` is what survived Laya's validation (by default Spark's whole proposal, for the
-    paths where Laya was not asked). Rows are unioned in requirement order; the research
-    intents are then ordered facts first (``research.intents.facts_first``).
+    paths where Laya was not asked). Rows are unioned in requirement order.
     """
     requirements = list(kept) if kept is not None else proposed_requirements(understanding)
     rows = [REQUIREMENT_TABLE[name] for name in requirements]
     calculations = _union(row.calculations for row in rows)
     also = [c for c in _union(row.also_calculated for row in rows) if c not in calculations]
-    windows = [row.min_price_days for row in rows if row.min_price_days]
     intent = INTENT_TABLE[understanding.intent]
     focus = intent.focus
     comparison = COMPARISON_FOCUS_LABELS.get(understanding.comparison_focus, "")
@@ -418,13 +407,10 @@ def build_requirements(
         source=source,
         dropped_by_validation=list(dropped),  # type: ignore[arg-type]
         recent_period=LATEST_PERIOD in requirements,
-        required_research_intents=[
-            str(i) for i in facts_first(_union(row.intents for row in rows))
-        ],
+        required_research_intents=[str(i) for i in _union(row.intents for row in rows)],
         required_calculations=calculations,
         also_calculated=also,
         required_operands=_union(row.operands for row in rows),
-        min_price_days=max(windows) if windows else None,
         focus=focus,
         horizons_emphasis=list(intent.horizons),
         notes=list(dict.fromkeys(notes)),
@@ -486,12 +472,6 @@ def operand_gaps(
 
 
 def _has_benchmark(evidence: NormalizedEvidence, role: str) -> bool:
-    for ref in evidence.benchmark_refs:
-        if ref.role != role:
-            continue
-        series = evidence.benchmarks.get(ref.symbol) or evidence.benchmarks.get(ref.role)
-        if series is not None and series.points:
-            return True
     series = evidence.benchmarks.get(role)
     return bool(series is not None and series.points)
 

@@ -8,8 +8,8 @@
 * ``FixtureResearchProvider`` / ``FixtureFetcher`` serve the synthetic fixture directories.
 
 Every number a double reports is measured with the double's own deterministic tokenizer
-(``doubles.tokens``) or its own clock, or it is ``None``. ``fixture_research_stack`` wires the
-fixture provider through the real ``EdgarClient`` and ``StooqPrices``.
+(``doubles.tokens``) or its own clock, or it is ``None``. ``fixture_research_stack`` builds the
+fixture provider (search hits and web pages only) the runtime takes as its research provider.
 """
 
 from __future__ import annotations
@@ -18,8 +18,6 @@ from pathlib import Path
 from typing import Any
 
 from bayanalytics.config import Settings
-from bayanalytics.research.edgar import EdgarClient
-from bayanalytics.research.prices import StooqPrices
 
 from .laya import LayaCall, RuleLaya
 from .research import FixtureFetcher, FixtureResearchProvider
@@ -44,10 +42,8 @@ __all__ = [
 
 def fixture_research_stack(
     settings: Settings, fixture_dir: Path | str, **provider_options: Any
-) -> tuple[FixtureResearchProvider, EdgarClient, StooqPrices]:
-    """The research stack over one fixture directory: the fixture provider plus the real EDGAR
-    and Stooq clients reading through the same ``FixtureFetcher``. ``provider_options`` go to
-    ``FixtureResearchProvider`` (``search_configured``, ``search_error``)."""
-    fetcher = FixtureFetcher(fixture_dir)
-    provider = FixtureResearchProvider(fixture_dir, fetcher=fetcher, **provider_options)
-    return provider, EdgarClient(fetcher, settings), StooqPrices(fetcher)
+) -> FixtureResearchProvider:
+    """The research provider over one fixture directory (search hits and web pages only).
+    ``provider_options`` go to ``FixtureResearchProvider`` (``search_configured``,
+    ``search_error``)."""
+    return FixtureResearchProvider(fixture_dir, **provider_options)

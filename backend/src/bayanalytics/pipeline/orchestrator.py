@@ -44,7 +44,6 @@ from bayanalytics.pipeline.understanding import (
     understand_question,
 )
 from bayanalytics.pipeline.understanding import TIMER_NAME as UNDERSTANDING_TIMER
-from bayanalytics.research.market import fundamentals_view, market_series
 from bayanalytics.research.sources import domain_of, web_pages
 from bayanalytics.runtime import Runtime
 from bayanalytics.schemas.common import ErrorCode, utcnow
@@ -55,7 +54,6 @@ from bayanalytics.schemas.results import (
     AnalysisResult,
     Assessment,
     InstrumentView,
-    MarketView,
     Telemetry,
     ThesisDiff,
     VersionInfo,
@@ -92,7 +90,6 @@ class _Draft:
         self.thesis_diff: ThesisDiff | None = None
         self.understanding: Understanding | None = None  # Spark pass 1, once it ran
         self.requirements: RequirementsReport | None = None
-        self.market = MarketView()
 
     def instrument_view(self) -> InstrumentView | None:
         if self.identity is None:
@@ -125,7 +122,6 @@ class _Draft:
             thesis_diff=self.thesis_diff,
             requirements=self.requirements,
             streamed_text=self.streamed_text,
-            market=self.market,
             telemetry=self.telemetry,
             error=error.payload() if error else None,
             partial=status != "completed" or self.partial_synthesis,
@@ -134,7 +130,6 @@ class _Draft:
 
 async def run_analysis(job: AnalysisJob, ctx: AnalysisContext, rt: Runtime) -> AnalysisResult:
     draft = _Draft(job)
-    draft.market.price_display = rt.settings.price_display
     analyzer: EquityAnalyzer = rt.extras["analyzer_factory"]()
     analyzer.instrument_ref = job.instrument_ref
     request = AnalysisRequest(
@@ -163,7 +158,6 @@ async def run_analysis(job: AnalysisJob, ctx: AnalysisContext, rt: Runtime) -> A
             # 1. instrument -------------------------------------------------------------
             await _set_status(rt, job, "resolving_instrument")
             identity = await analyzer.identify(job.query, ctx)
-            await analyzer.enrich_identity(identity, ctx)
             draft.identity = identity
             job.instrument = identity
             await rt.store.update_job(job)
@@ -234,14 +228,6 @@ async def run_analysis(job: AnalysisJob, ctx: AnalysisContext, rt: Runtime) -> A
                 segments=len(evidence.segments),
                 freshness=_freshness_view(evidence.freshness_summary),
             )
-            fundamentals = fundamentals_view(evidence, job.as_of)
-            draft.market.fundamentals = fundamentals
-            if fundamentals is not None:
-                await ctx.event("market.fundamentals", **fundamentals.model_dump(mode="json"))
-            if rt.settings.price_display:
-                draft.market.series = market_series(
-                    evidence, identity.symbol, identity.name or identity.symbol
-                )
             _evidence_gate(
                 evidence,
                 analyzer.compute_gaps(job.resolved_horizon, job.as_of),

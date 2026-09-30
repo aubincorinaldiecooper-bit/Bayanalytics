@@ -15,8 +15,8 @@ operands, always by the same rules so the same evidence yields the same operands
   (:mod:`bayanalytics.normalization.sessions`), never a partial session;
 * market cap pairs that close with the latest ``shares_outstanding`` fact and records both
   dates, noting when they differ;
-* benchmark series are looked up by role through ``evidence.benchmark_refs`` and then
-  ``evidence.benchmarks`` (keyed by role or by symbol).
+* benchmark series are looked up by role in ``evidence.benchmarks``; a missing series is a
+  missing operand.
 """
 
 from __future__ import annotations
@@ -294,15 +294,6 @@ class OperandResolver:
         chosen = self._choose(target)
         return self._operand(chosen, target) if chosen else None
 
-    def quarterly(self, metric: str) -> list[NormalizedFact]:
-        """One chosen fact per fiscal quarter (by period end), oldest first."""
-        by_end: dict[date, list[NormalizedFact]] = {}
-        for fact in self.facts(metric, "fiscal_quarter"):
-            if fact.period.end is not None:
-                by_end.setdefault(fact.period.end, []).append(fact)
-        chosen = (self._choose(by_end[end]) for end in sorted(by_end))
-        return [fact for fact in chosen if fact is not None]
-
     def latest_fq(self, metric: str) -> Operand | None:
         return self._latest_of_kind(metric, "fiscal_quarter")
 
@@ -527,22 +518,12 @@ class OperandResolver:
 
     def benchmark_series(self, role: str) -> tuple[PriceSeries | None, dict[str, Any]]:
         """The benchmark series for a role plus a record of which benchmark was used."""
-        ref = next((r for r in self.evidence.benchmark_refs if r.role == role), None)
+        series = self.evidence.benchmarks.get(role)
         record: dict[str, Any] = {
             "role": role,
-            "symbol": ref.symbol if ref else None,
-            "name": ref.name if ref else None,
-            "reason": ref.reason if ref else None,
+            "symbol": series.symbol if series is not None else None,
+            "name": (series.label or None) if series is not None else None,
         }
-        series = self.evidence.benchmarks.get(role)
-        if series is None and ref is not None:
-            series = self.evidence.benchmarks.get(ref.symbol)
-        if series is None and ref is not None:
-            series = next(
-                (s for s in self.evidence.benchmarks.values() if s.symbol == ref.symbol), None
-            )
-        if series is not None and record["symbol"] is None:
-            record["symbol"] = series.symbol
         return series, record
 
     def latest_close_point(self, series: PriceSeries | None = None) -> PricePoint | None:

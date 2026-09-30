@@ -1,7 +1,7 @@
 {
  "fixture": true,
  "searches": {
-  "\"Apple Inc.\" earnings OR guidance OR outlook": [
+  "\"AAPL\" earnings OR guidance OR outlook": [
    {
     "url": "https://www.cnbc.com/2026/09/18/fixture-apple-quarter-preview.html",
     "title": "[Fixture] Apple quarter preview: what the synthetic numbers imply",
@@ -65,7 +65,7 @@
     "publishedDate": "2026-07-30T20:07:00Z"
    }
   ],
-  "\"Apple Inc.\" stock 2025 results": [
+  "\"AAPL\" stock 2025 results": [
    {
     "url": "https://www.marketwatch.com/story/fixture-apple-outlook-2026-09-12",
     "title": "[Fixture] Opinion: the outlook for the next cycle",

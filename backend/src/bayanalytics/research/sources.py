@@ -2,7 +2,8 @@
 
 The classification table (AGENT.md section 22 hierarchy, section 26 data rights) is a plain
 module constant so new publishers are a one-line addition. Classification is host/path based
-and never trusts page content for the source type.
+and never trusts page content for the source type. The table only labels pages a web search
+returned (type, publisher, redistribution terms); it never chooses what to fetch.
 """
 
 from __future__ import annotations

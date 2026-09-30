@@ -75,9 +75,10 @@ def test_execution_and_version_info_carry_no_configured_labels() -> None:
     assert rt.capabilities().execution == rt.execution_info()
     assert rt.capabilities().research is True and rt.capabilities().voice is True
     assert rt.capabilities().web_search is True
-    # price points stay server-side unless the operator turns price display on
-    assert Settings().price_display is False and rt.capabilities().market.price_display is False
-    assert Settings.from_env({"BAY_PRICE_DISPLAY": "true"}).price_display is True
+    # research is web search only: no price-display or market-view settings exist
+    for field in ("price_display", "research_price_history_days"):
+        assert field not in Settings.model_fields, field
+    assert "market" not in rt.capabilities().model_dump()
 
 
 async def test_runtime_start_reports_a_laya_load_failure_and_a_missing_search_url(
@@ -110,14 +111,13 @@ async def test_runtime_start_reports_a_laya_load_failure_and_a_missing_search_ur
 
 async def test_runtime_close_closes_the_research_provider() -> None:
     settings = _settings()
-    stack = fixture_research_stack(settings, FIXTURES)
-    provider = stack[0]
+    provider = fixture_research_stack(settings, FIXTURES)
     rt = build_runtime(
         settings,
         laya=RuleLaya(),
         spark=ScriptedSpark(),
         transcriber=FixedTranscriber(),
-        research=stack,
+        research=provider,
     )
     await rt.start()
     assert rt.search_configured is True and provider.closed is False
@@ -184,12 +184,12 @@ async def test_post_and_health_reprobe_an_external_server_that_came_up() -> None
     rt.spark = spark
     async with _client(rt) as client:
         probes_after_start = spark.probes
-        first = await client.post("/api/v1/analyses", json={"query": "Assess Apple."})
+        first = await client.post("/api/v1/analyses", json={"query": "Assess $AAPL."})
         assert first.status_code == 503
         assert first.json()["error"]["code"] == "SPARK_START_FAILED"
         assert spark.probes == probes_after_start + 1
         spark.healthy = True  # an operator started llama-server after this backend
-        second = await client.post("/api/v1/analyses", json={"query": "Assess Apple."})
+        second = await client.post("/api/v1/analyses", json={"query": "Assess $AAPL."})
         assert second.status_code == 202, second.text
         assert spark.probes == probes_after_start + 2
         [_ async for _ in rt.bus.stream(second.json()["analysis_id"])]
@@ -199,30 +199,21 @@ async def test_post_and_health_reprobe_an_external_server_that_came_up() -> None
         assert next(c for c in health["components"] if c["name"] == "spark")["status"] == "ok"
 
 
-async def test_wiring_resolver_factory_reports_a_missing_ticker_directory(tmp_path: Path) -> None:
-    (tmp_path / "pages.json").write_text('{"fixture": true, "pages": {}}')
-    settings = _settings()
-    rt = _full_runtime(settings, fixture_dir=tmp_path)
-    with pytest.raises(AnalysisError) as info:
-        await rt.extras["resolver_factory"]()
-    outage = info.value
-    assert outage.code == ErrorCode.RESEARCH_UNAVAILABLE and outage.retryable is True
-    assert outage.details == {"stage": "ticker_directory", "reason": "ticker_directory_unavailable"}
-    assert "directory is unavailable" in outage.message
-    app = create_app(settings, runtime=rt)
+async def test_wiring_resolver_factory_needs_no_directory_or_network() -> None:
+    rt = _full_runtime()
+    resolver = await rt.extras["resolver_factory"]()
+    assert resolver.resolve("Assess $AAPL.").symbol == "AAPL"
+    app = create_app(rt.settings, runtime=rt)
     async with app.router.lifespan_context(app):
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             resp = await client.post("/api/v1/analyses", json={"query": "Assess Apple."})
-    assert resp.status_code == 503
-    assert resp.json()["error"]["code"] == "RESEARCH_UNAVAILABLE"
-    assert resp.json()["error"]["details"]["reason"] == "ticker_directory_unavailable"
+    assert resp.status_code == 422
+    error = resp.json()["error"]
+    assert error["code"] == "AMBIGUOUS_INSTRUMENT"
+    assert error["details"] == {"reason": "ticker_required", "candidates": []}
     assert rt.runner.active_count == 0  # nothing was admitted
-    # With the directory reachable the resolver holds the whole list; there is no partial mode.
-    good = _full_runtime(settings)
-    resolver = await good.extras["resolver_factory"]()
-    assert resolver.resolve("Assess Apple.").symbol == "AAPL"
-    assert not hasattr(resolver, "directory_complete")
+    assert rt.research.queries == []  # identity never searches
 
 
 async def test_wiring_versions_are_measured_not_configured(tmp_path: Path) -> None:
@@ -319,7 +310,7 @@ async def test_body_limit_envelopes_are_compact_json() -> None:
         assert error["message"] == "Request body exceeds the 200 byte limit."
 
         async def chunks() -> AsyncIterator[bytes]:
-            yield b'{"query": "Assess Apple."}'
+            yield b'{"query": "Assess $AAPL."}'
 
         chunked = await client.post(
             "/api/v1/analyses", content=chunks(), headers={"content-type": "application/json"}

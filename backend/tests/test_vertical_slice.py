@@ -20,6 +20,7 @@ import httpx
 from bayanalytics.config import Settings
 from bayanalytics.errors import AnalysisError
 from bayanalytics.main import create_app
+from bayanalytics.research.sources import domain_of
 from bayanalytics.runtime import Runtime
 from bayanalytics.schemas.common import ErrorCode
 from bayanalytics.schemas.events import AnalysisEvent
@@ -105,7 +106,7 @@ async def _run_to_completion(rt: Runtime, body: dict) -> tuple[str, list[dict], 
 async def test_assess_apple_end_to_end() -> None:
     rt = _runtime()
     analysis_id, events, result = await _run_to_completion(
-        rt, {"query": "Assess Apple.", "profile": "fast"}
+        rt, {"query": "Assess $AAPL.", "profile": "fast"}
     )
     names = [e["event"] for e in events]
     # Sequence numbers are contiguous and the stream closes on the terminal event.
@@ -150,7 +151,9 @@ async def test_assess_apple_end_to_end() -> None:
     started = next(e["data"] for e in events if e["event"] == "analysis.started")
     assert started["execution"] == EXECUTION
     resolved = next(e["data"] for e in events if e["event"] == "instrument.resolved")
-    assert resolved["symbol"] == "AAPL" and resolved["cik"] == "0000320193"
+    # the instrument is the ticker in the question: no directory, no name, no CIK
+    assert resolved["symbol"] == "AAPL" and resolved["resolution_method"] == "cashtag"
+    assert resolved["name"] == "" and resolved["cik"] is None
     # The Spark prompt size is measured by the session before generation and reported as such
     # on spark.started, spark.completed and in telemetry; nothing is estimated.
     spark_started = next(e["data"] for e in events if e["event"] == "spark.started")
@@ -173,29 +176,33 @@ async def test_assess_apple_end_to_end() -> None:
     assert result["status"] == "completed" and result["error"] is None
     assert result["analysis_id"] == analysis_id and result["horizon"] == "multi_horizon"
     assert result["instrument"]["symbol"] == "AAPL"
-    assert len(result["sources"]) >= 10
-    assert any(s["source_type"] == "regulatory_filing" for s in result["sources"])
-    assert all(len(s["excerpt"]) <= 600 for s in result["sources"])
+    # Web pages from several sites; every page opened was a search hit.
+    sources = result["sources"]
+    assert len(sources) >= 2 and len({domain_of(s["url"]) for s in sources}) >= 2
+    searched = json.loads((FIXTURES / "searches.json").read_text())["searches"]
+    hits = {hit["url"] for results in searched.values() for hit in results}
+    fetched = [e["data"]["url"] for e in events if e["event"] == "research.fetching"]
+    assert fetched and set(fetched) <= hits
+    assert all(len(s["excerpt"]) <= 600 for s in sources)
+    # No verified figures: every calculation runs and reports its missing operands.
     calcs = result["calculations"]
-    computed = [c for c in calcs if c["status"] == "computed"]
-    assert len(computed) >= 20
+    assert calcs
     for calc in calcs:
         assert calc["formula"] and calc["name"]
-        if calc["status"] == "unavailable":
-            assert calc["value"] is None and (calc["missing_inputs"] or calc["notes"])
-    assert len(result["laya_decisions"]) >= 40
+        assert calc["status"] == "unavailable"
+        assert calc["value"] is None and (calc["missing_inputs"] or calc["notes"])
+    assert result["laya_decisions"]
     assessment = result["assessment"]
     assert assessment["summary"]
     assert assessment["bull_evidence"] and all(
         i["source_ids"] or i["calc_id"] or i["decision_id"] for i in assessment["bull_evidence"]
     )
-    assert assessment["fundamentals"]["revenue_growth_yoy"]["display"].endswith("%")
-    assert "market_cap" in assessment["valuation"]
-    assert assessment["benchmark_context"]["benchmarks"]
     assert (
-        "price returns exclude dividends (price return, not total return)"
-        in (assessment["uncertainties"])
-    )
+        "No verified financial figures: this assessment is based only on "
+        f"{len(sources)} web pages found by search."
+    ) in assessment["uncertainties"]
+    assert "benchmarks" not in assessment["benchmark_context"]
+    assert "market" not in result
     assert len(result["horizon_assessments"]) == 4
     for horizon, item in result["horizon_assessments"].items():
         assert item["stance"] in {"bullish", "neutral", "bearish", "mixed"}
@@ -213,14 +220,9 @@ async def test_assess_apple_end_to_end() -> None:
     ):
         assert telemetry[key] is not None and telemetry[key] >= 0, key
     research = telemetry["research"]
-    assert research["queries_issued"] >= 5 and research["sources_fetched"] >= 10
-    assert research["termination_reason"]
-    # The synthetic fixture deliberately omits the primary documents of the 8-K 0000320193-26-
-    # 000050 and the 10-Q 0000320193-26-000010, so both excerpts fail to fetch; the analyzer
-    # counts them as structured failures (whether an unexcerptable filing should count as an
-    # EDGAR outage is an open product question, tracked in the migration report).
-    assert research["queries_failed"] == 0 and research["structured_failures"] == 2
-    assert sum("excerpt unavailable" in u for u in result["assessment"]["uncertainties"]) == 2
+    assert research["queries_issued"] >= 5 and research["sources_fetched"] >= 2
+    assert research["termination_reason"] and research["queries_failed"] == 0
+    assert "structured_failures" not in research
     assert telemetry["spark_prompt_tokens"] == spark_started["prompt_tokens"]
     # Measured or None: the doubles measure no model, no memory and no runtime.
     for key in (
@@ -260,7 +262,7 @@ async def test_assess_apple_end_to_end() -> None:
 
 async def test_spark_citations_of_bundle_sources_are_recognised() -> None:
     rt = _runtime()
-    _id, _events, result = await _run_to_completion(rt, {"query": "Assess Apple."})
+    _id, _events, result = await _run_to_completion(rt, {"query": "Assess $AAPL."})
     assessment = result["assessment"]
     # ScriptedSpark cites only ids rendered in the bundle, so none may be reported as unknown ...
     assert not any("unknown source" in u for u in assessment["uncertainties"])
@@ -273,7 +275,7 @@ async def test_spark_citations_of_bundle_sources_are_recognised() -> None:
 
 async def test_provenance_and_decision_ids_are_stable_across_runs() -> None:
     as_of = datetime(2026, 9, 26, tzinfo=UTC)
-    body = {"query": "Assess Apple."}
+    body = {"query": "Assess $AAPL."}
     first = (await _run_to_completion(_runtime(_settings(eval_as_of=as_of)), body))[2]
     second = (await _run_to_completion(_runtime(_settings(eval_as_of=as_of)), body))[2]
     assert first["analysis_id"] != second["analysis_id"]
@@ -285,17 +287,14 @@ async def test_provenance_and_decision_ids_are_stable_across_runs() -> None:
         d["decision_id"] for d in second["laya_decisions"]
     ]
     assert len({d["decision_id"] for d in first["laya_decisions"]}) == len(first["laya_decisions"])
-    segment_ids = {d["segment_id"] for d in first["laya_decisions"] if d["stage"] == "history_scan"}
-    assert segment_ids and all(s.startswith("seg_") for s in segment_ids)
-    assert segment_ids == {
-        d["segment_id"] for d in second["laya_decisions"] if d["stage"] == "history_scan"
-    }
+    # no verified figures means no history segments to score
+    assert not any(d["stage"] == "history_scan" for d in first["laya_decisions"])
 
 
 async def test_leakage_guard_freezes_information_set() -> None:
     as_of = datetime(2026, 6, 30, tzinfo=UTC)
     rt = _runtime(_settings(eval_as_of=as_of))
-    _analysis_id, events, result = await _run_to_completion(rt, {"query": "Assess Apple."})
+    _analysis_id, events, result = await _run_to_completion(rt, {"query": "Assess $AAPL."})
     assert result["status"] == "completed"
     assert result["as_of"].startswith("2026-06-30")
     for source in result["sources"]:
@@ -304,9 +303,8 @@ async def test_leakage_guard_freezes_information_set() -> None:
             assert published <= as_of, source["title"]
     rejected = [e["data"] for e in events if e["event"] == "research.source_rejected"]
     assert any(r["reason"] == "published_after_as_of" for r in rejected)
-    # Prices stop at the cut-off, so every close-based calculation is dated on or before it.
-    market = result["assessment"]["market_context"]
-    assert market["price"]["session_date"] <= "2026-06-30"
+    # Only pages dated on or before the cut-off were kept: here the two older ones.
+    assert {domain_of(s["url"]) for s in result["sources"]} == {"barrons.com", "zacks.com"}
 
 
 # ----------------------------------------------------------------------------- degraded paths
@@ -352,7 +350,7 @@ async def test_pages_from_a_single_website_are_insufficient_evidence(tmp_path: P
         transcriber=FixedTranscriber(),
         research=fixture_research_stack(settings, _one_site_fixture(tmp_path)),
     )
-    _id, events, result = await _run_to_completion(rt, {"query": "Assess Apple."})
+    _id, events, result = await _run_to_completion(rt, {"query": "Assess $AAPL."})
     assert result["status"] == "failed" and events[-1]["event"] == "analysis.failed"
     error = result["error"]
     assert error["code"] == "INSUFFICIENT_EVIDENCE"
@@ -363,14 +361,13 @@ async def test_pages_from_a_single_website_are_insufficient_evidence(tmp_path: P
     assert "spark.started" not in [e["event"] for e in events]  # nothing was synthesised
 
 
-
 async def test_cancel_mid_synthesis_preserves_partial_content() -> None:
     # httpx's ASGI transport buffers a streaming body, so the live stream is read in-process
     # through the event bus while the cancel goes through the real API.
     spark = ScriptedSpark(delay_s=0.02)
     rt = _runtime(spark=spark)
     async with _client(rt) as client:
-        created = await client.post("/api/v1/analyses", json={"query": "Assess Apple."})
+        created = await client.post("/api/v1/analyses", json={"query": "Assess $AAPL."})
         analysis_id = created.json()["analysis_id"]
         events: list[AnalysisEvent] = []
         cancelled_at: int | None = None
@@ -410,7 +407,7 @@ async def test_deep_profile_unavailable_is_a_structured_error() -> None:
         assert caps["profiles"]["deep"]["available"] is False
         assert caps["profiles"]["deep"]["code"] == "DEEP_PROFILE_UNAVAILABLE"
         created = await client.post(
-            "/api/v1/analyses", json={"query": "Assess Apple.", "profile": "deep"}
+            "/api/v1/analyses", json={"query": "Assess $AAPL.", "profile": "deep"}
         )
         assert created.status_code == 503
         assert created.json()["error"]["code"] == "DEEP_PROFILE_UNAVAILABLE"
@@ -420,9 +417,7 @@ async def test_deep_profile_unavailable_is_a_structured_error() -> None:
 async def test_ambiguous_instrument_is_answered_at_post() -> None:
     rt = _runtime()
     async with _client(rt) as client:
-        created = await client.post(
-            "/api/v1/analyses", json={"query": "Compare Apple and Microsoft."}
-        )
+        created = await client.post("/api/v1/analyses", json={"query": "Compare AAPL and MSFT."})
         assert created.status_code == 422
         error = created.json()["error"]
         assert error["code"] == "AMBIGUOUS_INSTRUMENT"
@@ -436,7 +431,7 @@ async def test_ambiguous_instrument_is_answered_at_post() -> None:
 async def test_laya_failure_is_structured_and_keeps_sources() -> None:
     laya = RuleLaya(raise_error=AnalysisError(ErrorCode.LAYA_INFERENCE_FAILED))
     rt = _runtime(laya=laya)
-    _id, events, result = await _run_to_completion(rt, {"query": "Assess Apple."})
+    _id, events, result = await _run_to_completion(rt, {"query": "Assess $AAPL."})
     assert events[-1]["event"] == "analysis.failed"
     assert events[-1]["data"]["error"]["code"] == "LAYA_INFERENCE_FAILED"
     assert result["status"] == "failed" and result["partial"] is True
@@ -463,10 +458,10 @@ async def test_explicit_instrument_and_horizon() -> None:
 
 async def test_stored_artifacts_and_health() -> None:
     rt = _runtime()
-    analysis_id, _events, result = await _run_to_completion(rt, {"query": "Assess Apple."})
+    analysis_id, _events, result = await _run_to_completion(rt, {"query": "Assess $AAPL."})
     job = await rt.store.get_job(analysis_id)
     assert job is not None and job.status == "completed" and job.instrument is not None
-    assert job.source_ids and job.last_seq > 100
+    assert job.source_ids and job.last_seq > 20
     assert job.profile == "fast" and job.normalization_version == "2026.09-1"
     assert job.spark_artifact is None and job.spark_runtime is None  # nothing was measured
     stored_events = await rt.store.list_events(analysis_id)
@@ -474,7 +469,7 @@ async def test_stored_artifacts_and_health() -> None:
     assert all(isinstance(e, AnalysisEvent) for e in stored_events)
     # Every artifact of a completed analysis is persisted, not only the result document.
     facts = await rt.store.get_facts(analysis_id)
-    assert facts and len(facts) == result["freshness_summary"]["facts"]["total"]
+    assert facts == [] and result["freshness_summary"]["facts"]["total"] == 0
     assert {s.source_id for s in await rt.store.get_sources(analysis_id)} == {
         s["source_id"] for s in result["sources"]
     }
@@ -499,44 +494,27 @@ async def test_stored_artifacts_and_health() -> None:
         assert caps["profiles"]["fast"]["available"] and caps["profiles"]["deep"]["available"]
 
 
-# ----------------------------------------------------------------------- live views / market
+# ----------------------------------------------------------------------- live research views
 
 
-async def test_live_research_and_market_views_end_to_end() -> None:
-    """The run announces every request, reports search hits, streams the quarterly
-    fundamentals, and keeps price points server-side unless price display is on."""
+async def test_live_research_events_end_to_end() -> None:
+    """The run announces every request right before it goes out, reports the search hits,
+    and never ships the excerpt of a page whose terms do not allow redistribution."""
     _, events, result = await _run_to_completion(
-        _runtime(), {"query": "Assess Apple.", "profile": "fast"}
+        _runtime(), {"query": "Assess $AAPL.", "profile": "fast"}
     )
     names = [e["event"] for e in events]
-    assert "research.fetching" in names
+    assert result["status"] == "completed"
+    assert "research.fetching" in names and "research.search_results" in names
+    assert names.index("research.search_results") < names.index("research.fetching")
     assert names.index("research.fetching") < names.index("research.source_found")
-    assert "market.series" not in names
-    fundamentals = next(e["data"] for e in events if e["event"] == "market.fundamentals")
-    assert names.index("normalization.completed") < names.index("market.fundamentals")
-    assert names.index("market.fundamentals") < names.index("spark.started")
-    quarters = fundamentals["quarters"]
-    assert 0 < len(quarters) <= 8 and all(q["revenue"] and q["end"] for q in quarters)
-    assert [q["end"] for q in quarters] == sorted(q["end"] for q in quarters)
-    assert all(q["gross_margin_pct"] is None or 0 < q["gross_margin_pct"] < 100 for q in quarters)
-    market = result["market"]
-    assert market["price_display"] is False and market["series"] == []
-    assert market["fundamentals"]["quarters"] == quarters
+    assert not any(n.startswith("market.") for n in names)
+    assert all(e["data"]["kind"] == "web" for e in events if e["event"] == "research.fetching")
     for e in events:
-        if e["event"] == "research.source_found" and e["data"]["redistribution"] != "allowed":
-            assert e["data"]["excerpt"] is None
-
-    shown = _settings().model_copy(update={"price_display": True})
-    _, events2, result2 = await _run_to_completion(
-        _runtime(shown), {"query": "Assess Apple.", "profile": "fast"}
-    )
-    series_events = [e["data"] for e in events2 if e["event"] == "market.series"]
-    assert series_events and series_events[0]["role"] == "company"
-    assert series_events[0]["symbol"] == "AAPL"
-    roles = [s["role"] for s in result2["market"]["series"]]
-    assert result2["market"]["price_display"] is True and roles[0] == "company"
-    assert set(roles) <= {"company", "broad_market", "sector"}
-    assert result2["market"]["series"][0]["points"][-1] == series_events[0]["points"][-1]
-    async with _client(_runtime(shown)) as client:
+        if e["event"] == "research.source_found":
+            assert "preview" not in e["data"]
+            if e["data"]["redistribution"] != "allowed":
+                assert e["data"]["excerpt"] is None
+    async with _client(_runtime()) as client:
         caps = (await client.get("/api/v1/capabilities")).json()
-    assert caps["market"] == {"price_display": True}
+    assert "market" not in caps and caps["web_search"] is True

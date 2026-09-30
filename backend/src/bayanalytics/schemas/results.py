@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Literal
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -67,7 +67,6 @@ class ResearchStats(BaseModel):
     search_rounds: int = 0
     queries_issued: int = 0
     queries_failed: int = 0  # search backend errors (the loop continued without them)
-    structured_failures: int = 0  # EDGAR / price endpoint errors after the first success
     sources_fetched: int = 0
     sources_rejected: int = 0
     duplicate_sources_removed: int = 0
@@ -212,44 +211,6 @@ class ThesisDiff(BaseModel):
     summary: list[str] = Field(default_factory=list)  # deterministic one-line statements
 
 
-PricePointRow = tuple[str, float | None, float | None, float | None, float, float | None]
-
-
-class MarketSeries(BaseModel):
-    """Daily price points for one symbol, as sent to clients when price display is enabled.
-
-    ``points`` rows are ``[date, open, high, low, close, volume]``, oldest first."""
-
-    role: Literal["company", "broad_market", "sector"]
-    symbol: str
-    name: str
-    source_id: str
-    currency: str = "USD"
-    interval: Literal["1d"] = "1d"
-    points: list[PricePointRow] = Field(default_factory=list)
-
-
-class FundamentalQuarter(BaseModel):
-    label: str
-    end: str  # ISO date
-    revenue: float | None = None
-    gross_margin_pct: float | None = None
-
-
-class MarketFundamentals(BaseModel):
-    """Quarterly revenue and gross margin from the normalized SEC facts, oldest first."""
-
-    currency: str = "USD"
-    quarters: list[FundamentalQuarter] = Field(default_factory=list)
-    source_ids: list[str] = Field(default_factory=list)
-
-
-class MarketView(BaseModel):
-    price_display: bool = False
-    series: list[MarketSeries] = Field(default_factory=list)
-    fundamentals: MarketFundamentals | None = None
-
-
 class AnalysisResult(BaseModel):
     analysis_id: str
     status: AnalysisStatus
@@ -271,7 +232,6 @@ class AnalysisResult(BaseModel):
     # met; None when the analysis stopped before the question was interpreted.
     requirements: RequirementsReport | None = None
     streamed_text: str = ""  # exactly what was streamed as spark.token, for recovery
-    market: MarketView = Field(default_factory=MarketView)
     telemetry: Telemetry = Field(default_factory=Telemetry)
     error: ErrorPayload | None = None
     partial: bool = False  # true when cancelled/failed with some content preserved

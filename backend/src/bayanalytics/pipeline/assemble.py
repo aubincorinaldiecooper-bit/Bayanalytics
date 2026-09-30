@@ -108,9 +108,7 @@ def build_structured_sections(
     ) is not None:
         valuation["valuation_extremeness"] = _decision_view(d)
 
-    benchmark_context: dict[str, Any] = {
-        "benchmarks": [r.model_dump() for r in evidence.benchmark_refs],
-    }
+    benchmark_context: dict[str, Any] = {}
     for name in (
         "relative_return_1y_vs_market",
         "relative_return_1y_vs_sector",

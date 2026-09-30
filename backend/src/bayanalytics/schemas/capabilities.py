@@ -15,10 +15,6 @@ class ProfileCapability(BaseModel):
     code: ErrorCode | None = None
 
 
-class MarketCapability(BaseModel):
-    price_display: bool = False
-
-
 class Capabilities(BaseModel):
     profiles: dict[str, ProfileCapability]
     voice: bool
@@ -26,7 +22,6 @@ class Capabilities(BaseModel):
     research: bool = True
     web_search: bool = False  # a search backend is configured (BAY_RESEARCH_SEARCH_URL)
     execution: ExecutionInfo = Field(default_factory=ExecutionInfo)
-    market: MarketCapability = Field(default_factory=MarketCapability)
 
 
 class ComponentHealth(BaseModel):

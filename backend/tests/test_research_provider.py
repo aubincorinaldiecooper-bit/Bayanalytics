@@ -263,7 +263,7 @@ async def test_fetcher_cache_hit_sets_from_cache(tmp_path: Path) -> None:
         fetcher = Fetcher(settings, http)
         # Bodies are only cached for allow-listed structured/public-domain hosts
         # (fetch.CACHE_BODY_HOSTS); journalism hosts are never body-cached.
-        url = "https://stooq.com/page"
+        url = "https://www.sec.gov/page"
         first = await fetcher.open(url)
         second = await fetcher.open(url)
         third = await fetcher.open(url, ttl_s=0)
