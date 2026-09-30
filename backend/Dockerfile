@@ -53,6 +53,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     HF_HUB_DISABLE_TELEMETRY=1 \
+    ORT_DISABLE_TELEMETRY=1 \
     BAY_SPARK_LLAMA_SERVER_BIN=/opt/llama/bin/llama-server \
     BAY_SPARK_MODEL_PATH=/app/models/spark.gguf \
     BAY_SPARK_LOCKFILE=/app/models/spark.lock.json \
