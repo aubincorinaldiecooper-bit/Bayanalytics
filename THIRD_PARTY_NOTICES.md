@@ -43,7 +43,7 @@ SOFTWARE.
 | Spark X2.5 1.7B Q4_K_M GGUF (`XHToken/Spark-X2.5-1.7B-GGUF`) | see the model card on Hugging Face; record it in `models/spark.lock.json` when downloading | `scripts/download_spark.py` |
 | Whisper Tiny ggml weights | MIT (OpenAI Whisper) | `scripts/setup_whisper.sh` |
 
-Public data sources have their own terms: SEC EDGAR (fair-access policy, contact e-mail in the
-User-Agent), Stooq daily prices (personal, non-commercial redistribution restrictions apply),
-and whatever the configured SearXNG instance returns. `SourceRecord.redistribution` and
-`terms_note` carry the per-source note into every result.
+Data comes only from web search: the search service in `search/` (SearXNG) and the pages its
+searches return, each under its publisher's own terms. `SourceRecord.redistribution` and
+`terms_note` carry the per-source note into every result, and third-party excerpts are sent to
+clients only when those terms allow redistribution.
