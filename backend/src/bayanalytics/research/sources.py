@@ -62,13 +62,6 @@ SOURCE_RULES: tuple[SourceRule, ...] = (
         terms_note="US government work; SEC fair-access policy applies to retrieval",
     ),
     SourceRule(
-        source_type="market_data",
-        redistribution="metadata_only",
-        hosts=("stooq.com", "stooq.pl"),
-        publisher="Stooq",
-        terms_note="Stooq terms: personal use, verify before redistribution",
-    ),
-    SourceRule(
         source_type="financial_journalism",
         redistribution="metadata_only",
         hosts=(

@@ -417,7 +417,7 @@ def test_extract_json_and_csv() -> None:
     listed = extract_json("https://example.com/list.json", "[1, 2]", NOW)
     assert listed.structured == {"items": [1, 2]}
     csv_record = extract_csv(
-        "https://stooq.com/q/d/l/?s=aapl.us&i=d",
+        "https://example.com/prices.csv",
         "Date,Open,High,Low,Close,Volume\n2026-09-24,1,2,0.5,1.5,100\n\n2026-09-25,1.5,2,1,1.8,120\n",
         NOW,
     )
@@ -494,7 +494,6 @@ def test_parse_datetime_lenient_formats() -> None:
             "SEC EDGAR",
             "allowed",
         ),
-        ("https://stooq.com/q/d/l/?s=aapl.us&i=d", "market_data", "Stooq", "metadata_only"),
         (
             "https://www.reuters.com/markets/x",
             "financial_journalism",
@@ -571,8 +570,6 @@ def test_classify_source_table(
     assert got_redistribution == redistribution
     if source_type == "regulatory_filing":
         assert note and "US government work" in note
-    if source_type == "market_data":
-        assert note == "Stooq terms: personal use, verify before redistribution"
     if source_type == "unverified_web":
         assert note is None
 
@@ -591,8 +588,8 @@ def test_canonical_url() -> None:
     )
     assert canonical_url("https://example.com/") == "https://example.com"
     assert canonical_url("https://example.com") == "https://example.com"
-    assert canonical_url("https://stooq.com/q/d/l/?s=^spx&i=d") == canonical_url(
-        "https://stooq.com/q/d/l/?i=d&s=%5Espx"
+    assert canonical_url("https://example.com/q?s=^spx&i=d") == canonical_url(
+        "https://example.com/q?i=d&s=%5Espx"
     )
 
 
