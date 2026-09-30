@@ -1,0 +1,25 @@
+use_default_settings:
+  engines:
+    remove:
+      - brave.videos
+
+server:
+  bind_address: "0.0.0.0"
+  port: 8080
+  secret_key: "${SEARXNG_SECRET}"
+  limiter: false
+  image_proxy: false
+
+search:
+  safe_search: 0
+  autocomplete: ""
+  formats:
+    - html
+    - json
+
+ui:
+  static_use_hash: true
+
+# BayAnalytics' only data source (see CLAUDE.md): the backend searches here and opens only the
+# pages these results link to. Search-engine snippets are never shown to users as evidence.
+# Brave Videos stays removed, as in CLIPIT's configuration this was migrated from.
