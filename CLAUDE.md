@@ -14,6 +14,12 @@ It never picks its own sources.
 - Never steer the search toward a chosen site: no `site:` operators, no provider names in
   query templates.
 - If data is missing, the analysis says so. It never fills the gap from somewhere else.
+- **Retrieving the data is web search's main job.** Price history (the company and the market
+  benchmark) and financial figures (quarterly revenue, margins, EPS, cash flow and the rest) are read
+  out of the pages the search returns: their tables, CSV/JSON responses and stated figures. They
+  feed the charts, the key stats and the calculations, and each number keeps the page it came from.
+  A chart or figure is empty only because no search result contained it, and the analysis then says
+  that plainly. It is never switched off by design and never filled from anywhere else.
 - A new source of any kind needs the owner's explicit approval **before** any code is written.
   Ask; don't assume that a spec line like "historical prices" or "filings" approves a provider.
 - `HttpResearchProvider` refuses to open any URL its own search did not return, and
