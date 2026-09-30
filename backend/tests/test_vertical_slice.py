@@ -31,7 +31,7 @@ EXECUTION = {
     "spark_mode": "managed",
     "whisper_mode": "disabled",
     "deployment": "local",
-    "search_configured": False,
+    "search_configured": True,
 }
 
 
@@ -310,6 +310,58 @@ async def test_leakage_guard_freezes_information_set() -> None:
 
 
 # ----------------------------------------------------------------------------- degraded paths
+
+
+_ONE_SITE_PAGE = """<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="bay-fixture" content="true">
+<title>[Fixture] {title}</title>
+<meta property="article:published_time" content="2026-09-{day}T09:00:00Z"></head>
+<body><main><article><h1>[Fixture] {title}</h1>
+<p>Synthetic fixture page {n} for the single-website test. It describes no real company and
+exists only so the extractor finds enough readable prose on the page to keep it.</p>
+<p>The fixture text says the fixture company's fixture quarter was broadly in line with the
+fixture expectations, and that fixture margins were steady, without giving any figure.</p>
+</article></main></body></html>
+"""
+
+
+def _one_site_fixture(tmp_path: Path) -> Path:
+    """Every search returns two pages from one website: kept, but one site is not enough."""
+    pages = json.loads((FIXTURES / "pages.json").read_text())["pages"]
+    for entry in pages.values():  # keep every apple body reachable from the new directory
+        if entry.get("body_file"):
+            entry["body_file"] = str((FIXTURES / entry["body_file"]).resolve())
+    hits = []
+    for n, day in ((1, 21), (2, 22)):
+        url = f"https://www.cnbc.com/2026/09/{day}/fixture-single-site-{n}.html"
+        body = tmp_path / f"single_site_{n}.html"
+        body.write_text(_ONE_SITE_PAGE.format(title=f"Single-site page {n}", day=day, n=n))
+        pages[url] = {"status": 200, "content_type": "text/html", "body_file": str(body)}
+        hits.append({"url": url, "title": f"[Fixture] Single-site page {n}", "engine": "fixture"})
+    (tmp_path / "pages.json").write_text(json.dumps({"fixture": True, "pages": pages}))
+    (tmp_path / "searches.json").write_text(json.dumps({"fixture": True, "searches": {"*": hits}}))
+    return tmp_path
+
+
+async def test_pages_from_a_single_website_are_insufficient_evidence(tmp_path: Path) -> None:
+    settings = _settings()
+    rt = build_runtime(
+        settings,
+        laya=RuleLaya(),
+        spark=ScriptedSpark(),
+        transcriber=FixedTranscriber(),
+        research=fixture_research_stack(settings, _one_site_fixture(tmp_path)),
+    )
+    _id, events, result = await _run_to_completion(rt, {"query": "Assess Apple."})
+    assert result["status"] == "failed" and events[-1]["event"] == "analysis.failed"
+    error = result["error"]
+    assert error["code"] == "INSUFFICIENT_EVIDENCE"
+    assert error["details"]["domains"] == ["cnbc.com"] and error["details"]["web_pages"] == 2
+    assert error["details"]["missing"] == ["pages from at least 2 different websites (found 1)"]
+    kept = [e["data"]["url"] for e in events if e["event"] == "research.source_found"]
+    assert any("fixture-single-site" in url for url in kept)
+    assert "spark.started" not in [e["event"] for e in events]  # nothing was synthesised
+
 
 
 async def test_cancel_mid_synthesis_preserves_partial_content() -> None:

@@ -57,6 +57,7 @@ from bayanalytics.research.intents import (
 )
 from bayanalytics.research.provider import EvidenceRecord, ResearchProviderError
 from bayanalytics.research.runner import REASON_SEARCH_FAILED, ResearchRunner, RoundResult
+from bayanalytics.research.sources import web_pages
 from bayanalytics.schemas.common import ErrorCode, source_rank, stable_id
 from bayanalytics.schemas.decisions import ChoiceAnswer, LayaDecision, LayaQuestionSet, NoulAnswer
 from bayanalytics.schemas.evidence import (
@@ -97,6 +98,7 @@ class RetrievalState:
     source_by_id: dict[str, SourceRecord] = field(default_factory=dict)
     evidence_by_source: dict[str, EvidenceRecord] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)  # provider outages, dropped rows, gaps
+    searches_issued: int = 0
     queries_failed: int = 0
     structured_failures: int = 0
 
@@ -288,6 +290,8 @@ class EquityAnalyzer:
         ctx: AnalysisContext,
         round_no: int,
     ) -> None:
+        if planned.kind == "search":
+            self.state.searches_issued += 1
         try:
             result = await runner.execute(planned, identity, request.as_of, ctx)
         except AnalysisError:
@@ -482,6 +486,9 @@ class EquityAnalyzer:
                     "price returns exclude dividends (price return, not total return)"
                 )
             segments = self._segments(comparable, prices)
+            if not fact_build.facts:
+                # Say what the assessment rests on when no figure could be verified.
+                uncertainties.insert(0, web_only_note(len(web_pages(records))))
             evidence = NormalizedEvidence(
                 symbol=self.identity.symbol,
                 as_of=as_of,
@@ -943,6 +950,15 @@ class EquityAnalyzer:
                 "source_id": evidence.prices.source_id,
             }
         return latest
+
+
+def web_only_note(pages: int) -> str:
+    """The uncertainty every assessment without verified financial figures carries."""
+    noun = "page" if pages == 1 else "pages"
+    return (
+        "No verified financial figures: this assessment is based only on "
+        f"{pages} web {noun} found by search."
+    )
 
 
 def _dedupe(items: list[str]) -> list[str]:

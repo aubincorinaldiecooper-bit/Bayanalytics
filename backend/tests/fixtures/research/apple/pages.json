@@ -90,6 +90,16 @@
    "status": 200,
    "content_type": "text/html; charset=utf-8",
    "body_file": "news/prnewswire_q3_syndicated.html"
+  },
+  "https://www.barrons.com/articles/fixture-apple-march-quarter-review-2026-05-04": {
+   "status": 200,
+   "content_type": "text/html; charset=utf-8",
+   "body_file": "news/barrons_march_quarter_review.html"
+  },
+  "https://www.zacks.com/stock/news/fixture-apple-june-quarter-preview-2026-06-15": {
+   "status": 200,
+   "content_type": "text/html; charset=utf-8",
+   "body_file": "news/zacks_june_quarter_preview.html"
   }
  }
 }

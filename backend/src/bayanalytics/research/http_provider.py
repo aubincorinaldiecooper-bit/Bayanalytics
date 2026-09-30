@@ -52,6 +52,11 @@ class HttpResearchProvider:
         self.fetcher = Fetcher(settings, self._http, allowed_hosts=allowed_hosts)
         self.searx = SearxngSearch(settings.research_search_url, self._http, settings.user_agent)
 
+    @property
+    def search_configured(self) -> bool:
+        """Whether a search backend (``BAY_RESEARCH_SEARCH_URL``) is configured."""
+        return self.searx.configured
+
     async def search(self, query: str) -> list[SearchResult]:
         return await self.search_with(query)
 

@@ -68,11 +68,13 @@ def test_execution_and_version_info_carry_no_configured_labels() -> None:
     assert Settings().graceful_shutdown_s == 10
     assert Settings.from_env({"BAY_GRACEFUL_SHUTDOWN_S": "4"}).graceful_shutdown_s == 4
     rt = _full_runtime()
+    # The fixture provider answers searches, so it reports a configured search backend.
     assert rt.execution_info() == ExecutionInfo(
-        spark_mode="managed", whisper_mode="disabled", deployment="local", search_configured=False
+        spark_mode="managed", whisper_mode="disabled", deployment="local", search_configured=True
     )
     assert rt.capabilities().execution == rt.execution_info()
     assert rt.capabilities().research is True and rt.capabilities().voice is True
+    assert rt.capabilities().web_search is True
     # price points stay server-side unless the operator turns price display on
     assert Settings().price_display is False and rt.capabilities().market.price_display is False
     assert Settings.from_env({"BAY_PRICE_DISPLAY": "true"}).price_display is True
@@ -118,7 +120,7 @@ async def test_runtime_close_closes_the_research_provider() -> None:
         research=stack,
     )
     await rt.start()
-    assert rt.search_configured is False and provider.closed is False
+    assert rt.search_configured is True and provider.closed is False
     assert rt.extras["laya_load"]["package_version"] is None  # a double measures no package
     await rt.close()
     assert provider.closed is True

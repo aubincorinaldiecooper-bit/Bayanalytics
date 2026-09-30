@@ -152,6 +152,22 @@
     "engine": "fixture",
     "score": 1.0,
     "publishedDate": "2026-07-30T20:07:00Z"
+   },
+   {
+    "url": "https://www.barrons.com/articles/fixture-apple-march-quarter-review-2026-05-04",
+    "title": "[Fixture] The March quarter in review",
+    "content": "Fixture review of the March quarter (synthetic figures).",
+    "engine": "fixture",
+    "score": 1.0,
+    "publishedDate": "2026-05-04T13:00:00Z"
+   },
+   {
+    "url": "https://www.zacks.com/stock/news/fixture-apple-june-quarter-preview-2026-06-15",
+    "title": "[Fixture] What to expect from the June quarter",
+    "content": "Fixture preview of the June quarter (synthetic figures).",
+    "engine": "fixture",
+    "score": 1.0,
+    "publishedDate": "2026-06-15T10:00:00Z"
    }
   ]
  }

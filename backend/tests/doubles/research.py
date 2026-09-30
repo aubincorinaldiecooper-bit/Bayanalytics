@@ -100,8 +100,19 @@ class FixtureFetcher:
 class FixtureResearchProvider:
     """``ResearchProvider`` reading searches from ``searches.json`` and pages via FixtureFetcher."""
 
-    def __init__(self, fixture_dir: Path | str, fetcher: FixtureFetcher | None = None) -> None:
+    def __init__(
+        self,
+        fixture_dir: Path | str,
+        fetcher: FixtureFetcher | None = None,
+        *,
+        search_configured: bool = True,
+        search_error: str | None = None,
+    ) -> None:
         self.dir = Path(fixture_dir)
+        # The fixture answers searches, so it counts as a configured search backend unless a
+        # test says otherwise; ``search_error`` makes every search fail like a backend outage.
+        self.search_configured = search_configured
+        self.search_error = search_error
         self.fetcher = fetcher or FixtureFetcher(self.dir)
         payload = _load_json(self.dir / SEARCHES_FILE)
         searches = payload.get("searches") if isinstance(payload.get("searches"), dict) else {}
@@ -123,6 +134,8 @@ class FixtureResearchProvider:
         max_results: int = 10,
     ) -> list[SearchResult]:
         self.queries.append(query)
+        if self.search_error is not None:
+            raise ResearchProviderError(self.search_error)
         items = self._searches.get(_normalise_query(query))
         if items is None:
             items = self._searches.get("*", [])

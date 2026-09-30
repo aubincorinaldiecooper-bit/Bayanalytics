@@ -600,7 +600,7 @@ async def test_full_seed_plan_runs_on_fixture(stack, settings: Settings) -> None
     stats = runner.finish("plan_complete")
     assert stats.termination_reason == "plan_complete"
     assert stats.queries_issued == 7
-    assert len(sources) == 7 + 1 + 1 + 2 + 4
+    assert len(sources) == 7 + 1 + 1 + 2 + 4 + 2  # + older coverage from the catch-all search
     assert len({s.source_id for s in sources}) == len(sources)
     assert all(s.rejected_reason is None for s in sources)
     assert stats.sources_rejected == 2
@@ -625,7 +625,7 @@ async def test_provenance_ids_are_stable_across_runs(settings: Settings) -> None
         return seen
 
     first, second = await run_plan(), await run_plan()
-    assert first == second and len(first) == 15
+    assert first == second and len(first) == 17
     assert len({sid for sid, _ in first}) == len(first)
     for source_id, url in first:
         assert source_id.startswith("src_") and len(source_id) == len("src_") + 16
@@ -673,7 +673,9 @@ async def test_fixture_provider_search_matching_and_fallback(settings: Settings)
     fallback = await provider.search_with(
         "something unknown", categories="news", time_range="month"
     )
-    assert [r.url for r in fallback] == [r.url for r in exact]
+    # the catch-all adds older coverage from two further sites
+    assert [r.url for r in fallback][: len(exact)] == [r.url for r in exact]
+    assert len(fallback) == len(exact) + 2
     narrowed = await provider.search('"Apple Inc." stock 2025 results')
     assert len(narrowed) == 3
     assert provider.queries[-1] == '"Apple Inc." stock 2025 results'

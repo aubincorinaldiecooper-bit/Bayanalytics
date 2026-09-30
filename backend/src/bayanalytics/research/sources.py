@@ -130,6 +130,24 @@ def classify_source(
     return UNKNOWN_RULE.source_type, name, UNKNOWN_RULE.redistribution, UNKNOWN_RULE.terms_note
 
 
+def domain_of(url: str) -> str:
+    """Registrable domain of a URL (``www.cnbc.com`` -> ``cnbc.com``); ``""`` when it has none."""
+    if not url:
+        return ""
+    try:
+        host = urlsplit(url).hostname or ""
+    except ValueError:
+        return ""
+    return registrable_domain(host) if host else ""
+
+
+def web_pages(sources: list[SourceRecord]) -> list[SourceRecord]:
+    """Kept sources with extracted text: the web pages an assessment can rest on."""
+    return [
+        s for s in sources if not s.rejected_reason and int(s.metadata.get("text_chars") or 0) > 0
+    ]
+
+
 def canonical_url(url: str) -> str:
     """Stable key for one page: lower-cased host, no tracking params, fragment or trailing /."""
     parts = urlsplit(url.strip())

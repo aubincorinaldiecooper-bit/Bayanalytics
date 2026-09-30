@@ -525,6 +525,23 @@ NEWS = [
     ),
 ]
 
+# Older coverage from two further websites, served only by the catch-all search ("*"): an
+# analysis frozen before the summer still finds dated pages from more than one site.
+OLDER_NEWS = [
+    (
+        "https://www.barrons.com/articles/fixture-apple-march-quarter-review-2026-05-04",
+        "news/barrons_march_quarter_review.html",
+        "2026-05-04T13:00:00Z",
+        "Fixture review of the March quarter (synthetic figures).",
+    ),
+    (
+        "https://www.zacks.com/stock/news/fixture-apple-june-quarter-preview-2026-06-15",
+        "news/zacks_june_quarter_preview.html",
+        "2026-06-15T10:00:00Z",
+        "Fixture preview of the June quarter (synthetic figures).",
+    ),
+]
+
 
 def build_pages() -> dict:
     pages: dict[str, dict] = {
@@ -585,7 +602,7 @@ def build_pages() -> dict:
         },
     }
     seen: set[str] = set()
-    for url, body_file, _, _ in NEWS:
+    for url, body_file, _, _ in NEWS + OLDER_NEWS:
         if body_file in seen and "utm_" in url:
             continue
         seen.add(body_file)
@@ -597,9 +614,9 @@ def build_pages() -> dict:
     return {"fixture": True, "pages": pages}
 
 
-def build_searches() -> dict:
+def _search_hits(news: list[tuple[str, str, str | None, str]]) -> list[dict]:
     results = []
-    for url, _, published, snippet in NEWS:
+    for url, _, published, snippet in news:
         item = {
             "url": url,
             "title": _title_for(url),
@@ -610,12 +627,17 @@ def build_searches() -> dict:
         if published:
             item["publishedDate"] = published
         results.append(item)
+    return results
+
+
+def build_searches() -> dict:
+    results = _search_hits(NEWS)
     return {
         "fixture": True,
         "searches": {
             '"Apple Inc." earnings OR guidance OR outlook': results,
             '"Apple Inc." stock 2025 results': results[2:5],
-            "*": results,
+            "*": results + _search_hits(OLDER_NEWS),
         },
     }
 
@@ -631,6 +653,10 @@ def _title_for(url: str) -> str:
         return "[Fixture] 3 things to watch this quarter"
     if "reuters" in url:
         return "[Fixture] October event recap"
+    if "barrons" in url:
+        return "[Fixture] The March quarter in review"
+    if "zacks" in url:
+        return "[Fixture] What to expect from the June quarter"
     return "[Fixture] Investor notice"
 
 

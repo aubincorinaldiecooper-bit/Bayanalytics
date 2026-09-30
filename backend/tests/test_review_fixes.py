@@ -48,7 +48,7 @@ from bayanalytics.spark.prompt import build_messages
 from bayanalytics.wiring import build_runtime
 from doubles import FixedTranscriber, RuleLaya, ScriptedSpark, fixture_research_stack
 from test_spark_client import FakeLlamaServer, Harness, messages
-from test_store_memory import make_calc, make_fact, make_source
+from test_store_memory import make_calc, make_source
 
 FIXTURES = Path(__file__).parent / "fixtures" / "research" / "apple"
 AS_OF = datetime(2026, 9, 27, tzinfo=UTC)
@@ -206,53 +206,130 @@ async def test_research_loop_honours_laya_stop_and_never_repeats_an_intent() -> 
 # --------------------------------------------------------------- evidence gate
 
 
-def test_evidence_gate_refuses_prices_or_news_alone() -> None:
-    price_only = NormalizedEvidence(
-        symbol="X", as_of=AS_OF, sources=[_src("src_px", "market_data", "csv")]
+def _page(source_id: str, url: str, text_chars: int = 900) -> SourceRecord:
+    """A kept web page as the runner records it (``text_chars`` from the extractor)."""
+    return make_source(source_id).model_copy(
+        update={
+            "url": url,
+            "source_type": "financial_journalism",
+            "extraction_method": "html_readability_v1",
+            "metadata": {"text_chars": text_chars},
+        }
+    )
+
+
+def test_evidence_gate_needs_two_pages_from_two_websites() -> None:
+    one_page = NormalizedEvidence(
+        symbol="X", as_of=AS_OF, sources=[_page("src_a", "https://www.cnbc.com/a")]
     )
     with pytest.raises(AnalysisError) as info:
-        _evidence_gate(price_only, ["earnings_history"])
+        _evidence_gate(one_page, ["earnings_history"])
     assert info.value.code == ErrorCode.INSUFFICIENT_EVIDENCE
-    assert len(info.value.details["missing"]) == 3
-    assert info.value.details["evidence_gaps"] == ["earnings_history"]
-    news_and_facts = NormalizedEvidence(
-        symbol="X",
-        as_of=AS_OF,
-        facts=[make_fact("f1", "src_news")],
-        sources=[_src("src_news", "financial_journalism", "html_readability_v1")],
+    details = info.value.details
+    assert details["missing"] == [
+        "at least 2 web pages with readable text (found 1)",
+        "pages from at least 2 different websites (found 1)",
+    ]
+    assert details["evidence_gaps"] == ["earnings_history"]
+    assert details["web_pages"] == 1 and details["domains"] == ["cnbc.com"]
+    # Two pages from one site (www and a subdomain count as the same site) are not enough.
+    same_site = one_page.model_copy(
+        update={
+            "sources": [
+                _page("src_a", "https://www.cnbc.com/a"),
+                _page("src_b", "https://markets.cnbc.com/b"),
+            ]
+        }
     )
-    with pytest.raises(AnalysisError):
-        _evidence_gate(news_and_facts, [])  # a fact without a primary source is still refused
-    ok = news_and_facts.model_copy(
-        update={"sources": [_src("src_10k", "regulatory_filing", "edgar_submissions")]}
+    with pytest.raises(AnalysisError) as info:
+        _evidence_gate(same_site, [])
+    assert info.value.details["missing"] == ["pages from at least 2 different websites (found 1)"]
+    # A kept source without extracted text (or a rejected one) is not a page to rest on.
+    textless = one_page.model_copy(
+        update={
+            "sources": [
+                _page("src_a", "https://www.cnbc.com/a"),
+                _page("src_b", "https://www.fool.com/b", text_chars=0),
+                _page("src_c", "https://www.wsj.com/c").model_copy(
+                    update={"rejected_reason": "paywalled"}
+                ),
+            ]
+        }
     )
+    with pytest.raises(AnalysisError) as info:
+        _evidence_gate(textless, [])
+    assert info.value.details["web_pages"] == 1
+    # Two sites are enough: no financial figure, filing or price series is required.
+    ok = one_page.model_copy(
+        update={
+            "sources": [
+                _page("src_a", "https://www.cnbc.com/a"),
+                _page("src_b", "https://www.fool.com/b"),
+            ]
+        }
+    )
+    assert not ok.facts and ok.prices is None
     _evidence_gate(ok, [])
 
 
-def test_evidence_gate_blames_a_structured_outage_only_when_one_happened() -> None:
-    price_only = NormalizedEvidence(
-        symbol="X", as_of=AS_OF, sources=[_src("src_px", "market_data", "csv")]
-    )
+def test_evidence_gate_reports_a_search_outage_only_when_every_search_failed() -> None:
+    empty = NormalizedEvidence(symbol="X", as_of=AS_OF)
     with pytest.raises(AnalysisError) as info:
-        _evidence_gate(price_only, ["earnings_history"], structured_failures=2)
+        _evidence_gate(empty, ["recent_news"], searches_issued=5, searches_failed=5)
     outage = info.value
     assert outage.code == ErrorCode.RESEARCH_UNAVAILABLE and outage.retryable is True
-    assert outage.details["reason"] == "structured_source_failed"
-    assert outage.details["structured_failures"] == 2
-    assert len(outage.details["missing"]) == 3
-    # Without an outage the same evidence is simply insufficient (and not retryable).
+    assert outage.details == {"reason": "search_failed", "searches_issued": 5, "searches_failed": 5}
+    # Some searches answered: whatever they found is judged on its own, not blamed on search.
     with pytest.raises(AnalysisError) as info:
-        _evidence_gate(price_only, [], structured_failures=0)
+        _evidence_gate(empty, [], searches_issued=5, searches_failed=4)
     assert info.value.code == ErrorCode.INSUFFICIENT_EVIDENCE
     assert info.value.retryable is False
-    # Complete evidence is never blamed on a failure elsewhere.
-    complete = NormalizedEvidence(
-        symbol="X",
-        as_of=AS_OF,
-        facts=[make_fact("f1", "src_10k")],
-        sources=[_src("src_10k", "regulatory_filing", "edgar_submissions")],
+    # No search issued at all (an empty plan) is not an outage either.
+    with pytest.raises(AnalysisError) as info:
+        _evidence_gate(empty, [], searches_issued=0, searches_failed=0)
+    assert info.value.code == ErrorCode.INSUFFICIENT_EVIDENCE
+
+
+async def test_an_analysis_without_a_search_backend_fails_before_research() -> None:
+    settings = _settings()
+    spark = ScriptedSpark()
+    rt = build_runtime(
+        settings,
+        laya=RuleLaya(),
+        spark=spark,
+        transcriber=FixedTranscriber(),
+        research=fixture_research_stack(settings, FIXTURES, search_configured=False),
     )
-    _evidence_gate(complete, [], structured_failures=3)
+    events, result = await _run(rt, {"query": "Assess Apple."})
+    names = [e.event for e in events]
+    assert result["status"] == "failed"
+    error = result["error"]
+    assert error["code"] == "RESEARCH_UNAVAILABLE" and error["retryable"] is False
+    assert error["details"] == {"reason": "search_not_configured"}
+    assert "BAY_RESEARCH_SEARCH_URL" in error["message"]
+    assert not any(n.startswith("research.") for n in names) and "spark.loading" not in names
+    assert spark.runs == [] and rt.research[0].queries == []
+    async with _client(rt) as client:
+        caps = (await client.get("/api/v1/capabilities")).json()
+    assert caps["web_search"] is False and caps["execution"]["search_configured"] is False
+
+
+async def test_an_analysis_whose_every_search_fails_is_a_research_outage() -> None:
+    settings = _settings()
+    rt = build_runtime(
+        settings,
+        laya=RuleLaya(),
+        spark=ScriptedSpark(),
+        transcriber=FixedTranscriber(),
+        research=fixture_research_stack(settings, FIXTURES, search_error="backend down"),
+    )
+    events, result = await _run(rt, {"query": "Assess Apple."})
+    assert result["status"] == "failed"
+    assert result["error"]["code"] == "RESEARCH_UNAVAILABLE"
+    assert result["error"]["details"]["reason"] == "search_failed"
+    searches = [e.data for e in events if e.event == "research.search_results"]
+    assert searches and all(s["failed"] is True and s["hits"] == [] for s in searches)
+    assert "backend down" not in str(result)  # transport text never reaches the client
 
 
 # --------------------------------------------------------------- shutdown and cancel semantics

@@ -897,20 +897,15 @@ async def test_a_guidance_question_with_a_small_source_budget_still_gets_company
     }
     rt = _runtime(_settings(research_max_sources=4), spark=ScriptedSpark(interpretations=script))
     _id, events, result = await _run_to_completion(rt, {"query": query})
-    assert result["status"] == "completed", result["error"]
     labels = [e["data"]["label"] for e in events if e["event"] == "research.query"]
     assert labels[:2] == ["XBRL company facts for Apple Inc.", "daily prices for AAPL"]
     assert result["telemetry"]["research"]["termination_reason"] == "max_sources"
+    # The budget filled up before any web page was kept, and the evidence gate needs pages
+    # from at least two websites: refused, with the searches it never reached reported.
+    assert result["status"] == "failed"
+    assert result["error"]["code"] == "INSUFFICIENT_EVIDENCE"
+    assert result["error"]["details"]["web_pages"] == 0
     requirements = result["requirements"]
-    assert {
-        "eps_growth_yoy",
-        "gross_margin",
-        "operating_margin",
-        "net_margin",
-        "operating_margin_change_bp",
-    } <= set(requirements["satisfied_calculations"])
-    assert requirements["missing_operands"] == []
-    # the searches the budget could not reach are reported, never a failure
     assert "retrieve_guidance_history" in requirements["missing_research_intents"]
 
 

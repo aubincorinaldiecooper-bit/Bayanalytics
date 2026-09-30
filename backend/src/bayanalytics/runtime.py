@@ -46,9 +46,10 @@ class Runtime:
 
     @property
     def search_configured(self) -> bool:
+        """Whether the research provider has a web search backend to ask (the only source of
+        evidence; an analysis cannot run without one)."""
         provider = self.research[0] if isinstance(self.research, tuple) and self.research else None
-        searx = getattr(provider, "searx", None)
-        return bool(getattr(searx, "configured", False))
+        return bool(getattr(provider, "search_configured", False))
 
     def execution_info(self) -> ExecutionInfo:
         s = self.settings
@@ -65,8 +66,8 @@ class Runtime:
         self.extras["execution"] = self.execution_info()
         if not self.search_configured:
             log.warning(
-                "BAY_RESEARCH_SEARCH_URL is not set: web search is disabled, research is "
-                "limited to SEC EDGAR and Stooq"
+                "BAY_RESEARCH_SEARCH_URL is not set: web search is not configured, so analyses "
+                "cannot run (evidence comes only from web search)"
             )
         await self.store.start()
         await self.runner.start()
@@ -147,6 +148,7 @@ class Runtime:
             voice=self.transcriber.available(),
             deployment=self.settings.deployment,
             research=self.research is not None,
+            web_search=self.search_configured,
             execution=self.execution_info(),
             market=MarketCapability(price_display=self.settings.price_display),
         )

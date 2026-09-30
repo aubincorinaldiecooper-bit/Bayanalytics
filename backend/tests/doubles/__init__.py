@@ -15,6 +15,7 @@ fixture provider through the real ``EdgarClient`` and ``StooqPrices``.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 from bayanalytics.config import Settings
 from bayanalytics.research.edgar import EdgarClient
@@ -42,10 +43,11 @@ __all__ = [
 
 
 def fixture_research_stack(
-    settings: Settings, fixture_dir: Path | str
+    settings: Settings, fixture_dir: Path | str, **provider_options: Any
 ) -> tuple[FixtureResearchProvider, EdgarClient, StooqPrices]:
     """The research stack over one fixture directory: the fixture provider plus the real EDGAR
-    and Stooq clients reading through the same ``FixtureFetcher``."""
+    and Stooq clients reading through the same ``FixtureFetcher``. ``provider_options`` go to
+    ``FixtureResearchProvider`` (``search_configured``, ``search_error``)."""
     fetcher = FixtureFetcher(fixture_dir)
-    provider = FixtureResearchProvider(fixture_dir, fetcher=fetcher)
+    provider = FixtureResearchProvider(fixture_dir, fetcher=fetcher, **provider_options)
     return provider, EdgarClient(fetcher, settings), StooqPrices(fetcher)

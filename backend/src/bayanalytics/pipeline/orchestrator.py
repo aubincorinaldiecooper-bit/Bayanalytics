@@ -45,6 +45,7 @@ from bayanalytics.pipeline.understanding import (
 )
 from bayanalytics.pipeline.understanding import TIMER_NAME as UNDERSTANDING_TIMER
 from bayanalytics.research.market import fundamentals_view, market_series
+from bayanalytics.research.sources import domain_of, web_pages
 from bayanalytics.runtime import Runtime
 from bayanalytics.schemas.common import ErrorCode, utcnow
 from bayanalytics.schemas.decisions import LayaDecision
@@ -177,6 +178,10 @@ async def run_analysis(job: AnalysisJob, ctx: AnalysisContext, rt: Runtime) -> A
                 confidence=round(identity.confidence, 3),
             )
             # 2. research ---------------------------------------------------------------
+            # Evidence comes only from web search: without a search backend there is nothing
+            # to research, so fail before any model time is spent.
+            if not rt.search_configured:
+                raise _search_not_configured()
             await _set_status(rt, job, "researching")
             # 2a. what the question requires: Spark pass 1 interprets it (a short structured
             # reading on its own Spark session, lock released before research), Laya confirms
@@ -240,7 +245,8 @@ async def run_analysis(job: AnalysisJob, ctx: AnalysisContext, rt: Runtime) -> A
             _evidence_gate(
                 evidence,
                 analyzer.compute_gaps(job.resolved_horizon, job.as_of),
-                structured_failures=analyzer.state.structured_failures,
+                searches_issued=analyzer.state.searches_issued,
+                searches_failed=analyzer.state.queries_failed,
             )
             # 4. Laya scoring -----------------------------------------------------------
             await _set_status(rt, job, "scoring")
@@ -498,37 +504,58 @@ def _pack_name(decisions: LayaDecisions) -> str:
     return str(chosen.decision) if chosen is not None else "all_standard"
 
 
+MIN_WEB_SOURCES = 2
+"""Kept web pages with extracted text an assessment needs (from ``MIN_WEB_DOMAINS`` sites)."""
+MIN_WEB_DOMAINS = 2
+
+
 def _evidence_gate(
-    evidence: NormalizedEvidence, gaps: list[str], *, structured_failures: int = 0
+    evidence: NormalizedEvidence,
+    gaps: list[str],
+    *,
+    searches_issued: int = 0,
+    searches_failed: int = 0,
 ) -> None:
-    """Refuse to synthesise without at least one normalized fact and one primary source
-    (AGENT.md section 24): a price series or a lone news snippet is not an assessment."""
-    primary = [s for s in evidence.sources if s.is_primary and not s.rejected_reason]
-    missing: list[str] = []
-    if not evidence.facts:
-        missing.append("normalized financial facts (filings / XBRL)")
-    if not primary:
-        missing.append("a primary source (regulatory filing, issuer release or transcript)")
-    if evidence.prices is None:
-        missing.append("price history")
-    if (not evidence.facts or not primary) and structured_failures:
-        # The facts are missing because a structured public source failed, not because the
-        # company lacks them: that is a retryable outage, not a verdict on the evidence.
+    """Refuse to synthesise from too little web evidence (AGENT.md section 24).
+
+    Research is web search only, so the floor is what search can supply: at least
+    ``MIN_WEB_SOURCES`` kept pages with extracted text, from at least ``MIN_WEB_DOMAINS``
+    different sites (one site repeating itself is not corroboration). When every search of
+    the run failed the search backend is down: that is a retryable outage, not a verdict on
+    the company. Financial figures and prices are not required: calculations report their
+    missing operands and the result says what it is based on.
+    """
+    if searches_issued and searches_failed >= searches_issued:
         raise AnalysisError(
             ErrorCode.RESEARCH_UNAVAILABLE,
+            "Web search failed for every query, so no evidence could be gathered. "
+            "Try again shortly.",
             details={
-                "reason": "structured_source_failed",
-                "missing": missing,
-                "structured_failures": structured_failures,
+                "reason": "search_failed",
+                "searches_issued": searches_issued,
+                "searches_failed": searches_failed,
             },
         )
-    if not evidence.facts or not primary:
+    pages = web_pages(evidence.sources)
+    domains = sorted({domain_of(s.url) for s in pages} - {""})
+    missing: list[str] = []
+    if len(pages) < MIN_WEB_SOURCES:
+        missing.append(
+            f"at least {MIN_WEB_SOURCES} web pages with readable text (found {len(pages)})"
+        )
+    if len(domains) < MIN_WEB_DOMAINS:
+        missing.append(
+            f"pages from at least {MIN_WEB_DOMAINS} different websites (found {len(domains)})"
+        )
+    if missing:
         raise AnalysisError(
             ErrorCode.INSUFFICIENT_EVIDENCE,
             details={
                 "missing": missing,
                 "evidence_gaps": gaps,
                 "sources": len(evidence.sources),
+                "web_pages": len(pages),
+                "domains": domains,
                 "facts": len(evidence.facts),
             },
         )
@@ -542,6 +569,16 @@ def _evidence_gate(
             ErrorCode.STALE_EVIDENCE,
             details={"freshness": {"facts": facts_buckets, "prices": prices_fresh}},
         )
+
+
+def _search_not_configured() -> AnalysisError:
+    return AnalysisError(
+        ErrorCode.RESEARCH_UNAVAILABLE,
+        "Web search is not configured on this server (BAY_RESEARCH_SEARCH_URL), so no "
+        "evidence can be gathered.",
+        retryable=False,
+        details={"reason": "search_not_configured"},
+    )
 
 
 def _spark_busy(spark: Any) -> bool:
