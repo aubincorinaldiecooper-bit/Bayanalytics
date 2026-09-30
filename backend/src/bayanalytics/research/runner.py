@@ -5,16 +5,29 @@ finance layer owns: leakage guard against ``as_of``, paywall and thin-content re
 deduplication, source classification, provenance records, budget enforcement, counters and
 observable events. Every page it opens is a hit of the search it just ran.
 
+Retrieving data is web search's main job: with a Laya wrapper the runner asks Laya which hits
+most likely hold the intent's topic and opens them in that order (engine order without Laya),
+and for every page with candidate tables it asks Laya which table is the daily price history
+or the quarterly results, which column is the close and which line is which figure
+(``research.selection``). Deterministic code reads what was chosen (``research.tables``); the
+series and figures accumulate in ``MarketData`` with the page they came from. A page with data
+is kept even when its readable text is short (a CSV or JSON response has none).
+
 Events emitted HERE (the analyzer emits ``research.started`` / ``research.completed``):
 
 * ``research.query``            {intent, kind, query, label, round}
 * ``research.search_results``   {query, intent, round, total, failed, hits}
+* ``laya.started`` / ``laya.decision`` / ``laya.completed`` for the ``source_selection`` and
+  ``data_identification`` choices
 * ``research.fetching``         {url, domain, kind="web", label, intent, round}
 * ``research.fetch_skipped``    {url, domain, reason ("duplicate" | "budget"), intent, round}
 * ``research.source_found``     SourceRecord.public_view() + {domain, fetch_ms, text_chars,
-  redistribution, excerpt (only when redistribution == "allowed"), intent, round}
+  redistribution, excerpt (only when redistribution == "allowed"), preview (a small table when
+  the page yielded prices or figures, else null), intent, round}
 * ``research.source_rejected``  {url, title, reason, domain, fetch_ms, intent, round};
   ``reason`` is always one of ``REJECTION_REASONS`` (fixed keywords, never transport text)
+* ``market.series``             a price series the analysis keeps (company or broad market),
+  right after its page's ``research.source_found``
 """
 
 from __future__ import annotations
@@ -22,21 +35,32 @@ from __future__ import annotations
 import logging
 import time
 from datetime import datetime
+from typing import Any
 
 from pydantic import BaseModel, Field
 
 from bayanalytics.config import Settings
 from bayanalytics.context import AnalysisContext
+from bayanalytics.errors import AnalysisError
 from bayanalytics.instruments.base import InstrumentIdentity, ResearchBudget
+from bayanalytics.laya.wrapper import LayaFinanceWrapper
 from bayanalytics.research.dedup import Deduplicator
 from bayanalytics.research.http_provider import REASON_NOT_FROM_SEARCH
-from bayanalytics.research.intents import PlannedQuery
+from bayanalytics.research.intents import PlannedQuery, intent_topic
+from bayanalytics.research.market import (
+    BROAD_MARKET,
+    BROAD_MARKET_NAME,
+    BROAD_MARKET_SYMBOL,
+    COMPANY,
+    MarketData,
+)
 from bayanalytics.research.provider import (
     EvidenceRecord,
     ResearchProvider,
     ResearchProviderError,
     SearchResult,
 )
+from bayanalytics.research.selection import PageData, identify_page_data, order_hits, role_for
 from bayanalytics.research.sources import (
     canonical_url,
     classify_freshness,
@@ -45,6 +69,7 @@ from bayanalytics.research.sources import (
     source_record_from_evidence,
 )
 from bayanalytics.schemas.common import stable_id, utcnow
+from bayanalytics.schemas.decisions import LayaDecision
 from bayanalytics.schemas.evidence import SourceRecord
 from bayanalytics.schemas.results import ResearchStats
 
@@ -108,15 +133,26 @@ class RoundResult(BaseModel):
 
 
 class ResearchRunner:
+    """``laya`` makes the bounded choices (hit order, tables, columns, lines); without it hits
+    open in engine order and no table is read. ``market`` accumulates the series and figures
+    read from pages; ``decisions`` receives every Laya decision the runner records."""
+
     def __init__(
         self,
         provider: ResearchProvider,
         settings: Settings,
         budget: ResearchBudget,
+        *,
+        laya: LayaFinanceWrapper | None = None,
+        market: MarketData | None = None,
+        decisions: list[LayaDecision] | None = None,
     ) -> None:
         self.provider = provider
         self.settings = settings
         self.budget = budget
+        self.laya = laya
+        self.market = market if market is not None else MarketData()
+        self.decisions: list[LayaDecision] = decisions if decisions is not None else []
         self.stats = ResearchStats()
         self.dedup = Deduplicator()
         self.kept_sources = 0
@@ -196,6 +232,7 @@ class ResearchRunner:
         *,
         fetch_ms: int | None = None,
         text_chars: int | None = None,
+        preview: dict[str, Any] | None = None,
     ) -> None:
         self.kept_sources += 1
         result.sources.append(source)
@@ -212,6 +249,7 @@ class ResearchRunner:
             text_chars=text_chars,
             redistribution=source.redistribution,
             excerpt=excerpt,
+            preview=preview,
             intent=result.intent,
             round=self._round,
         )
@@ -317,6 +355,15 @@ class ResearchRunner:
                 for h in results[:8]
             ],
         )
+        results, decisions = await order_hits(
+            self.laya,
+            results,
+            symbol=identity.symbol,
+            topic=intent_topic(planned.intent, planned.params.get("gap")),
+            query=planned.query or "",
+            ctx=ctx,
+        )
+        self.decisions.extend(decisions)
         attempts = 0
         for hit in results:
             if attempts >= self.budget.max_fetch_per_round:
@@ -365,15 +412,89 @@ class ResearchRunner:
             if record.published_at is not None and record.published_at > as_of:
                 await self._reject(source, REASON_LEAKAGE, ctx, result, fetch_ms=fetch_ms)
                 continue
-            if len(record.text) < MIN_TEXT_CHARS:
-                await self._reject(source, REASON_THIN, ctx, result, fetch_ms=fetch_ms)
-                continue
             if self.dedup.seen_record(record, check_url=False):
                 result.duplicates += 1
                 self.stats.duplicate_sources_removed += 1
                 await self._skipped(ctx, hit.url, "duplicate", result.intent)
                 continue
-            await self._keep(source, ctx, result, record, fetch_ms=fetch_ms, text_chars=text_chars)
+            page = await self._page_data(record, source, identity, result.intent, as_of, ctx)
+            if len(record.text) < MIN_TEXT_CHARS and not page.has_data:
+                await self._reject(source, REASON_THIN, ctx, result, fetch_ms=fetch_ms)
+                continue
+            if page.has_data:
+                source.metadata["data"] = page.summary()
+            await self._keep(
+                source,
+                ctx,
+                result,
+                record,
+                fetch_ms=fetch_ms,
+                text_chars=text_chars,
+                preview=page.preview(),
+            )
+            await self._use_page_data(page, source, identity, result.intent, as_of, ctx)
+
+    async def _page_data(
+        self,
+        record: EvidenceRecord,
+        source: SourceRecord,
+        identity: InstrumentIdentity,
+        intent: str,
+        as_of: datetime,
+        ctx: AnalysisContext,
+    ) -> PageData:
+        """Laya's choices among the page's candidate tables and the deterministic reading of
+        them. A parser failure on hostile content means no data from the page, never a failed
+        analysis; a cancellation propagates."""
+        try:
+            page = await identify_page_data(
+                self.laya,
+                record,
+                source_id=source.source_id,
+                symbol=identity.symbol,
+                role=role_for(intent),
+                as_of=as_of.date(),
+                ctx=ctx,
+            )
+        except AnalysisError:
+            raise
+        except Exception:
+            log.exception("reading tables failed for %s", record.final_url or record.url)
+            return PageData()
+        self.decisions.extend(page.decisions)
+        for note in page.notes:
+            self.market.note(f"{domain_of(source.url)}: {note}")
+        return page
+
+    async def _use_page_data(
+        self,
+        page: PageData,
+        source: SourceRecord,
+        identity: InstrumentIdentity,
+        intent: str,
+        as_of: datetime,
+        ctx: AnalysisContext,
+    ) -> None:
+        """Keep what the page yielded: its price series (``market.series`` when it becomes the
+        company's or the market's series) and its figures."""
+        if page.prices is not None:
+            if role_for(intent) == BROAD_MARKET:
+                payload = self.market.offer_series(
+                    BROAD_MARKET, BROAD_MARKET_SYMBOL, BROAD_MARKET_NAME, source, page.prices
+                )
+            else:
+                payload = self.market.offer_series(
+                    COMPANY,
+                    identity.symbol,
+                    identity.name or identity.symbol,
+                    source,
+                    page.prices,
+                    identity.exchange,
+                )
+            if payload is not None:
+                await ctx.event("market.series", **payload.model_dump(mode="json"))
+        if page.figures is not None:
+            self.market.add_figures(source, page.figures, as_of.date())
 
     def _source_from_hit(
         self, hit: SearchResult, identity: InstrumentIdentity, result: RoundResult, as_of: datetime

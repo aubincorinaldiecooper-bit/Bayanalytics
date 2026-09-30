@@ -198,11 +198,13 @@ async def test_assess_apple_end_to_end() -> None:
         i["source_ids"] or i["calc_id"] or i["decision_id"] for i in assessment["bull_evidence"]
     )
     assert (
-        "No verified financial figures: this assessment is based only on "
-        f"{len(sources)} web pages found by search."
+        "Web search returned no page with price history or quarterly figures: this "
+        f"assessment is based only on the text of {len(sources)} web pages found by search."
     ) in assessment["uncertainties"]
     assert "benchmarks" not in assessment["benchmark_context"]
-    assert "market" not in result
+    # No search result held a price or figures table: honest empty views, no market events.
+    assert result["market"] == {"series": [], "fundamentals": None}
+    assert "market.series" not in names and "market.fundamentals" not in names
     assert len(result["horizon_assessments"]) == 4
     for horizon, item in result["horizon_assessments"].items():
         assert item["stance"] in {"bullish", "neutral", "bearish", "mixed"}
@@ -512,7 +514,7 @@ async def test_live_research_events_end_to_end() -> None:
     assert all(e["data"]["kind"] == "web" for e in events if e["event"] == "research.fetching")
     for e in events:
         if e["event"] == "research.source_found":
-            assert "preview" not in e["data"]
+            assert e["data"]["preview"] is None  # no page here holds a price or figures table
             if e["data"]["redistribution"] != "allowed":
                 assert e["data"]["excerpt"] is None
     async with _client(_runtime()) as client:

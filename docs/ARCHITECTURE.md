@@ -167,7 +167,11 @@ calculating → synthesizing → completed | failed | cancelled`. Every transiti
 The SSE stream (`GET /api/v1/analyses/{id}/events`) carries only recorded system state:
 
 ```
-analysis.started → instrument.resolved
+analysis.started
+→ research.query / research.search_results (intent resolve_instrument, round 0)
+  → laya.started → laya.decision → laya.completed          (instrument_resolution; only when the
+                                                            question names a company, no ticker)
+→ instrument.resolved
 → spark.queued?                                             (stage query_understanding; only when
                                                             the Spark lane is busy)
 → spark.loading?                                            (only when Spark pass 1 loads the
@@ -182,9 +186,14 @@ analysis.started → instrument.resolved
   url/title/domain/date; no third-party snippets) after each web search; research.fetching
   (kind "web") right before every page request; each request then ends in
   research.source_found, research.source_rejected or research.fetch_skipped (duplicate, budget).
-  research.source_found also carries domain, fetch_ms, text_chars, redistribution, and the
-  excerpt only when the source's redistribution is "allowed".
-→ research.completed → normalization.completed
+  research.source_found also carries domain, fetch_ms, text_chars, redistribution, the
+  excerpt only when the source's redistribution is "allowed", and a preview table when the
+  page yielded prices or figures. Laya's source_selection choice follows each search with two
+  or more hits; its data_identification choices precede the research.source_found of a page
+  with candidate tables; market.series follows the research.source_found of a page whose price
+  series was kept (company or broad market).
+→ research.completed → normalization.completed → market.fundamentals?  (when quarterly revenue
+                                                                         was read)
 → laya.started → laya.decision × n → laya.completed        (evidence_scan, history_scan, text_evidence)
 → calculation.started → calculation.completed × n
 → laya.started → laya.decision × n → laya.completed        (horizon stances)
@@ -301,8 +310,21 @@ nothing: it is met when the prior completed assessment exists that the question-
 - *Every intent is a web search.* `build_queries` maps each intent to a topic-only query
   template (no `site:` operator, no provider or site name); the required intents come first,
   then the horizon seed, deduplicated, and the research budget bounds execution.
-- *Web pages are text evidence.* Pages are not parsed into financial facts or price series, so
-  required operands stay unmet and their calculations report the missing inputs.
+- *Search results carry the data.* After each search Laya orders the hits by how likely each
+  holds the intent's topic (engine order without Laya). For a kept page, `research/tables.py`
+  finds the candidate tables in the body the fetcher already has (HTML tables, CSV/JSON
+  responses, JSON script blocks; links inside a page are never followed) and Laya chooses
+  (stage `data_identification`): which table is the daily price history or the quarterly
+  results, which column is the close, which row is each figure. Only options that exist are
+  offered; `none` or a confidence below 0.5 skips the table or line. Deterministic code reads
+  the choice: dates in several formats, thousands separators, `$`, K/M/B suffixes, units from
+  the caption or the text before the table, periods that need an end date written on the page,
+  rows after `as_of` dropped, implausible values (margins outside 0-100 %, out-of-range amounts)
+  dropped. Figures become `build_facts` rows (one per page, no `fy`/`fp`: periods line up by end
+  date), so pages that disagree are conflicts; the company series and the S&P 500 series come
+  from different pages. `research/market.py` keeps them with their pages and writes the
+  uncertainty lines (figures from how many pages, which figures only one page reported, or that
+  search returned no page with them).
 - Required operands the retrieval state lacks become evidence gaps under their metric name
   (`gap_to_intent` maps them to `retrieve_earnings_history`, and once that ran the loop
   escalates to one `retrieve_missing_metric` search whose template spells the metric out); the
@@ -366,8 +388,16 @@ on the result. Without a configured search backend an analysis fails before rese
 `RESEARCH_UNAVAILABLE` (`search_not_configured`); when every search of a run failed it ends as
 `RESEARCH_UNAVAILABLE` (`search_failed`). Otherwise the evidence gate needs at least two kept
 web pages with readable text from at least two different websites, or the run ends as
-`INSUFFICIENT_EVIDENCE`; a result without verified figures says it is based only on the web
-pages found by search.
+`INSUFFICIENT_EVIDENCE`; a result for which no search result held a price or figures table
+says so and that it is based only on the text of the web pages found by search.
+
+A question with a company name but no ticker is resolved before research (stage
+`instrument_resolution`): one topic-only search `"<name>" stock ticker symbol`, the tickers its
+result titles and snippets name next to a company name, ranked by distinct websites, and a Laya
+choice among at most five of them plus `none`. A choice at confidence 0.6 or more that does not
+tie on websites with another candidate is the instrument (its name as the results wrote it);
+anything else is `AMBIGUOUS_INSTRUMENT` with the candidates, or `ticker_required` when the
+results name no ticker. A ticker in the question always wins without a search.
 
 ## Evidence-only boundary
 

@@ -6,7 +6,10 @@ templates are deterministic so retrieval is reproducible for evaluation.
 
 Every intent is a web search. Templates describe the topic only: no ``site:`` operators and no
 provider, site or brand names (``tests/test_source_policy.py`` checks this), so what is read is
-whatever the search engine returns.
+whatever the search engine returns. The data intents (price history, earnings history, the
+market benchmark) search for pages that carry the numbers as tables, by ticker: naming an
+index ("S&P 500") is a topic, not a source. There is no sector without a company directory, so
+the benchmark is the broad market only.
 """
 
 from __future__ import annotations
@@ -158,6 +161,31 @@ def _display_name(identity: InstrumentIdentity) -> str:
     return identity.name.strip() or identity.symbol
 
 
+BROAD_MARKET_QUERY = "S&P 500 index historical prices daily"
+
+# What each intent's pages should hold, in words (Laya's question when it orders the hits).
+INTENT_TOPICS: dict[ResearchIntent, str] = {
+    ResearchIntent.retrieve_latest_filing: "the company's latest annual or quarterly report",
+    ResearchIntent.retrieve_recent_news: "recent news about the company",
+    ResearchIntent.retrieve_historical_coverage: "coverage of the company's past results",
+    ResearchIntent.retrieve_price_history: "a table of the stock's daily prices",
+    ResearchIntent.retrieve_sector_benchmark: "a table of the S&P 500 index's daily prices",
+    ResearchIntent.retrieve_earnings_history: "a table of the company's quarterly results",
+    ResearchIntent.retrieve_guidance_history: "changes to the company's guidance",
+    ResearchIntent.retrieve_management_commentary: "management remarks on an earnings call",
+    ResearchIntent.retrieve_missing_metric: "the figure the analysis is missing",
+    ResearchIntent.stop_research: "nothing further",
+}
+
+
+def intent_topic(intent: ResearchIntent | str, gap: str | None = None) -> str:
+    """The topic the hits of ``intent``'s search should hold (a missing metric names its gap)."""
+    resolved = ResearchIntent(intent)
+    if resolved is ResearchIntent.retrieve_missing_metric and gap:
+        return f"the company's {gap.strip().replace('_', ' ')} figures"
+    return INTENT_TOPICS[resolved]
+
+
 def build_queries(
     intent: ResearchIntent | str,
     identity: InstrumentIdentity,
@@ -168,6 +196,7 @@ def build_queries(
     """Deterministic templates: same inputs always yield the same planned web searches."""
     intent = ResearchIntent(intent)
     name = _display_name(identity)
+    symbol = identity.symbol
     year = ensure_utc(as_of).year
     gaps = [g for g in (gaps or []) if g and g.strip()]
 
@@ -208,24 +237,20 @@ def build_queries(
             f"latest annual or quarterly report for {name}",
             time_range="year",
         )
+    # Data pages are evergreen tables, so these searches carry no time range; rows after
+    # ``as_of`` are dropped when the tables are read.
     if intent is ResearchIntent.retrieve_earnings_history:
         return search(
-            f'"{name}" quarterly results revenue earnings per share {year}',
-            f"earnings history for {name}",
-            time_range="year",
+            f'"{symbol}" quarterly revenue gross profit earnings per share',
+            f"quarterly figures for {symbol}",
         )
     if intent is ResearchIntent.retrieve_price_history:
         return search(
-            f'"{name}" stock price performance {year}',
-            f"share price performance for {name}",
-            time_range="year",
+            f'"{symbol}" stock historical prices daily',
+            f"daily price history for {symbol}",
         )
     if intent is ResearchIntent.retrieve_sector_benchmark:
-        return search(
-            f'"{name}" stock performance compared with sector peers and the market {year}',
-            f"sector and market comparison for {name}",
-            time_range="year",
-        )
+        return search(BROAD_MARKET_QUERY, "daily S&P 500 history (broad-market benchmark)")
     if intent is ResearchIntent.retrieve_missing_metric:
         planned: list[PlannedQuery] = []
         for gap in gaps[:MAX_GAP_QUERIES]:

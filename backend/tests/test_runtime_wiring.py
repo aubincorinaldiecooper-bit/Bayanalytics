@@ -203,17 +203,28 @@ async def test_wiring_resolver_factory_needs_no_directory_or_network() -> None:
     rt = _full_runtime()
     resolver = await rt.extras["resolver_factory"]()
     assert resolver.resolve("Assess $AAPL.").symbol == "AAPL"
-    app = create_app(rt.settings, runtime=rt)
-    async with app.router.lifespan_context(app):
-        transport = httpx.ASGITransport(app=app)
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-            resp = await client.post("/api/v1/analyses", json={"query": "Assess Apple."})
-    assert resp.status_code == 422
-    error = resp.json()["error"]
-    assert error["code"] == "AMBIGUOUS_INSTRUMENT"
-    assert error["details"] == {"reason": "ticker_required", "candidates": []}
-    assert rt.runner.active_count == 0  # nothing was admitted
-    assert rt.research.queries == []  # identity never searches
+    # A company name is looked up by the analysis (web search + Laya, tests/test_web_data.py);
+    # without web search, or without a company in the question, POST asks for the ticker.
+    settings = _settings()
+    offline = build_runtime(
+        settings,
+        laya=RuleLaya(),
+        spark=ScriptedSpark(),
+        transcriber=FixedTranscriber(),
+        research=fixture_research_stack(settings, FIXTURES, search_configured=False),
+    )
+    for runtime, query in ((offline, "Assess Apple."), (rt, "How is it doing?")):
+        app = create_app(runtime.settings, runtime=runtime)
+        async with app.router.lifespan_context(app):
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                resp = await client.post("/api/v1/analyses", json={"query": query})
+        assert resp.status_code == 422
+        error = resp.json()["error"]
+        assert error["code"] == "AMBIGUOUS_INSTRUMENT"
+        assert error["details"] == {"reason": "ticker_required", "candidates": []}
+        assert runtime.runner.active_count == 0  # nothing was admitted
+        assert runtime.research.queries == []  # POST never searches
 
 
 async def test_wiring_versions_are_measured_not_configured(tmp_path: Path) -> None:

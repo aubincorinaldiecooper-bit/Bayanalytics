@@ -16,7 +16,15 @@ Input row contract (produced by the research module; agreed, do not change here)
       "source_id": "src_...",
       "basis": "gaap" | "adjusted" | "unknown",   # default gaap (XBRL is GAAP)
       "currency": "USD",                    # default USD
+      "period_kind": "fiscal_quarter" | "fiscal_year" | None,  # optional, see below
     }
+
+Rows read from web pages (``research.market``) carry no start date: a page states a period's
+end ("Jun 27, 2026") and whether it is a quarter or a fiscal year, not its first day. Their
+optional ``period_kind`` names the kind so the period is not mistaken for an instant; ``fy`` /
+``fp`` stay empty (a page's "Q3 2026" may be a fiscal or a calendar label), so periods line up
+by their end dates. Such rows have no filing date either (``filed`` is ``None``): two pages that
+report different values for one period are a same-date ``Conflict``, never a restatement.
 
 What ``build_facts`` guarantees:
 
@@ -225,7 +233,15 @@ def _prepare_rows(rows: Iterable[dict[str, Any]], as_of: datetime, build: FactBu
                 {"row": row, "reason": f"period end {end.isoformat()} after as_of", "index": index}
             )
             continue
-        period = period_from_xbrl(start, end, row.get("fy"), row.get("fp"), row.get("form"))
+        kind_hint = row.get("period_kind")
+        period = period_from_xbrl(
+            start,
+            end,
+            row.get("fy"),
+            row.get("fp"),
+            row.get("form"),
+            kind_hint=kind_hint if kind_hint in ("fiscal_quarter", "fiscal_year") else None,
+        )
         _kind, period_note = classify_duration(start, end, row.get("fp"))
         unit = normalize_unit(row.get("unit"))
         currency = str(row.get("currency") or "USD").upper()

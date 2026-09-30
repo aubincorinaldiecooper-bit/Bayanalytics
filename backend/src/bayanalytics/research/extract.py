@@ -7,7 +7,10 @@ limits (section 26): main text is capped at ``MAX_TEXT_CHARS`` and the stored ex
 can be detected without keeping full articles.
 
 Only the standard library is used: ``html.parser`` builds a tiny DOM, and a small readability
-heuristic scores block containers by paragraph text length and link density.
+heuristic scores block containers by paragraph text length and link density. The page's tables
+(``<table>`` elements and JSON script blocks, see ``research.tables``) are kept, bounded, in
+``EvidenceRecord.structured["tables"]`` so price history and reported figures can be read from
+the page the search returned; links inside a page are never followed.
 
 Hostile input: element nesting is capped at ``MAX_DOM_DEPTH`` in the tree builder (a page
 nested deeper is rejected as ``extract_failed``; real pages stay far below the cap) and every
@@ -33,6 +36,7 @@ from urllib.parse import urlsplit
 from bayanalytics.research.dates import parse_datetime_lenient
 from bayanalytics.research.fetch import PAYWALL_HEADER, REASON_EXTRACT_FAILED, TaggedProviderError
 from bayanalytics.research.provider import EvidenceRecord, PageResult, ResearchProviderError
+from bayanalytics.research.tables import html_tables
 
 log = logging.getLogger(__name__)
 
@@ -496,8 +500,19 @@ def extract_html(url: str, html: str, fetched_at: datetime) -> EvidenceRecord:
         content_hash=content_hash(text),
         extraction_method=HTML_METHOD,
         language=(tree.html_lang or None),
+        structured={"tables": _tables_of(url, html)},
         metadata={"paragraphs": len(paragraphs), "container": container.tag if container else None},
     )
+
+
+def _tables_of(url: str, html: str) -> list[dict[str, Any]]:
+    """The page's tables (bounded); a table the parser cannot read costs the tables only,
+    never the page's text."""
+    try:
+        return [table.to_dict() for table in html_tables(html)]
+    except Exception as exc:
+        log.warning("table extraction failed for %s (%s)", url, type(exc).__name__)
+        return []
 
 
 def _first_heading(root: _Node) -> str:
@@ -602,13 +617,25 @@ def page_kind(page: PageResult) -> str:
     if "html" in ctype or "xml" in ctype or path.endswith((".htm", ".html")):
         return "html"
     if ctype.startswith("text/plain"):
-        return "text"
+        return "csv" if _looks_like_csv(page.body) else "text"
     body_head = page.body.lstrip()[:64].lower()
     if body_head.startswith(("<!doctype", "<html", "<head", "<body")):
         return "html"
     if body_head.startswith(("{", "[")):
         return "json"
     return "html"
+
+
+def _looks_like_csv(body: str) -> bool:
+    """A plain-text body whose first two lines are comma-separated with the same field count
+    and a header of short, non-numeric names (a CSV served as ``text/plain``)."""
+    lines = [line for line in body.lstrip().splitlines()[:2] if line.strip()]
+    if len(lines) < 2:
+        return False
+    header, first = lines[0].split(","), lines[1].split(",")
+    if len(header) < 2 or len(header) != len(first):
+        return False
+    return all(0 < len(cell.strip()) <= 30 and not cell.strip()[:1].isdigit() for cell in header)
 
 
 def extract_page(page: PageResult) -> EvidenceRecord:

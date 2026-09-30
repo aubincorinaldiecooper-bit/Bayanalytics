@@ -159,20 +159,42 @@ contacts that search engine (`BAY_RESEARCH_SEARCH_URL`; on Railway
 `http://${{searxng.RAILWAY_PRIVATE_DOMAIN}}:8080`) and the pages those searches returned, with
 their redirects and `robots.txt`. `HttpResearchProvider` refuses to open any URL its own search
 did not return, query templates carry no `site:` operator or provider name, and
-`tests/test_source_policy.py` fails the build if product code gains a hard-coded data URL. Web
-pages are evidence as text: they are not parsed into financial figures or price series, so the
-deterministic calculations report their missing operands and every result says it is based only
-on the web pages found by search. The instrument is the ticker in the question (`$AAPL`, `AAPL`
-or an explicit `instrument`); without one `POST /analyses` answers `AMBIGUOUS_INSTRUMENT` with
-`details.reason = ticker_required`.
+`tests/test_source_policy.py` fails the build if product code gains a hard-coded data URL.
+
+Retrieving the data is web search's main job. Topic-only searches by ticker
+(`"AAPL" stock historical prices daily`, `"AAPL" quarterly revenue gross profit earnings per
+share`, `S&P 500 index historical prices daily`) return pages whose tables carry the numbers;
+`research/tables.py` reads the body the fetcher already has (HTML `<table>`s, a CSV or JSON
+response, JSON script blocks) and never follows a link inside a page. Laya makes the bounded
+choices among what exists: which hits to open first, which table is the daily price history or
+the quarterly results, which column is the close and which row is each figure; deterministic
+code reads what was chosen (dates, units such as "(in millions)", the `as_of` cut, plausibility
+checks) and a declined or unsure choice skips the table. The company's daily series and the
+S&P 500 series (each from its own page) become the price evidence; figures become normalized
+facts that keep their page's `source_id`, so two pages that disagree are a conflict and a figure
+only one page reported is named in the uncertainties. When no search result holds a table the
+charts stay empty and the result says that search returned no page with price history or
+quarterly figures; nothing is filled in.
+
+The instrument is the ticker in the question (`$AAPL`, `AAPL` or an explicit `instrument`),
+which always wins. A question that names a company instead ("Assess apple.") is resolved by the
+analysis: one search (`"apple" stock ticker symbol`), the tickers its result titles and snippets
+name ("Apple Inc. (AAPL)"), ranked by how many websites name them, and a Laya choice among them;
+an unsure, tied or declined choice fails with `AMBIGUOUS_INSTRUMENT` and the candidates as found.
+Without a company in the question, or without web search, `POST /analyses` answers
+`AMBIGUOUS_INSTRUMENT` with `details.reason = ticker_required`.
 
 ## Live research monitoring
 
 While an analysis runs, the event stream shows exactly what research is doing: each web search
 with its hit list (`research.search_results`), each request right before it goes out
 (`research.fetching`), and how it ended (`research.source_found`, `research.source_rejected` with
-a reason, or `research.fetch_skipped`). Found sources carry the domain, request time, text size
-and the excerpt only when the source's redistribution terms allow it.
+a reason, or `research.fetch_skipped`). Found sources carry the domain, request time, text size,
+the excerpt only when the source's redistribution terms allow it, and a small `preview` table
+when the page yielded prices (`Date`, `Close`) or figures (`Metric`, `Period`, `Value`). Laya's
+choices appear as `laya.*` events (stages `instrument_resolution`, `source_selection`,
+`data_identification`). `market.series` is emitted when a price series is kept (company, then the
+S&P 500) and `market.fundamentals` after normalization; the result's `market` holds both.
 
 ## API contract (`/api/v1`)
 
@@ -210,10 +232,12 @@ Notes for the client (from a real-HTTP simulation of the frontend reducer):
 - A user cancel ends with `analysis.failed` whose `status` is `cancelled` and `error.code` is
   `CANCELLED`; branch on `status`, and treat the terminal event as authoritative (the cancel
   response echoes the pre-cancel stage). A backend stop or crash is `INTERRUPTED`, never `CANCELLED`.
-- `laya.started` / `laya.decision` / `laya.completed` carry a `stage`: `question_validation`
-  (only when Spark's interpretation proposed requirements) and `research_plan` happen inside the
-  research phase, `evidence_scan`, `history_scan` and `text_evidence` are the scoring phase, and
-  `horizon` runs after the calculations. Map by stage, not by first occurrence.
+- `laya.started` / `laya.decision` / `laya.completed` carry a `stage`: `instrument_resolution`
+  (only for a company name without a ticker) runs before `instrument.resolved`;
+  `question_validation` (only when Spark's interpretation proposed requirements),
+  `research_plan`, `source_selection` and `data_identification` happen inside the research phase,
+  `evidence_scan`, `history_scan` and `text_evidence` are the scoring phase, and `horizon` runs
+  after the calculations. Map by stage, not by first occurrence.
 - The question is interpreted before research starts (see "Question understanding" in
   `docs/ARCHITECTURE.md`): Spark pass 1 produces a short structured interpretation, Laya
   confirms or drops each proposed requirement, and Python builds the research plan and
@@ -323,8 +347,9 @@ instance, the Railway database or the reference machine.
 | Question understanding: the pass-1 request (`response_format` JSON schema, 192 tokens, temperature 0), fallbacks, event order and lock release through the real Spark client and a fake llama-server; Laya validation and the requirements builder with scripted interpretations (the doubles do not understand language, so these prove the pipeline, not interpretation quality) | | Pass-1 latency and interpretation quality with the real Spark model on the reference machine |
 
 Known limits not yet addressed: no exchange-holiday calendar (a session around an NYSE holiday
-is labelled one day late); web pages are not parsed into financial figures, prices or
-corporate actions, so those calculations report missing operands; conflict
+is labelled one day late); figures and prices come only from tables in the returned pages
+(stated figures in prose and tables a browser builds with JavaScript are not read; there is no
+sector benchmark), and corporate actions are not retrieved; conflict
 handling preserves and surfaces disagreements but does not search for a primary source to
 resolve them; z-scores, correlations and scenario tables exist as primitives without a
 calculation pack; the evaluation harness is limited to the global `BAY_EVAL_AS_OF` guard; free

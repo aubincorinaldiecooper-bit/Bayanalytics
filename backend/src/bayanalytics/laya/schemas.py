@@ -9,7 +9,8 @@ answers is confidence in the structured decision, never a market-outcome probabi
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+import re
+from collections.abc import Iterable, Mapping, Sequence
 
 from bayanalytics.laya.compaction import validate_questions
 from bayanalytics.schemas.common import SINGLE_HORIZONS
@@ -26,6 +27,11 @@ STAGE_HISTORY_SCAN = "history_scan"
 STAGE_CALCULATION = "calculation"
 STAGE_HORIZON = "horizon"
 STAGE_SYNTHESIS_GATE = "synthesis_gate"
+# Dynamic choices during research: the options are things that exist in this run (company
+# candidates found by a web search, the hits of a search, the tables and lines of a page).
+STAGE_INSTRUMENT_RESOLUTION = "instrument_resolution"
+STAGE_SOURCE_SELECTION = "source_selection"
+STAGE_DATA_IDENTIFICATION = "data_identification"
 
 # Bounded research intents (section 21). The research layer maps each to a deterministic query
 # template; Laya only ever picks one of these.
@@ -438,11 +444,167 @@ BUILDERS = (
 )
 
 
+# ---- dynamic choices (options built at run time from what actually exists) ---------------
+
+NONE_OPTION = "none"
+MAX_DYNAMIC_OPTIONS = 8
+"""Options a dynamic choice offers besides ``none``: well under Laya's 20-option limit, and
+short descriptions keep the head inside its 192 tokens (measured again at call time)."""
+MAX_OPTION_TEXT_CHARS = 48
+"""Characters of one option description (Laya keeps at most 48 tokens per option)."""
+
+INSTRUMENT_CHOICE_KEY = "instrument_choice"
+OPEN_ORDER_KEY = "open_order"
+PRICE_TABLE_KEY = "price_table"
+FIGURES_TABLE_KEY = "figures_table"
+CLOSE_COLUMN_KEY = "close_column"
+
+LINE_SUBJECTS: dict[str, str] = {
+    "revenue": "total revenue",
+    "gross_profit": "gross profit",
+    "operating_income": "operating income",
+    "net_income": "net income",
+    "eps_diluted": "diluted earnings per share",
+    "eps_basic": "basic earnings per share",
+    "operating_cash_flow": "cash flow from operating activities",
+    "capex": "capital expenditure",
+    "free_cash_flow": "free cash flow",
+    "shares_outstanding": "the number of shares outstanding",
+}
+
+_OPTION_WS = re.compile(r"\s+")
+
+
+def line_key(metric: str) -> str:
+    """The choice key that asks which line of a table reports ``metric``."""
+    return f"line_{metric}"
+
+
+def option_text(text: str) -> str:
+    """One option description: whitespace collapsed, Laya's ``[MASK]`` marker removed, cut to
+    ``MAX_OPTION_TEXT_CHARS`` characters."""
+    flat = _OPTION_WS.sub(" ", str(text).replace("[MASK]", " ")).strip()
+    if len(flat) > MAX_OPTION_TEXT_CHARS:
+        flat = flat[: MAX_OPTION_TEXT_CHARS - 3].rstrip() + "..."
+    return flat or "(blank)"
+
+
+def dynamic_choice(
+    instructions: str, options: Sequence[tuple[str, str]], none_text: str | None = None
+) -> LayaQuestion:
+    """A choice among ``options`` (``(key, description)``, at most ``MAX_DYNAMIC_OPTIONS``),
+    plus ``none`` with ``none_text`` when given. Raises ``ValueError`` when the options break
+    Laya's structural limits (too many, colliding keys); token lengths are measured when the
+    question is asked."""
+    if not options:
+        raise ValueError("a dynamic choice needs at least one option")
+    if len(options) > MAX_DYNAMIC_OPTIONS:
+        raise ValueError(f"at most {MAX_DYNAMIC_OPTIONS} options, got {len(options)}")
+    criteria = {str(key): option_text(text) for key, text in options}
+    if none_text is not None:
+        if NONE_OPTION in criteria:
+            raise ValueError("an option key collides with 'none'")
+        criteria[NONE_OPTION] = none_text
+    question = _choice(instructions, criteria)
+    validate_questions({"dynamic_choice": question})
+    return question
+
+
+def instrument_choice_questions(candidates: Sequence[tuple[str, str]]) -> dict[str, LayaQuestion]:
+    """Stage ``instrument_resolution``: which listed company the analyst means, among the
+    tickers a web search named (key: the symbol, description: the name as found).
+
+    State: the company phrase from the question and each candidate's symbol, name and the
+    number of distinct websites that named it.
+    """
+    return {
+        INSTRUMENT_CHOICE_KEY: dynamic_choice(
+            "Which listed company does the user mean?", candidates, "none of these companies"
+        )
+    }
+
+
+def result_order_questions(topic: str, hits: Sequence[tuple[str, str]]) -> dict[str, LayaQuestion]:
+    """Stage ``source_selection``: which search hit most likely contains ``topic``; the answer's
+    probabilities order the hits (key ``r<n>``, description: site and title). No snippet is
+    used as evidence."""
+    return {
+        OPEN_ORDER_KEY: dynamic_choice(f"Which search result most likely contains {topic}?", hits)
+    }
+
+
+def table_choice_questions(
+    price_tables: Sequence[tuple[str, str]], figure_tables: Sequence[tuple[str, str]]
+) -> dict[str, LayaQuestion]:
+    """Stage ``data_identification``: which table of a page is the daily price history and
+    which reports quarterly results (keys ``t<n>``, described by header row and row count)."""
+    questions: dict[str, LayaQuestion] = {}
+    if price_tables:
+        questions[PRICE_TABLE_KEY] = dynamic_choice(
+            "Which of these tables is the daily price history?",
+            price_tables,
+            "none of these tables",
+        )
+    if figure_tables:
+        questions[FIGURES_TABLE_KEY] = dynamic_choice(
+            "Which of these tables reports the company's quarterly results?",
+            figure_tables,
+            "none of these tables",
+        )
+    if not questions:
+        raise ValueError("at least one kind of table is required")
+    return questions
+
+
+def close_column_questions(columns: Sequence[tuple[str, str]]) -> dict[str, LayaQuestion]:
+    """Stage ``data_identification``: which column of the chosen price table is the closing
+    price (keys ``c<n>``, described by the header cell as the page wrote it)."""
+    return {
+        CLOSE_COLUMN_KEY: dynamic_choice(
+            "Which column is the closing price?", columns, "no closing price column"
+        )
+    }
+
+
+def figure_line_questions(
+    options: Mapping[str, Sequence[tuple[str, str]]], *, across: bool = True
+) -> dict[str, LayaQuestion]:
+    """Stage ``data_identification``: for each metric, which line of the chosen table reports
+    it (rows when periods are columns, columns otherwise; keys ``l<n>``, described by the
+    label as the page wrote it). Only metrics with a shortlist are asked."""
+    noun = "row" if across else "column"
+    questions: dict[str, LayaQuestion] = {}
+    for metric, lines in options.items():
+        if metric not in LINE_SUBJECTS:
+            raise ValueError(f"unknown metric {metric!r}")
+        if lines:
+            questions[line_key(metric)] = dynamic_choice(
+                f"Which {noun} is {LINE_SUBJECTS[metric]}?", lines, "not reported here"
+            )
+    if not questions:
+        raise ValueError("at least one metric with options is required")
+    return questions
+
+
+def _full_dynamic_examples() -> list[dict[str, LayaQuestion]]:
+    """Every dynamic builder at its largest option count, for the import-time guard."""
+    many = [(f"x{i}", "option description of typical length") for i in range(MAX_DYNAMIC_OPTIONS)]
+    return [
+        instrument_choice_questions(many),
+        result_order_questions("a table of the stock's daily prices", many),
+        table_choice_questions(many, many),
+        close_column_questions(many),
+        figure_line_questions(dict.fromkeys(LINE_SUBJECTS, many)),
+    ]
+
+
 def validate_all_builders() -> None:
     """Run the head/option guard on every builder output (also executed at import time)."""
     validate_questions(ALL_QUESTIONS)
     for builder in BUILDERS:
         validate_questions(builder())
+    for batch in _full_dynamic_examples():
+        validate_questions(batch)
 
 
 validate_all_builders()

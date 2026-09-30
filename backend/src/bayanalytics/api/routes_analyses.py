@@ -15,6 +15,7 @@ from bayanalytics.api.deps import RuntimeDep
 from bayanalytics.api.sse import event_stream, parse_after_seq, sse_response
 from bayanalytics.errors import AnalysisError
 from bayanalytics.instruments.base import ResearchBudget
+from bayanalytics.instruments.identity import company_phrase
 from bayanalytics.jobs.models import AnalysisJob
 from bayanalytics.pipeline.horizon import resolve_horizon
 from bayanalytics.schemas.common import ErrorCode
@@ -67,11 +68,18 @@ async def create_analysis(body: CreateAnalysisRequest, rt: RuntimeDep) -> Create
         raise AnalysisError(code, details={"reason": capability.reason})
     # Resolve the instrument synchronously so an ambiguous query is answered here, with
     # candidates, instead of creating an analysis that fails a few milliseconds later
-    # (frontend contract section 18: "Which company did you mean?").
+    # (frontend contract section 18: "Which company did you mean?"). A question that names a
+    # company but no ticker is accepted when web search is configured: the analysis looks the
+    # name up (search + Laya, visible on its event stream) and fails with
+    # AMBIGUOUS_INSTRUMENT and the candidates when it cannot tell.
     resolver_factory = rt.extras.get("resolver_factory")
     if resolver_factory is not None:
         resolver = await resolver_factory()
-        resolver.resolve(body.query, body.instrument)
+        try:
+            resolver.resolve(body.query, body.instrument)
+        except AnalysisError as exc:
+            if not _name_lookup_possible(exc, body, rt.search_configured):
+                raise
     resolved = resolve_horizon(body.query, body.horizon)
     settings = rt.settings
     budget = ResearchBudget(
@@ -88,6 +96,18 @@ async def create_analysis(body: CreateAnalysisRequest, rt: RuntimeDep) -> Create
         status=job.status,
         profile=job.profile,
         resolved_horizon=job.resolved_horizon,
+    )
+
+
+def _name_lookup_possible(
+    exc: AnalysisError, body: CreateAnalysisRequest, searchable: bool
+) -> bool:
+    return (
+        searchable
+        and body.instrument is None
+        and exc.code == ErrorCode.AMBIGUOUS_INSTRUMENT
+        and (exc.details or {}).get("reason") == "ticker_required"
+        and company_phrase(body.query) is not None
     )
 
 

@@ -44,6 +44,7 @@ from bayanalytics.pipeline.understanding import (
     understand_question,
 )
 from bayanalytics.pipeline.understanding import TIMER_NAME as UNDERSTANDING_TIMER
+from bayanalytics.research.market import fundamentals_view
 from bayanalytics.research.sources import domain_of, web_pages
 from bayanalytics.runtime import Runtime
 from bayanalytics.schemas.common import ErrorCode, utcnow
@@ -54,6 +55,7 @@ from bayanalytics.schemas.results import (
     AnalysisResult,
     Assessment,
     InstrumentView,
+    MarketView,
     Telemetry,
     ThesisDiff,
     VersionInfo,
@@ -90,6 +92,7 @@ class _Draft:
         self.thesis_diff: ThesisDiff | None = None
         self.understanding: Understanding | None = None  # Spark pass 1, once it ran
         self.requirements: RequirementsReport | None = None
+        self.market = MarketView()  # price series and quarterly figures read from web pages
 
     def instrument_view(self) -> InstrumentView | None:
         if self.identity is None:
@@ -122,6 +125,7 @@ class _Draft:
             thesis_diff=self.thesis_diff,
             requirements=self.requirements,
             streamed_text=self.streamed_text,
+            market=self.market,
             telemetry=self.telemetry,
             error=error.payload() if error else None,
             partial=status != "completed" or self.partial_synthesis,
@@ -159,6 +163,7 @@ async def run_analysis(job: AnalysisJob, ctx: AnalysisContext, rt: Runtime) -> A
             await _set_status(rt, job, "resolving_instrument")
             identity = await analyzer.identify(job.query, ctx)
             draft.identity = identity
+            draft.decisions.decisions.extend(analyzer.identity_decisions)
             job.instrument = identity
             await rt.store.update_job(job)
             await ctx.event(
@@ -211,6 +216,7 @@ async def run_analysis(job: AnalysisJob, ctx: AnalysisContext, rt: Runtime) -> A
             request = request.model_copy(update={"requirements": requirements})
             sources = await analyzer.retrieve(identity, request, ctx)
             draft.sources = sources
+            draft.market.series = analyzer.market.series_payloads()
             draft.decisions.decisions.extend(analyzer.research_decisions)
             job.source_ids = [s.source_id for s in sources]
             await rt.store.save_sources(job.analysis_id, sources)
@@ -228,6 +234,10 @@ async def run_analysis(job: AnalysisJob, ctx: AnalysisContext, rt: Runtime) -> A
                 segments=len(evidence.segments),
                 freshness=_freshness_view(evidence.freshness_summary),
             )
+            fundamentals = fundamentals_view(evidence, job.as_of, analyzer.market_labels)
+            draft.market.fundamentals = fundamentals
+            if fundamentals is not None:
+                await ctx.event("market.fundamentals", **fundamentals.model_dump(mode="json"))
             _evidence_gate(
                 evidence,
                 analyzer.compute_gaps(job.resolved_horizon, job.as_of),
@@ -451,10 +461,13 @@ async def _salvage(rt: Runtime, job: AnalysisJob, draft: _Draft, analyzer: Equit
     if not draft.sources and analyzer.state.sources:
         draft.sources = list(analyzer.state.sources)
         job.source_ids = [s.source_id for s in draft.sources]
-    if analyzer.research_decisions and not any(
-        d.stage == "research_plan" for d in draft.decisions.decisions
-    ):
-        draft.decisions.decisions.extend(analyzer.research_decisions)
+    recorded = {d.decision_id for d in draft.decisions.decisions}
+    for decision in [*analyzer.identity_decisions, *analyzer.research_decisions]:
+        if decision.decision_id not in recorded:
+            draft.decisions.decisions.append(decision)
+            recorded.add(decision.decision_id)
+    if not draft.market.series:
+        draft.market.series = analyzer.market.series_payloads()
     if draft.identity is None and analyzer.identity is not None:
         draft.identity = analyzer.identity
     if draft.requirements is None and analyzer.requirements is not None:

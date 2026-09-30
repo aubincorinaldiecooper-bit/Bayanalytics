@@ -162,13 +162,12 @@ def test_build_queries_templates_are_deterministic() -> None:
     filing = one(ResearchIntent.retrieve_latest_filing)
     assert filing.query == '"AAPL" annual report 10-K OR quarterly report 10-Q 2026'
     facts = one(ResearchIntent.retrieve_earnings_history)
-    assert facts.query == '"AAPL" quarterly results revenue earnings per share 2026'
+    assert facts.query == '"AAPL" quarterly revenue gross profit earnings per share'
     prices = one(ResearchIntent.retrieve_price_history, "near_term")
-    assert prices.query == '"AAPL" stock price performance 2026'
+    assert prices.query == '"AAPL" stock historical prices daily'
     bench = one(ResearchIntent.retrieve_sector_benchmark)
-    assert bench.query == (
-        '"AAPL" stock performance compared with sector peers and the market 2026'
-    )
+    assert bench.query == "S&P 500 index historical prices daily"  # the broad market only
+    assert facts.params == prices.params == bench.params == {}
     for intent in ResearchIntent:  # every intent is a web search, nothing else
         assert all(q.kind == "search" for q in build_queries(intent, IDENTITY, "near_term", AS_OF))
     assert build_queries(ResearchIntent.stop_research, IDENTITY, "near_term", AS_OF) == []
@@ -254,11 +253,13 @@ async def test_execute_search_applies_guards_dedup_and_events(stack, settings: S
     assert len(found) == 4
     assert {f["source_id"] for f in found} == {s.source_id for s in result.sources}
     assert all(f["intent"] == "retrieve_recent_news" and f["round"] == 1 for f in found)
-    live_fields = {"domain", "fetch_ms", "text_chars", "redistribution", "excerpt"}
+    live_fields = {"domain", "fetch_ms", "text_chars", "redistribution", "excerpt", "preview"}
     assert set(found[0]) == set(result.sources[0].public_view()) | {"intent", "round"} | live_fields
     for f in found:
-        # metadata_only sources never ship their excerpt; web pages carry timing and size
+        # metadata_only sources never ship their excerpt; web pages carry timing and size;
+        # these pages hold no price or figures table, so no preview
         assert f["redistribution"] == "metadata_only" and f["excerpt"] is None
+        assert f["preview"] is None
         assert isinstance(f["fetch_ms"], int) and f["fetch_ms"] >= 0
         assert f["text_chars"] > 0
         assert f["domain"] and f["domain"] in f["url"]

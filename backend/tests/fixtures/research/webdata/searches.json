@@ -1,0 +1,166 @@
+{
+ "fixture": true,
+ "searches": {
+  "\"NWND\" earnings OR guidance OR outlook": [
+   {
+    "url": "https://www.fixturewire.example/markets/northwind-fixture-quarter-review",
+    "title": "[Fixture] Northwind Fixture Foods (NWND) closes a steady quarter",
+    "content": "Fixture news about the invented company.",
+    "engine": "fixture",
+    "score": 1.0,
+    "publishedDate": "2026-09-18T12:00:00Z"
+   }
+  ],
+  "\"NWND\" stock historical prices daily": [
+   {
+    "url": "https://www.fixturewire.example/markets/northwind-fixture-quarter-review",
+    "title": "[Fixture] Northwind Fixture Foods (NWND) closes a steady quarter",
+    "content": "Fixture news about the invented company.",
+    "engine": "fixture",
+    "score": 1.0,
+    "publishedDate": "2026-09-18T12:00:00Z"
+   },
+   {
+    "url": "https://quotes.fixture-markets.example/nwnd/history",
+    "title": "[Fixture] NWND Historical Prices - daily stock price history",
+    "content": "Fixture daily prices.",
+    "engine": "fixture",
+    "score": 1.0
+   }
+  ],
+  "\"NWND\" quarterly revenue gross profit earnings per share": [
+   {
+    "url": "https://www.fixture-financials.example/stocks/nwnd/financials/quarterly",
+    "title": "[Fixture] NWND Quarterly Financials",
+    "content": "Fixture quarterly results.",
+    "engine": "fixture",
+    "score": 1.0
+   },
+   {
+    "url": "https://www.fixture-earnings.example/nwnd/results-by-quarter",
+    "title": "[Fixture] NWND results by quarter",
+    "content": "Fixture results table.",
+    "engine": "fixture",
+    "score": 1.0
+   }
+  ],
+  "S&P 500 index historical prices daily": [
+   {
+    "url": "https://data.fixture-index.example/sp500/daily.csv",
+    "title": "[Fixture] S&P 500 daily values (CSV)",
+    "content": "Fixture index values.",
+    "engine": "fixture",
+    "score": 1.0
+   }
+  ],
+  "\"Northwind\" stock ticker symbol": [
+   {
+    "url": "https://quotes.fixture-markets.example/quote",
+    "title": "Northwind Fixture Foods (NWND) Stock Price",
+    "content": "",
+    "engine": "fixture",
+    "score": 1.0
+   },
+   {
+    "url": "https://www.fixture-financials.example/quote",
+    "title": "Northwind Fixture Foods (NWND) financials",
+    "content": "",
+    "engine": "fixture",
+    "score": 1.0
+   },
+   {
+    "url": "https://www.fixturewire.example/quote",
+    "title": "NWND stock news",
+    "content": "Northwind Fixture Foods (NYSE: NWND) and Northwind Fixture Traders (NWTR).",
+    "engine": "fixture",
+    "score": 1.0
+   }
+  ],
+  "\"apple\" stock ticker symbol": [
+   {
+    "url": "https://quote-one.example/quote",
+    "title": "Apple Inc. (AAPL) Stock Price, News, Quote",
+    "content": "",
+    "engine": "fixture",
+    "score": 1.0
+   },
+   {
+    "url": "https://quote-two.example/quote",
+    "title": "AAPL stock quote",
+    "content": "Apple Inc. (NASDAQ: AAPL)",
+    "engine": "fixture",
+    "score": 1.0
+   },
+   {
+    "url": "https://quote-three.example/quote",
+    "title": "Apple Inc. (AAPL) company profile",
+    "content": "",
+    "engine": "fixture",
+    "score": 1.0
+   },
+   {
+    "url": "https://quote-four.example/quote",
+    "title": "Apple Hospitality REIT (APLE) quote",
+    "content": "",
+    "engine": "fixture",
+    "score": 1.0
+   }
+  ],
+  "\"Delta\" stock ticker symbol": [
+   {
+    "url": "https://quote-one.example/quote",
+    "title": "Delta Fixture Air (DFXA) stock quote",
+    "content": "",
+    "engine": "fixture",
+    "score": 1.0
+   },
+   {
+    "url": "https://quote-two.example/quote",
+    "title": "Delta Fixture Apparel (DFXP) stock quote",
+    "content": "",
+    "engine": "fixture",
+    "score": 1.0
+   },
+   {
+    "url": "https://quote-three.example/quote",
+    "title": "Delta Fixture Air (DFXA) news",
+    "content": "",
+    "engine": "fixture",
+    "score": 1.0
+   },
+   {
+    "url": "https://quote-four.example/quote",
+    "title": "Delta Fixture Apparel (DFXP) news",
+    "content": "",
+    "engine": "fixture",
+    "score": 1.0
+   }
+  ],
+  "\"Zorblax\" stock ticker symbol": [
+   {
+    "url": "https://quote-one.example/quote",
+    "title": "Zorblax: a word the fixture invented",
+    "content": "",
+    "engine": "fixture",
+    "score": 1.0
+   },
+   {
+    "url": "https://quote-two.example/quote",
+    "title": "What does zorblax mean?",
+    "content": "No company.",
+    "engine": "fixture",
+    "score": 1.0
+   }
+  ],
+  "*": [
+   {
+    "url": "https://www.fixturewire.example/markets/northwind-fixture-quarter-review",
+    "title": "[Fixture] Northwind Fixture Foods (NWND) closes a steady quarter",
+    "content": "Fixture news about the invented company.",
+    "engine": "fixture",
+    "score": 1.0,
+    "publishedDate": "2026-09-18T12:00:00Z"
+   }
+  ]
+ }
+}
