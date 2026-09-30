@@ -275,21 +275,27 @@ def test_cli_serve_passes_graceful_shutdown_to_uvicorn(monkeypatch: pytest.Monke
 
     recorded: dict[str, Any] = {}
 
-    def fake_run(app: Any, **kwargs: Any) -> None:
-        recorded["app"] = app
-        recorded.update(kwargs)
+    class FakeServer:
+        def __init__(self, config: uvicorn.Config) -> None:
+            recorded["config"] = config
+            self.started = True
 
-    monkeypatch.setattr(uvicorn, "run", fake_run)
+        def run(self, sockets: list[Any] | None = None) -> None:
+            recorded["sockets"] = sockets
+
+    monkeypatch.setattr(uvicorn, "Server", FakeServer)
     monkeypatch.setenv("BAY_GRACEFUL_SHUTDOWN_S", "3")
     monkeypatch.setenv("BAY_LOG_LEVEL", "WARNING")
     try:
         assert cli.main(["serve", "--port", "8123"]) == 0
     finally:
         set_settings(None)
-    assert recorded["timeout_graceful_shutdown"] == 3
-    assert recorded["port"] == 8123 and recorded["host"] == "127.0.0.1"
-    assert recorded["log_level"] == "warning"
-    assert recorded["app"].title == "BayAnalytics"
+    config = recorded["config"]
+    assert config.timeout_graceful_shutdown == 3
+    assert config.port == 8123 and config.host == "127.0.0.1"
+    assert config.log_level == "warning"
+    assert config.app.title == "BayAnalytics"
+    assert recorded["sockets"] is None
 
 
 async def test_body_limit_envelopes_are_compact_json() -> None:
