@@ -73,6 +73,9 @@ def test_execution_and_version_info_carry_no_configured_labels() -> None:
     )
     assert rt.capabilities().execution == rt.execution_info()
     assert rt.capabilities().research is True and rt.capabilities().voice is True
+    # price points stay server-side unless the operator turns price display on
+    assert Settings().price_display is False and rt.capabilities().market.price_display is False
+    assert Settings.from_env({"BAY_PRICE_DISPLAY": "true"}).price_display is True
 
 
 async def test_runtime_start_reports_a_laya_load_failure_and_a_missing_search_url(

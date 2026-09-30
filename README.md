@@ -151,6 +151,21 @@ binds, and `0.0.0.0` leaves no IPv6 listener for the private network. The fronte
 `BAY_API_URL=http://${{bayanalytics-api-live.RAILWAY_PRIVATE_DOMAIN}}:8000/api/v1` and
 `BAY_API_KEY=${{bayanalytics-api-live.BAY_API_KEY}}`, so the key has one source of truth.
 
+## Live research monitoring and market views
+
+While an analysis runs, the event stream shows exactly what research is doing: each web search
+with its hit list (`research.search_results`), each request right before it goes out
+(`research.fetching`), and how it ended (`research.source_found`, `research.source_rejected` with
+a reason, or `research.fetch_skipped`). Found sources carry the domain, request time, text size,
+a small preview table for SEC and price data, and the excerpt only when the source's
+redistribution terms allow it. After normalization, `market.fundamentals` carries quarterly
+revenue and gross margin from the SEC facts; the final result repeats it under `market`.
+
+Price points (`market.series`, the price previews and `market.series` in the result) are sent
+only when `BAY_PRICE_DISPLAY=true`. It is off by default: Stooq's terms are personal use and its
+data is treated as `metadata_only`, so enable it only for a market-data source you are allowed to
+display. `GET /api/v1/capabilities` reports the setting as `market.price_display`.
+
 ## API contract (`/api/v1`)
 
 | Method | Path | Purpose |

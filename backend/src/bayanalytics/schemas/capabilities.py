@@ -15,12 +15,17 @@ class ProfileCapability(BaseModel):
     code: ErrorCode | None = None
 
 
+class MarketCapability(BaseModel):
+    price_display: bool = False
+
+
 class Capabilities(BaseModel):
     profiles: dict[str, ProfileCapability]
     voice: bool
     deployment: str
     research: bool = True
     execution: ExecutionInfo = Field(default_factory=ExecutionInfo)
+    market: MarketCapability = Field(default_factory=MarketCapability)
 
 
 class ComponentHealth(BaseModel):

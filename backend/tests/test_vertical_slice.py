@@ -445,3 +445,46 @@ async def test_stored_artifacts_and_health() -> None:
         assert caps["execution"] == EXECUTION
         assert caps["voice"] is True and caps["research"] is True
         assert caps["profiles"]["fast"]["available"] and caps["profiles"]["deep"]["available"]
+
+
+# ----------------------------------------------------------------------- live views / market
+
+
+async def test_live_research_and_market_views_end_to_end() -> None:
+    """The run announces every request, reports search hits, streams the quarterly
+    fundamentals, and keeps price points server-side unless price display is on."""
+    _, events, result = await _run_to_completion(
+        _runtime(), {"query": "Assess Apple.", "profile": "fast"}
+    )
+    names = [e["event"] for e in events]
+    assert "research.fetching" in names
+    assert names.index("research.fetching") < names.index("research.source_found")
+    assert "market.series" not in names
+    fundamentals = next(e["data"] for e in events if e["event"] == "market.fundamentals")
+    assert names.index("normalization.completed") < names.index("market.fundamentals")
+    assert names.index("market.fundamentals") < names.index("spark.started")
+    quarters = fundamentals["quarters"]
+    assert 0 < len(quarters) <= 8 and all(q["revenue"] and q["end"] for q in quarters)
+    assert [q["end"] for q in quarters] == sorted(q["end"] for q in quarters)
+    assert all(q["gross_margin_pct"] is None or 0 < q["gross_margin_pct"] < 100 for q in quarters)
+    market = result["market"]
+    assert market["price_display"] is False and market["series"] == []
+    assert market["fundamentals"]["quarters"] == quarters
+    for e in events:
+        if e["event"] == "research.source_found" and e["data"]["redistribution"] != "allowed":
+            assert e["data"]["excerpt"] is None
+
+    shown = _settings().model_copy(update={"price_display": True})
+    _, events2, result2 = await _run_to_completion(
+        _runtime(shown), {"query": "Assess Apple.", "profile": "fast"}
+    )
+    series_events = [e["data"] for e in events2 if e["event"] == "market.series"]
+    assert series_events and series_events[0]["role"] == "company"
+    assert series_events[0]["symbol"] == "AAPL"
+    roles = [s["role"] for s in result2["market"]["series"]]
+    assert result2["market"]["price_display"] is True and roles[0] == "company"
+    assert set(roles) <= {"company", "broad_market", "sector"}
+    assert result2["market"]["series"][0]["points"][-1] == series_events[0]["points"][-1]
+    async with _client(_runtime(shown)) as client:
+        caps = (await client.get("/api/v1/capabilities")).json()
+    assert caps["market"] == {"price_display": True}

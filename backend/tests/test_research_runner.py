@@ -267,11 +267,42 @@ async def test_execute_search_applies_guards_dedup_and_events(stack, settings: S
     assert len(found) == 4
     assert {f["source_id"] for f in found} == {s.source_id for s in result.sources}
     assert all(f["intent"] == "retrieve_recent_news" and f["round"] == 1 for f in found)
-    assert set(found[0]) == set(result.sources[0].public_view()) | {"intent", "round"}
+    live_fields = {"domain", "fetch_ms", "text_chars", "redistribution", "excerpt", "preview"}
+    assert set(found[0]) == set(result.sources[0].public_view()) | {"intent", "round"} | live_fields
+    for f in found:
+        # metadata_only sources never ship their excerpt; web pages carry timing and size
+        assert f["redistribution"] == "metadata_only" and f["excerpt"] is None
+        assert isinstance(f["fetch_ms"], int) and f["fetch_ms"] >= 0
+        assert f["text_chars"] > 0 and f["preview"] is None
+        assert f["domain"] and f["domain"] in f["url"]
     rejected = rec.named("research.source_rejected")
     assert len(rejected) == 2
-    assert all(set(r) == {"url", "title", "reason", "intent", "round"} for r in rejected)
+    assert all(
+        set(r) == {"url", "title", "reason", "intent", "round", "domain", "fetch_ms"}
+        for r in rejected
+    )
+    # both were fetched first: the leak is caught from the page's own date, not the hit's
+    assert all(isinstance(r["fetch_ms"], int) for r in rejected)
     assert rec.events[0][0] == "research.query"
+    assert rec.events[1][0] == "research.search_results"
+    (search,) = rec.named("research.search_results")
+    assert search["query"] == queries[0]["query"] and search["failed"] is False
+    assert search["total"] >= len(search["hits"]) and 0 < len(search["hits"]) <= 8
+    assert all(set(h) == {"url", "title", "domain", "published_at"} for h in search["hits"])
+    fetching = rec.named("research.fetching")
+    assert len(fetching) == stats.sources_fetched == 7  # one announcement per request made
+    assert all(f["kind"] == "web" and f["round"] == 1 and f["domain"] for f in fetching)
+    skipped = rec.named("research.fetch_skipped")
+    assert [s["reason"] for s in skipped] == ["duplicate", "duplicate"]
+    # every announced request is concluded by exactly one found / rejected / skipped event
+    announced = [f["url"] for f in fetching]
+    concluded = [e["url"] for e in found] + [r["url"] for r in rejected]
+    concluded += [s["url"] for s in skipped]
+    for url in announced:
+        assert url in concluded or any(url in c or c in url for c in concluded), url
+    order = [name for name, _ in rec.events]
+    first_fetch = order.index("research.fetching")
+    assert order.index("research.search_results") < first_fetch
 
 
 async def test_execute_search_respects_max_fetch_per_round(stack, settings: Settings) -> None:
@@ -714,3 +745,100 @@ def test_fixture_csvs_regenerate_deterministically(tmp_path: Path) -> None:
     assert (tmp_path / "again" / "pages.json").read_bytes() == (
         FIXTURE_DIR / "pages.json"
     ).read_bytes()
+
+
+# --------------------------------------------------------------------------------------
+# live research events: structured sources, previews, price display gating
+# --------------------------------------------------------------------------------------
+
+
+async def test_structured_sources_announce_requests_and_carry_previews(
+    stack, settings: Settings
+) -> None:
+    runner = make_runner(stack, settings)
+    rec = RecordingCtx()
+    await runner.execute(one(ResearchIntent.retrieve_latest_filing), IDENTITY, AS_OF, rec.ctx)
+    fetching = rec.named("research.fetching")
+    assert fetching[0]["kind"] == "edgar_submissions"
+    assert fetching[0]["url"] == "https://data.sec.gov/submissions/CIK0000320193.json"
+    assert fetching[0]["domain"] == "sec.gov" and fetching[0]["label"] == "SEC EDGAR submissions"
+    assert {f["kind"] for f in fetching[1:]} == {"filing"}
+    assert all(" filed " in f["label"] for f in fetching[1:])
+    found = rec.named("research.source_found")
+    subs = found[0]
+    assert subs["title"] == "SEC EDGAR submissions" and isinstance(subs["fetch_ms"], int)
+    assert subs["preview"]["columns"] == ["Form", "Filed", "Period"]
+    assert 0 < len(subs["preview"]["rows"]) <= 4
+    assert all(len(row) == 3 for row in subs["preview"]["rows"])
+    # SEC filings are public: their excerpts are shown; a filing whose excerpt could not be
+    # fetched still arrives, with no text size
+    filings = found[1:]
+    assert all(f["redistribution"] == "allowed" for f in filings)
+    with_text = [f for f in filings if f["excerpt"]]
+    assert with_text and all(f["text_chars"] == len(f["excerpt"]) for f in with_text)
+
+    rec2 = RecordingCtx()
+    await runner.execute(one(ResearchIntent.retrieve_earnings_history), IDENTITY, AS_OF, rec2.ctx)
+    (facts_fetch,) = rec2.named("research.fetching")
+    assert facts_fetch["kind"] == "edgar_companyfacts"
+    (facts,) = rec2.named("research.source_found")
+    assert facts["preview"]["columns"] == ["Metric", "Period", "Value"]
+    labels = [row[0] for row in facts["preview"]["rows"]]
+    assert labels[0] == "Revenue" and set(labels) <= {
+        "Revenue",
+        "Gross profit",
+        "Operating cash flow",
+        "Diluted EPS",
+    }
+    assert all(row[2].startswith(("$", "-$")) for row in facts["preview"]["rows"])
+
+
+async def test_price_points_stay_on_the_server_by_default(stack, settings: Settings) -> None:
+    assert settings.price_display is False
+    runner = make_runner(stack, settings)
+    rec = RecordingCtx()
+    await runner.execute(
+        one(ResearchIntent.retrieve_price_history, "near_term"), IDENTITY, AS_OF, rec.ctx
+    )
+    await runner.execute(
+        one(ResearchIntent.retrieve_sector_benchmark, "near_term"), IDENTITY, AS_OF, rec.ctx
+    )
+    assert rec.named("market.series") == []
+    found = rec.named("research.source_found")
+    assert len(found) == 3
+    assert all(f["preview"] is None and f["excerpt"] is None for f in found)
+    assert [f["kind"] for f in rec.named("research.fetching")] == [
+        "prices",
+        "benchmark",
+        "benchmark",
+    ]
+
+
+async def test_price_display_streams_series_and_previews(stack, settings: Settings) -> None:
+    shown = settings.model_copy(update={"price_display": True})
+    runner = make_runner(stack, shown)
+    rec = RecordingCtx()
+    prices = await runner.execute(
+        one(ResearchIntent.retrieve_price_history, "near_term"), IDENTITY, AS_OF, rec.ctx
+    )
+    await runner.execute(
+        one(ResearchIntent.retrieve_sector_benchmark, "near_term"), IDENTITY, AS_OF, rec.ctx
+    )
+    series = rec.named("market.series")
+    assert [(s["role"], s["symbol"]) for s in series] == [
+        ("company", "AAPL"),
+        ("broad_market", "^SPX"),
+        ("sector", "XLK"),
+    ]
+    company = series[0]
+    assert company["name"] == "Apple Inc." and company["interval"] == "1d"
+    assert company["source_id"] == prices.price_series.source_id
+    assert len(company["points"]) == len(prices.price_series.points)
+    first, last = company["points"][0], company["points"][-1]
+    assert len(first) == 6 and first[0] < last[0]
+    assert last[4] == prices.price_series.points[-1].close
+    found = rec.named("research.source_found")
+    assert all(f["preview"]["columns"] == ["Date", "Close"] for f in found)
+    # the series event arrives before the source that carries it is reported as kept
+    names = [name for name, _ in rec.events]
+    assert names.index("market.series") < names.index("research.source_found")

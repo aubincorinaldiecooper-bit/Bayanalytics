@@ -177,7 +177,16 @@ analysis.started → instrument.resolved
   (per round; research.started carries question_intent, requirements and interpretation_source;
   then laya.started → laya.decision × n → laya.completed for the research_plan
   stage, which chooses the next bounded intent)
-→ research.completed → normalization.completed
+  Live monitoring inside a round: research.search_results (query, hit count, top ≤ 8 hits as
+  url/title/domain/date; no third-party snippets) after each web search; research.fetching right
+  before every request (web page, filing excerpt, EDGAR submissions/company facts, prices,
+  benchmark); each request then ends in research.source_found, research.source_rejected or
+  research.fetch_skipped (duplicate, budget). research.source_found also carries domain,
+  fetch_ms, text_chars, redistribution, a small preview table for structured sources, and the
+  excerpt only when the source's redistribution is "allowed". market.series (daily OHLCV for
+  the company and each benchmark) is emitted only when BAY_PRICE_DISPLAY is on.
+→ research.completed → normalization.completed → market.fundamentals? (quarterly revenue and
+  gross margin from the normalized SEC facts, when quarterly revenue exists)
 → laya.started → laya.decision × n → laya.completed        (evidence_scan, history_scan, text_evidence)
 → calculation.started → calculation.completed × n
 → laya.started → laya.decision × n → laya.completed        (horizon stances)

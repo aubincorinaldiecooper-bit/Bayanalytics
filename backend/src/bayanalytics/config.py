@@ -87,6 +87,9 @@ class Settings(BaseModel):
     research_fetch_timeout_s: float = 20.0
     research_min_request_interval_s: float = 0.25
     research_price_history_days: int = 5 * 366
+    # Stooq's terms are personal use and its data is classed ``metadata_only``: price points are
+    # never sent to clients unless the operator enables this for a data source they may display.
+    price_display: bool = False
     eval_as_of: datetime | None = None  # leakage guard: drop evidence published after this
 
     # --- laya ---------------------------------------------------------------------------

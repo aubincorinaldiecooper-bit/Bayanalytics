@@ -294,6 +294,15 @@ class OperandResolver:
         chosen = self._choose(target)
         return self._operand(chosen, target) if chosen else None
 
+    def quarterly(self, metric: str) -> list[NormalizedFact]:
+        """One chosen fact per fiscal quarter (by period end), oldest first."""
+        by_end: dict[date, list[NormalizedFact]] = {}
+        for fact in self.facts(metric, "fiscal_quarter"):
+            if fact.period.end is not None:
+                by_end.setdefault(fact.period.end, []).append(fact)
+        chosen = (self._choose(by_end[end]) for end in sorted(by_end))
+        return [fact for fact in chosen if fact is not None]
+
     def latest_fq(self, metric: str) -> Operand | None:
         return self._latest_of_kind(metric, "fiscal_quarter")
 

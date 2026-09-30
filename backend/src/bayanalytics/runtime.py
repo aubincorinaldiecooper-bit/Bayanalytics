@@ -16,7 +16,12 @@ from bayanalytics.errors import AnalysisError
 from bayanalytics.jobs.bus import AnalysisEventBus
 from bayanalytics.jobs.runner import AnalysisRunner
 from bayanalytics.laya.base import LayaClient
-from bayanalytics.schemas.capabilities import Capabilities, ComponentHealth, Health
+from bayanalytics.schemas.capabilities import (
+    Capabilities,
+    ComponentHealth,
+    Health,
+    MarketCapability,
+)
 from bayanalytics.schemas.results import ExecutionInfo
 from bayanalytics.spark.base import SparkClient
 from bayanalytics.store.base import AnalysisStore
@@ -143,6 +148,7 @@ class Runtime:
             deployment=self.settings.deployment,
             research=self.research is not None,
             execution=self.execution_info(),
+            market=MarketCapability(price_display=self.settings.price_display),
         )
 
     async def health(self, version: str) -> Health:
