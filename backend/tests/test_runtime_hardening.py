@@ -17,7 +17,7 @@ import pytest
 from bayanalytics.config import Settings
 from bayanalytics.errors import AnalysisError
 from bayanalytics.laya.client import LayaWorkerClient, _scrub_paths
-from bayanalytics.procenv import SAFE_ENV_VARS, child_env, is_forwarded
+from bayanalytics.procenv import FORCED_ENV, SAFE_ENV_VARS, child_env, is_forwarded
 from bayanalytics.schemas.common import ErrorCode
 from bayanalytics.schemas.decisions import ChoiceAnswer
 from bayanalytics.spark.manager import LlamaServerManager, default_spawn
@@ -160,7 +160,9 @@ def test_child_env_is_an_allow_list(secret_env: dict[str, str], monkeypatch: pyt
     assert env["HF_TOKEN"] == "hf_forwarded"
     assert env["BAY_KEEP_ME"] == "kept on request"
     assert env["LAYA_MODULE"] == "/x/stub.mjs"  # extra wins over the inherited value
-    assert set(env) <= SAFE_ENV_VARS | {"LLAMA_ARG_THREADS", "BAY_KEEP_ME", "LAYA_MODULE"}
+    assert set(env) <= SAFE_ENV_VARS | {"LLAMA_ARG_THREADS", "BAY_KEEP_ME", "LAYA_MODULE"} | set(
+        FORCED_ENV
+    )
     assert child_env() == {
         k: v for k, v in env.items() if k not in ("BAY_KEEP_ME", "LAYA_MODULE")
     } | ({"LAYA_MODULE": "inherited-module"})
@@ -169,6 +171,26 @@ def test_child_env_is_an_allow_list(secret_env: dict[str, str], monkeypatch: pyt
     assert is_forwarded("BAY_KEEP_ME", keep=["BAY_KEEP_ME"])
     for secret in SECRETS:
         assert secret not in SAFE_ENV_VARS
+
+
+def test_child_env_forces_third_party_usage_reporting_off(monkeypatch: pytest.MonkeyPatch):
+    """ONNX Runtime (loaded by the Laya worker) reports usage to Microsoft from Linux unless
+    ORT_DISABLE_TELEMETRY is set; no caller or parent variable can switch that back on."""
+    monkeypatch.setenv("ORT_DISABLE_TELEMETRY", "0")
+    monkeypatch.setenv("HF_HUB_DISABLE_TELEMETRY", "0")
+    for env in (
+        child_env(),
+        child_env(keep=["ORT_DISABLE_TELEMETRY", "HF_HUB_DISABLE_TELEMETRY"]),
+        child_env({"ORT_DISABLE_TELEMETRY": "0", "HF_HUB_DISABLE_TELEMETRY": "false"}),
+    ):
+        assert env["ORT_DISABLE_TELEMETRY"] == "1"
+        assert env["HF_HUB_DISABLE_TELEMETRY"] == "1"
+
+
+def test_image_switches_usage_reporting_off() -> None:
+    dockerfile = (Path(__file__).resolve().parents[1] / "Dockerfile").read_text()
+    for name in FORCED_ENV:
+        assert f"{name}=1" in dockerfile
 
 
 @requires_node

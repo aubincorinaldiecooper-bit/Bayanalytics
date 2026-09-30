@@ -1,56 +1,6 @@
 {
  "fixture": true,
  "pages": {
-  "https://www.sec.gov/files/company_tickers.json": {
-   "status": 200,
-   "content_type": "application/json",
-   "body_file": "edgar/company_tickers.json"
-  },
-  "https://data.sec.gov/submissions/CIK0000320193.json": {
-   "status": 200,
-   "content_type": "application/json",
-   "body_file": "edgar/submissions_CIK0000320193.json"
-  },
-  "https://data.sec.gov/api/xbrl/companyfacts/CIK0000320193.json": {
-   "status": 200,
-   "content_type": "application/json",
-   "body_file": "edgar/companyfacts_CIK0000320193.json"
-  },
-  "https://www.sec.gov/Archives/edgar/data/320193/000032019325000123/aapl-20250927.htm": {
-   "status": 200,
-   "content_type": "text/html",
-   "body_file": "edgar/aapl-20250927_10k_primary.html"
-  },
-  "https://www.sec.gov/Archives/edgar/data/320193/000032019326000079/aapl-20260627.htm": {
-   "status": 200,
-   "content_type": "text/html",
-   "body_file": "edgar/aapl-20260627_10q_primary.html"
-  },
-  "https://www.sec.gov/Archives/edgar/data/320193/000032019326000052/aapl-20260328.htm": {
-   "status": 200,
-   "content_type": "text/html",
-   "body_file": "edgar/aapl-20260328_10q_primary.html"
-  },
-  "https://www.sec.gov/Archives/edgar/data/320193/000032019326000077/aapl-20260730.htm": {
-   "status": 200,
-   "content_type": "text/html",
-   "body_file": "edgar/aapl-20260730_8k_primary.html"
-  },
-  "https://stooq.com/q/d/l/?s=aapl.us&i=d": {
-   "status": 200,
-   "content_type": "text/csv",
-   "body_file": "prices/aapl.us.csv"
-  },
-  "https://stooq.com/q/d/l/?s=^spx&i=d": {
-   "status": 200,
-   "content_type": "text/csv",
-   "body_file": "prices/spx.csv"
-  },
-  "https://stooq.com/q/d/l/?s=xlk.us&i=d": {
-   "status": 200,
-   "content_type": "text/csv",
-   "body_file": "prices/xlk.us.csv"
-  },
   "https://www.wsj.com/fixture/paywalled-apple-story": {
    "status": 403,
    "content_type": "text/html",
@@ -90,6 +40,16 @@
    "status": 200,
    "content_type": "text/html; charset=utf-8",
    "body_file": "news/prnewswire_q3_syndicated.html"
+  },
+  "https://www.barrons.com/articles/fixture-apple-march-quarter-review-2026-05-04": {
+   "status": 200,
+   "content_type": "text/html; charset=utf-8",
+   "body_file": "news/barrons_march_quarter_review.html"
+  },
+  "https://www.zacks.com/stock/news/fixture-apple-june-quarter-preview-2026-06-15": {
+   "status": 200,
+   "content_type": "text/html; charset=utf-8",
+   "body_file": "news/zacks_june_quarter_preview.html"
   }
  }
 }

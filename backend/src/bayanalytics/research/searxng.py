@@ -6,7 +6,7 @@ exactly the SearXNG discovery call: ``GET {base}/search?q=<query>&format=json`` 
 ``{"results": [...]}``; a missing base URL is a configuration error, a non-2xx status is a
 backend error. Nothing else from GNSIS is imported or depended upon (AGENT.md section 21).
 
-MIT License text: https://opensource.org/license/mit
+The MIT License text is reproduced in THIRD_PARTY_NOTICES.md at the repository root.
 """
 
 from __future__ import annotations

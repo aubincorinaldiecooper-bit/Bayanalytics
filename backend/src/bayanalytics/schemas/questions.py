@@ -241,8 +241,6 @@ class AnalyticalRequirements(BaseModel):
     """Run with the required ones when their inputs exist, never reported as unmet (the
     three-year reconciliation exists only when the history reaches back that far)."""
     required_operands: list[str] = Field(default_factory=list)
-    min_price_days: int | None = None
-    """The shortest price window the requirements need; research widens the horizon's."""
     focus: str = ""
     horizons_emphasis: list[str] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)  # product-level interpretation notes

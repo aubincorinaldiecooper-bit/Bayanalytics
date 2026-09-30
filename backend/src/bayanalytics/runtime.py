@@ -34,16 +34,16 @@ class Runtime:
     laya: LayaClient
     spark: SparkClient
     transcriber: Transcriber
-    research: Any = None  # research stack (provider, edgar, prices); opaque to the API layer
+    research: Any = None  # the web research provider; opaque to the API layer
     extras: dict[str, Any] = field(default_factory=dict)
     _started: bool = False
     _health_cache: tuple[float, Health] | None = None
 
     @property
     def search_configured(self) -> bool:
-        provider = self.research[0] if isinstance(self.research, tuple) and self.research else None
-        searx = getattr(provider, "searx", None)
-        return bool(getattr(searx, "configured", False))
+        """Whether the research provider has a web search backend to ask (the only source of
+        evidence; an analysis cannot run without one)."""
+        return bool(getattr(self.research, "search_configured", False))
 
     def execution_info(self) -> ExecutionInfo:
         s = self.settings
@@ -60,8 +60,8 @@ class Runtime:
         self.extras["execution"] = self.execution_info()
         if not self.search_configured:
             log.warning(
-                "BAY_RESEARCH_SEARCH_URL is not set: web search is disabled, research is "
-                "limited to SEC EDGAR and Stooq"
+                "BAY_RESEARCH_SEARCH_URL is not set: web search is not configured, so analyses "
+                "cannot run (evidence comes only from web search)"
             )
         await self.store.start()
         await self.runner.start()
@@ -118,8 +118,7 @@ class Runtime:
         # Stop accepting new jobs, cancel/finish active work, then close runtimes.
         await self.runner.shutdown()
         closers = [("spark", self.spark.close), ("laya", self.laya.close)]
-        provider = self.research[0] if isinstance(self.research, tuple) and self.research else None
-        aclose = getattr(provider, "aclose", None)
+        aclose = getattr(self.research, "aclose", None)
         if callable(aclose):
             closers.append(("research", aclose))
         closers.append(("transcriber", self.transcriber.close))
@@ -142,6 +141,7 @@ class Runtime:
             voice=self.transcriber.available(),
             deployment=self.settings.deployment,
             research=self.research is not None,
+            web_search=self.search_configured,
             execution=self.execution_info(),
         )
 

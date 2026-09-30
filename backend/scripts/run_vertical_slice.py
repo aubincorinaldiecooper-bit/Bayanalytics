@@ -1,7 +1,7 @@
-"""Run the first engineering task end to end (AGENT.md section 19): "Assess Apple."
+"""Run the first engineering task end to end (AGENT.md section 19): "Assess $AAPL."
 
 Builds the runtime from the environment with the real components (Laya worker, llama-server,
-SEC EDGAR / Stooq / SearXNG research, Postgres or in-memory store), submits one analysis, prints
+SearXNG web search research, Postgres or in-memory store), submits one analysis, prints
 every recorded event from the in-process event bus as it happens, then prints the telemetry
 block and writes the full structured result to bench/vertical_slice_<analysis_id>.json.
 
@@ -30,7 +30,7 @@ from bayanalytics.wiring import build_runtime
 
 async def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--query", default="Assess Apple.")
+    parser.add_argument("--query", default="Assess $AAPL.")
     parser.add_argument("--profile", default="fast", choices=["fast", "deep"])
     parser.add_argument("--horizon", default="auto")
     parser.add_argument("--out", default="bench")

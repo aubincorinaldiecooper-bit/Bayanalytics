@@ -1,26 +1,30 @@
-"""HTTP ``ResearchProvider`` (SearXNG + Fetcher + extract) and the research stack factory."""
+"""HTTP ``ResearchProvider`` (SearXNG + Fetcher + extract) and the research stack factory.
+
+Research is web search only (see the repository's CLAUDE.md): the provider contacts the
+configured search backend and the pages its searches returned, nothing else. ``open`` and
+``extract`` refuse any URL this provider's own search did not return
+(``not_from_search``); redirects and ``robots.txt`` of a returned page are followed inside the
+fetcher, since they belong to that page.
+"""
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from collections.abc import Iterable
 from typing import Literal
 
 import httpx
 
 from bayanalytics.config import Settings
-from bayanalytics.research.edgar import EdgarClient
 from bayanalytics.research.extract import extract_page
-from bayanalytics.research.fetch import Fetcher, search_backend_hosts
-from bayanalytics.research.prices import StooqPrices
-from bayanalytics.research.provider import (
-    EvidenceRecord,
-    PageResult,
-    ResearchProvider,
-    SearchResult,
-)
+from bayanalytics.research.fetch import Fetcher, TaggedProviderError, search_backend_hosts
+from bayanalytics.research.provider import EvidenceRecord, PageResult, SearchResult
 from bayanalytics.research.searxng import SearxngSearch
 
 TimeRange = Literal["day", "week", "month", "year"]
+REASON_NOT_FROM_SEARCH = "not_from_search"
+SEARCH_URL_MEMORY = 20_000
+"""How many search-result URLs the provider remembers (least recently returned forgotten)."""
 
 
 class HttpResearchProvider:
@@ -51,6 +55,22 @@ class HttpResearchProvider:
             allowed_hosts = search_backend_hosts(settings.research_search_url)
         self.fetcher = Fetcher(settings, self._http, allowed_hosts=allowed_hosts)
         self.searx = SearxngSearch(settings.research_search_url, self._http, settings.user_agent)
+        self._search_urls: OrderedDict[str, None] = OrderedDict()
+
+    @property
+    def search_configured(self) -> bool:
+        """Whether a search backend (``BAY_RESEARCH_SEARCH_URL``) is configured."""
+        return self.searx.configured
+
+    def returned_by_search(self, url: str) -> bool:
+        return url in self._search_urls
+
+    def _remember(self, results: list[SearchResult]) -> None:
+        for result in results:
+            self._search_urls[result.url] = None
+            self._search_urls.move_to_end(result.url)
+        while len(self._search_urls) > SEARCH_URL_MEMORY:
+            self._search_urls.popitem(last=False)
 
     async def search(self, query: str) -> list[SearchResult]:
         return await self.search_with(query)
@@ -62,11 +82,15 @@ class HttpResearchProvider:
         time_range: TimeRange | None = None,
         max_results: int = 10,
     ) -> list[SearchResult]:
-        return await self.searx.search(
+        results = await self.searx.search(
             query, categories=categories, time_range=time_range, max_results=max_results
         )
+        self._remember(results)
+        return results
 
     async def open(self, url: str) -> PageResult:
+        if not self.returned_by_search(url):
+            raise TaggedProviderError(REASON_NOT_FROM_SEARCH, url)
         return await self.fetcher.open(url)
 
     async def extract(self, url: str) -> EvidenceRecord:
@@ -81,15 +105,10 @@ class HttpResearchProvider:
 
 def build_research_stack(
     settings: Settings, http_client: httpx.AsyncClient | None = None
-) -> tuple[ResearchProvider, EdgarClient, StooqPrices]:
-    """Wire the HTTP provider + EDGAR + Stooq over one shared fetcher."""
-    http_provider = HttpResearchProvider(
+) -> HttpResearchProvider:
+    """The research provider: the configured search backend and the pages it returns."""
+    return HttpResearchProvider(
         settings,
         http_client,
         allowed_hosts=search_backend_hosts(settings.research_search_url),
-    )
-    return (
-        http_provider,
-        EdgarClient(http_provider.fetcher, settings),
-        StooqPrices(http_provider.fetcher),
     )

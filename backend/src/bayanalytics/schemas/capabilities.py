@@ -20,6 +20,7 @@ class Capabilities(BaseModel):
     voice: bool
     deployment: str
     research: bool = True
+    web_search: bool = False  # a search backend is configured (BAY_RESEARCH_SEARCH_URL)
     execution: ExecutionInfo = Field(default_factory=ExecutionInfo)
 
 

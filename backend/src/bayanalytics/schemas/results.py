@@ -67,7 +67,6 @@ class ResearchStats(BaseModel):
     search_rounds: int = 0
     queries_issued: int = 0
     queries_failed: int = 0  # search backend errors (the loop continued without them)
-    structured_failures: int = 0  # EDGAR / price endpoint errors after the first success
     sources_fetched: int = 0
     sources_rejected: int = 0
     duplicate_sources_removed: int = 0

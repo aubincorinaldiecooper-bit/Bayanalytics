@@ -15,11 +15,12 @@ Spark pass 1: query understanding    pipeline/understanding.py
 Laya question validation             pipeline/questions.py  (confirm or drop each proposed requirement)
         ↓
 requirements builder                 instruments/questions.py
-   per-requirement rows → research intents (company facts first), calculations, operands, checks
+   per-requirement rows → research intents, calculations, operands, checks
         ↓
 active retrieval loop                instruments/equity.py + research/*
    required intents with the horizon seed; required operands become evidence gaps;
-   Laya picks a bounded intent  →  deterministic query template  →  search / EDGAR / prices
+   Laya picks a bounded intent  →  deterministic query template  →  web search (SearXNG)
+   →  the pages that search returned (nothing else is ever contacted)
         ↓
 normalization + provenance           normalization/*  (facts, periods, sessions, conflicts)
         ↓
@@ -177,6 +178,12 @@ analysis.started → instrument.resolved
   (per round; research.started carries question_intent, requirements and interpretation_source;
   then laya.started → laya.decision × n → laya.completed for the research_plan
   stage, which chooses the next bounded intent)
+  Live monitoring inside a round: research.search_results (query, hit count, top ≤ 8 hits as
+  url/title/domain/date; no third-party snippets) after each web search; research.fetching
+  (kind "web") right before every page request; each request then ends in
+  research.source_found, research.source_rejected or research.fetch_skipped (duplicate, budget).
+  research.source_found also carries domain, fetch_ms, text_chars, redistribution, and the
+  excerpt only when the source's redistribution is "allowed".
 → research.completed → normalization.completed
 → laya.started → laya.decision × n → laya.completed        (evidence_scan, history_scan, text_evidence)
 → calculation.started → calculation.completed × n
@@ -280,7 +287,7 @@ unchanged.
 
 **Python executes** (`instruments/questions.py`). `REQUIREMENT_TABLE` maps every requirement to
 research intents, registry calculations, operands (canonical metric names, `prices`,
-`benchmark`, `sector_benchmark`) and a minimum price window; `INTENT_TABLE` maps every intent to
+`benchmark`, `sector_benchmark`); `INTENT_TABLE` maps every intent to
 the focus sentence Spark is given and the horizons to emphasise. Both are validated at import
 against `ResearchIntent`, `SPECS` and the operand names. `build_requirements` unions the kept
 requirements' rows in order (deduplicated), so requirements compose: "valuation history" is
@@ -291,17 +298,11 @@ relative-return, beta and relative-drawdown records; "prior assessment" retrieve
 nothing: it is met when the prior completed assessment exists that the question-agnostic thesis diff
 (above) compares against, and the diff is never duplicated.
 
-- *Company facts first.* The research loop ends an intent list as soon as `max_sources` is
-  reached, and each search intent can fetch several sources, so searches planned ahead of the
-  XBRL company facts could fill the budget and leave the evidence gate without facts. The
-  required intents and the seed plan built from them are therefore reordered by a stable
-  structural rule (`research/intents.py::facts_first`): company facts and prices, then the other
-  structured sources (filings list, benchmarks), then searches.
-- *Price window.* A requirement can declare a minimum price window: valuation history and the
-  price-versus-earnings reconciliation need `PE_HISTORY_YEARS × 366` days of prices (eight
-  quarter-end P/E points and the price three years back), so `build_queries` uses the larger of
-  the horizon's window (`PRICE_DAYS`, 400 days for `near_term` / `next_cycle`) and the
-  requirements' minimum, for prices and benchmarks alike.
+- *Every intent is a web search.* `build_queries` maps each intent to a topic-only query
+  template (no `site:` operator, no provider or site name); the required intents come first,
+  then the horizon seed, deduplicated, and the research budget bounds execution.
+- *Web pages are text evidence.* Pages are not parsed into financial facts or price series, so
+  required operands stay unmet and their calculations report the missing inputs.
 - Required operands the retrieval state lacks become evidence gaps under their metric name
   (`gap_to_intent` maps them to `retrieve_earnings_history`, and once that ran the loop
   escalates to one `retrieve_missing_metric` search whose template spells the metric out); the
@@ -359,11 +360,14 @@ sufficient (≥ 0.7), Laya chooses `stop_research` and no untried gap remains, t
 was already executed, `max_sources` is reached, `max_rounds` is reached, the research budget
 timeout (`BAY_RESEARCH_TIMEOUT_S`) expires, or the user cancels. When Laya judges the evidence stale enough to matter, one `retrieve_recent_news`
 refresh is forced before stopping. The counters `search_rounds, queries_issued, queries_failed,
-structured_failures, sources_fetched, sources_rejected, duplicate_sources_removed,
-evidence_gaps_remaining, retrieval_total_ms` are returned in `telemetry.research`; provider
-outages (a dead SearXNG, an EDGAR error) become uncertainties on the result, and a run whose
-facts are missing because a structured source failed ends as `RESEARCH_UNAVAILABLE`
-(`structured_source_failed`) rather than `INSUFFICIENT_EVIDENCE`.
+sources_fetched, sources_rejected, duplicate_sources_removed, evidence_gaps_remaining,
+retrieval_total_ms` are returned in `telemetry.research`; a failed search becomes an uncertainty
+on the result. Without a configured search backend an analysis fails before research as
+`RESEARCH_UNAVAILABLE` (`search_not_configured`); when every search of a run failed it ends as
+`RESEARCH_UNAVAILABLE` (`search_failed`). Otherwise the evidence gate needs at least two kept
+web pages with readable text from at least two different websites, or the run ends as
+`INSUFFICIENT_EVIDENCE`; a result without verified figures says it is based only on the web
+pages found by search.
 
 ## Evidence-only boundary
 
@@ -399,7 +403,7 @@ pressure. Thresholds and KV precision are planning inputs until measured with
 ## Historical evaluation hook
 
 `BAY_EVAL_AS_OF` freezes the information set: every source published after that timestamp and
-every XBRL fact filed after it is dropped and counted (`leakage guard`). The rest of the
+every fact filed after it is dropped and counted (`leakage guard`). The rest of the
 section-14 harness (per-request `as_of`, date-bounded search templates, an evaluations table and
 outcome comparison) is not built; see the README "What is verified where" table.
 
@@ -415,7 +419,9 @@ loop is bounded by `ResearchBudget.timeout_s`.
 The fetcher (`research/fetch.py`) resolves every host itself and refuses loopback, link-local,
 private, multicast and reserved targets on the initial URL and on every redirect hop (redirects
 are walked manually, at most 5 hops), with only the configured SearXNG `host:port` exempt; page
-bodies are cached on disk only for SEC and Stooq hosts, with a 24-hour sweep. HTML deeper than
+bodies are cached on disk only for public-domain (`sec.gov`) pages a search returned, with a
+24-hour sweep. `HttpResearchProvider` opens only URLs its own search returned (the search
+service in `search/`, SearXNG, is the only data source; `not_from_search` otherwise). HTML deeper than
 200 nested elements is rejected instead of parsed. Rejection reasons and `RESEARCH_UNAVAILABLE`
 details are fixed keywords, never URLs or upstream text.
 

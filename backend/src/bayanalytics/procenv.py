@@ -18,6 +18,11 @@ wholesale. ``child_env`` therefore builds the child's environment from a fixed a
 
 Everything else is dropped. Callers add call-specific values through ``extra`` and can forward
 further parent variables by name through ``keep``.
+
+``FORCED_ENV`` is then applied last and cannot be overridden: it switches off the usage
+reporting that bundled third-party libraries would otherwise send (ONNX Runtime, loaded by the
+Laya worker, reports to Microsoft from Linux unless ``ORT_DISABLE_TELEMETRY`` is set). The backend
+makes no outbound connection the operator has not approved.
 """
 
 from __future__ import annotations
@@ -66,6 +71,12 @@ SAFE_ENV_VARS: frozenset[str] = frozenset(
 SAFE_ENV_PREFIXES: tuple[str, ...] = ("LLAMA_ARG_",)
 """Prefixes whose variables are forwarded (llama.cpp reads its defaults from ``LLAMA_ARG_*``)."""
 
+FORCED_ENV: dict[str, str] = {
+    "ORT_DISABLE_TELEMETRY": "1",
+    "HF_HUB_DISABLE_TELEMETRY": "1",
+}
+"""Set in every child's environment after everything else: usage reporting stays off."""
+
 
 def is_forwarded(name: str, keep: Iterable[str] = ()) -> bool:
     """True when a parent variable called ``name`` is forwarded by :func:`child_env`."""
@@ -77,11 +88,12 @@ def is_forwarded(name: str, keep: Iterable[str] = ()) -> bool:
 def child_env(
     extra: Mapping[str, str] | None = None, *, keep: Iterable[str] = ()
 ) -> dict[str, str]:
-    """Environment for a third-party child: the allow list, ``keep`` names, then ``extra``.
+    """Environment for a third-party child: the allow list, ``keep`` names, ``extra``, then
+    ``FORCED_ENV``.
 
     Variables are copied from ``os.environ`` only when they exist there. ``extra`` values are
     added verbatim and override forwarded ones (a caller injecting ``LAYA_MODULE`` wins over an
-    inherited one).
+    inherited one); ``FORCED_ENV`` overrides both.
     """
     wanted = set(keep)
     env: dict[str, str] = {}
@@ -91,7 +103,8 @@ def child_env(
     if extra:
         for name, value in extra.items():
             env[str(name)] = str(value)
+    env.update(FORCED_ENV)
     return env
 
 
-__all__ = ["SAFE_ENV_PREFIXES", "SAFE_ENV_VARS", "child_env", "is_forwarded"]
+__all__ = ["FORCED_ENV", "SAFE_ENV_PREFIXES", "SAFE_ENV_VARS", "child_env", "is_forwarded"]

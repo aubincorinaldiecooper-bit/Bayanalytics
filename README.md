@@ -20,8 +20,8 @@ This repository holds the **backend** (`backend/`). The Next.js + Beautiful UI f
 a separate repository and is a thin client of this API.
 
 **Nothing in the product is a mock, a fixture or a placeholder.** Every component the backend
-starts is the real one (the `@receptron/laya` Node worker, `llama-server`, `whisper-cli`, SEC
-EDGAR, Stooq, a SearXNG instance, Postgres or the in-memory store), every number in
+starts is the real one (the `@receptron/laya` Node worker, `llama-server`, `whisper-cli`, a
+SearXNG instance, Postgres or the in-memory store), every number in
 `telemetry` is measured or `null`, and every token count that sizes a prompt or a Laya state is
 taken from the real tokenizer (llama-server `/apply-template` + `/tokenize`; the Laya bundle's
 tokenizer through the worker's `count_tokens` op). Test doubles and the synthetic Apple fixture
@@ -37,8 +37,8 @@ backend/
     jobs/           asyncio job runner (admission control), per-analysis event bus, durable job model
     pipeline/       orchestrator (the vertical slice), horizon resolution, question understanding (Spark pass 1) and validation, thesis diff, result assembly
     instruments/    InstrumentAnalyzer boundary, identity resolution, analytical requirements builder, EquityAnalyzer
-    research/       ResearchProvider boundary, SearXNG search, fetch (SSRF gate)/extract/dedup, SEC EDGAR, prices, intents
-    normalization/  units, fiscal periods, market sessions, facts + conflicts + freshness, corporate actions (EDGAR name history)
+    research/       ResearchProvider boundary (web search only), SearXNG search, fetch (SSRF gate)/extract/dedup, intents
+    normalization/  units, fiscal periods, market sessions, facts + conflicts + freshness, corporate actions
     laya/           Node worker (@receptron/laya@0.1.2, NDJSON), Python client, finance question schemas, measured compaction
     calculations/   deterministic finance math, reproducible calculation records, formatting
     spark/          llama-server manager, Fast/Deep profiles, streaming client, prompt, measured bundle fitting, parser
@@ -73,8 +73,8 @@ The tests exercise the real code paths (runner, event bus, orchestrator, API, th
 
 1. **Tooling**: Xcode command line tools, `git`, `cmake`, Python 3.12, Node 20+ (22 recommended),
    `uv`, `ffmpeg` (any browser recording that is not 16 kHz mono WAV goes through it), and a
-   reachable SearXNG instance for web search (without one, research is SEC EDGAR + Stooq only and
-   the backend says so at startup).
+   reachable SearXNG instance: the search service in `search/` (SearXNG) is the backend's only
+   data source, and without it analyses cannot run (the backend says so at startup).
 2. **Backend**: `cd backend && uv venv --python 3.12 .venv && uv pip install -p .venv/bin/python -e ".[dev]"`.
    The venv has no `pip`; use `uv pip install -p .venv/bin/python …` for extras.
 3. **Laya**: `scripts/install_laya_worker.sh` installs the pinned `@receptron/laya@0.1.2` (and its
@@ -92,8 +92,8 @@ The tests exercise the real code paths (runner, event bus, orchestrator, API, th
 6. **Whisper (optional)**: `scripts/setup_whisper.sh` (whisper.cpp at tag `v1.9.4`, Whisper Tiny).
 7. **Configuration**: copy `backend/.env.example` to `backend/.env`, replace every placeholder
    (a literal `<…>` breaks `source`), fill in the paths the scripts printed,
-   `BAY_RESEARCH_CONTACT_EMAIL` (SEC EDGAR requires it), `BAY_RESEARCH_SEARCH_URL` and
-   `DATABASE_URL`. The backend binds `127.0.0.1` and needs no key there; any other host refuses to
+   `BAY_RESEARCH_SEARCH_URL` and `DATABASE_URL` (`BAY_RESEARCH_CONTACT_EMAIL`, optional, is
+   appended to the User-Agent of every fetch). The backend binds `127.0.0.1` and needs no key there; any other host refuses to
    start unless `BAY_API_KEY` is set, and clients then send `Authorization: Bearer <key>` or
    `X-API-Key`. `BAY_MAX_ACTIVE_ANALYSES` (default 4) bounds concurrent analyses; further requests
    get `429 TOO_MANY_ANALYSES`.
@@ -151,6 +151,29 @@ binds, and `0.0.0.0` leaves no IPv6 listener for the private network. The fronte
 `BAY_API_URL=http://${{bayanalytics-api-live.RAILWAY_PRIVATE_DOMAIN}}:8000/api/v1` and
 `BAY_API_KEY=${{bayanalytics-api-live.BAY_API_KEY}}`, so the key has one source of truth.
 
+## Data sources: web search only
+
+The backend aggregates what the configured web search returns and nothing else (the owner's
+rule, see `CLAUDE.md`). The search service in `search/` (SearXNG) is its only data source: it
+contacts that search engine (`BAY_RESEARCH_SEARCH_URL`; on Railway
+`http://${{searxng.RAILWAY_PRIVATE_DOMAIN}}:8080`) and the pages those searches returned, with
+their redirects and `robots.txt`. `HttpResearchProvider` refuses to open any URL its own search
+did not return, query templates carry no `site:` operator or provider name, and
+`tests/test_source_policy.py` fails the build if product code gains a hard-coded data URL. Web
+pages are evidence as text: they are not parsed into financial figures or price series, so the
+deterministic calculations report their missing operands and every result says it is based only
+on the web pages found by search. The instrument is the ticker in the question (`$AAPL`, `AAPL`
+or an explicit `instrument`); without one `POST /analyses` answers `AMBIGUOUS_INSTRUMENT` with
+`details.reason = ticker_required`.
+
+## Live research monitoring
+
+While an analysis runs, the event stream shows exactly what research is doing: each web search
+with its hit list (`research.search_results`), each request right before it goes out
+(`research.fetching`), and how it ended (`research.source_found`, `research.source_rejected` with
+a reason, or `research.fetch_skipped`). Found sources carry the domain, request time, text size
+and the excerpt only when the source's redistribution terms allow it.
+
 ## API contract (`/api/v1`)
 
 | Method | Path | Purpose |
@@ -178,10 +201,12 @@ Notes for the client (from a real-HTTP simulation of the frontend reducer):
   `details.candidates`); no analysis is created, so the "Which company did you mean?" picker
   runs before any stream is opened. If a live ticker refresh changes the answer, the same code
   can still arrive as `analysis.failed`.
-- `RESEARCH_UNAVAILABLE` (retryable) covers every public-source outage: the SEC ticker directory
-  (`details.reason = ticker_directory_unavailable`), EDGAR submissions or facts
-  (`structured_source_failed`), or the first structured call of a run. A dead SearXNG does not
-  fail the run; it lowers `telemetry.research.queries_failed` and adds an uncertainty.
+- `RESEARCH_UNAVAILABLE` covers the search backend: not configured
+  (`details.reason = search_not_configured`, not retryable) or every search of the run failed
+  (`search_failed`, retryable). A search that fails while others answer lowers
+  `telemetry.research.queries_failed` and adds an uncertainty. `INSUFFICIENT_EVIDENCE` means
+  fewer than two kept web pages with readable text, or pages from fewer than two websites
+  (`details.missing` says which).
 - A user cancel ends with `analysis.failed` whose `status` is `cancelled` and `error.code` is
   `CANCELLED`; branch on `status`, and treat the terminal event as authoritative (the cancel
   response echoes the pre-cancel stage). A backend stop or crash is `INTERRUPTED`, never `CANCELLED`.
@@ -264,7 +289,7 @@ Notes for the client (from a real-HTTP simulation of the frontend reducer):
   `calculations/reconciliation.py`. Spark receives the verdicts under
   `calculated_metrics.reconciliation` and is told to restate them as given.
   `pe_history_percentile` ranks the current trailing P/E within every quarter-end trailing
-  P/E the retrieved XBRL EPS and price history can produce; its period label states the
+  P/E the available EPS and price history can produce; its period label states the
   window used ("over 19 available quarters, Q3 FY2021 to Q2 FY2026"), and `pe_5y_percentile`
   (five-year cap) is kept with the same labelling.
   As everywhere, a missing operand makes the record `unavailable` with `missing_inputs` named.
@@ -282,24 +307,24 @@ and Node 22) with test doubles injected through `build_runtime`, a fake llama-se
 `httpx.MockTransport`, the real `worker.mjs` with a stub Laya module and the synthetic Apple
 fixture. The middle column was executed in the development container against a local
 PostgreSQL 16 and a real uvicorn process. Nothing in the right column has been executed anywhere
-yet: the container this backend was written in had no access to Hugging Face, sec.gov, Stooq, a
-SearXNG instance, the Railway database or the reference machine.
+yet: the container this backend was written in had no access to Hugging Face, a SearXNG
+instance, the Railway database or the reference machine.
 
 | Verified in CI (doubles, fakes, fixture) | Verified in the container (real process, real Postgres 16) | Not yet executed anywhere |
 | --- | --- | --- |
 | API contract, SSE replay (`Last-Event-ID`), cancellation, INTERRUPTED marking, API-key gate, body limits, admission control (including the store-await race) | `bayanalytics migrate` twice, schema-version refusal, every table populated by real analyses, INTERRUPTED recovery after SIGKILL, JSONB/typed column agreement, no DSN or path leaks | Loading the real `@receptron/laya` ONNX bundle: load time, resident RAM, `systemOne` latency, calibration on finance states |
 | Laya worker NDJSON protocol (`load`, `system_one`, `count_tokens`, `health`, `close`) with the real `worker.mjs` and a stub model, one controlled restart per process lifetime | Real uvicorn: health, capabilities, 202/SSE/GET, cancel, reconnect edge cases, 413/411/401 envelopes, SIGTERM and SIGKILL behaviour, process hygiene | Building llama-server b10828, GGUF download and sha256, a real generation, TTFT, tokens/s, KV precision, whether 128K allocates on 8 GB |
 | Spark streaming client, Fast/Deep restart command lines, `/apply-template` + `/tokenize` prompt measurement, memory-pressure and Deep-unavailable errors, cancel-while-silent (fake llama-server) | The real worker answering `load`/`health`/`system_one`/`close` with a bogus model directory (fails fast, no orphan) | A real `whisper-cli` run (tests use a fake shell script) |
-| Deterministic calculations (reproducibility, units, formatting), derived Q4, valuation-vs-fundamentals reconciliation, historical P/E window reporting (direct unit tests) | | End-to-end "Assess Apple." with live SEC EDGAR, Stooq and SearXNG retrieval and real models, with telemetry |
+| Deterministic calculations (reproducibility, units, formatting), derived Q4, valuation-vs-fundamentals reconciliation, historical P/E window reporting (direct unit tests) | | End-to-end "Assess $AAPL." with live SearXNG retrieval and real models, with telemetry |
 | Prior-assessment lookup and thesis diff: two runs on the fixture, the second carrying `thesis_diff` and the Spark prompt the prior block (in-memory store) | `latest_completed_result` against a local PostgreSQL 16 | |
-| Normalization: periods, sessions (no exchange-holiday calendar), restatements, conflicts, freshness, leakage guard, corporate actions from EDGAR name history | | The Railway Postgres instance (`bayanalytics migrate` against it) |
+| Normalization: periods, sessions (no exchange-holiday calendar), restatements, conflicts, freshness, leakage guard, corporate actions | | The Railway Postgres instance (`bayanalytics migrate` against it) |
 | Fetcher target policy (loopback, link-local, private and every redirect hop refused), DOM depth cap, keyword-only rejection reasons, cache policy | | |
-| End-to-end "Assess Apple." with the synthetic fixture, `RuleLaya` and `ScriptedSpark` doubles | | |
+| End-to-end "Assess $AAPL." with the synthetic web-search fixture, `RuleLaya` and `ScriptedSpark` doubles; the source policy (`tests/test_source_policy.py`) | | |
 | Question understanding: the pass-1 request (`response_format` JSON schema, 192 tokens, temperature 0), fallbacks, event order and lock release through the real Spark client and a fake llama-server; Laya validation and the requirements builder with scripted interpretations (the doubles do not understand language, so these prove the pipeline, not interpretation quality) | | Pass-1 latency and interpretation quality with the real Spark model on the reference machine |
 
 Known limits not yet addressed: no exchange-holiday calendar (a session around an NYSE holiday
-is labelled one day late); splits, mergers and spin-offs are not retrieved (only EDGAR former
-names feed the corporate-action checks); Stooq prices are assumed split-adjusted; conflict
+is labelled one day late); web pages are not parsed into financial figures, prices or
+corporate actions, so those calculations report missing operands; conflict
 handling preserves and surfaces disagreements but does not search for a primary source to
 resolve them; z-scores, correlations and scenario tables exist as primitives without a
 calculation pack; the evaluation harness is limited to the global `BAY_EVAL_AS_OF` guard; free

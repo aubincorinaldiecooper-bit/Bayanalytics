@@ -48,7 +48,7 @@ from bayanalytics.spark.prompt import build_messages
 from bayanalytics.wiring import build_runtime
 from doubles import FixedTranscriber, RuleLaya, ScriptedSpark, fixture_research_stack
 from test_spark_client import FakeLlamaServer, Harness, messages
-from test_store_memory import make_calc, make_fact, make_source
+from test_store_memory import make_calc, make_source
 
 FIXTURES = Path(__file__).parent / "fixtures" / "research" / "apple"
 AS_OF = datetime(2026, 9, 27, tzinfo=UTC)
@@ -109,7 +109,7 @@ async def test_truncated_synthesis_is_marked_partial() -> None:
         return "## Summary\nEvidence suggests signals are mixed [src_x].\n"
 
     rt = _runtime(spark=ScriptedSpark(text_factory=summary_only))
-    _events, result = await _run(rt, {"query": "Assess Apple."})
+    _events, result = await _run(rt, {"query": "Assess $AAPL."})
     assert result["status"] == "completed"
     assert result["partial"] is True
     for horizon in result["horizon_assessments"].values():
@@ -135,7 +135,7 @@ class _TruncatingSpark(ScriptedSpark):
 
 async def test_synthesis_cut_off_by_the_token_limit_is_partial_even_with_every_horizon() -> None:
     rt = _runtime(spark=_TruncatingSpark())
-    events, result = await _run(rt, {"query": "Assess Apple."})
+    events, result = await _run(rt, {"query": "Assess $AAPL."})
     assert result["status"] == "completed"
     assert all(h["synthesized"] for h in result["horizon_assessments"].values())
     assert result["partial"] is True
@@ -163,7 +163,7 @@ async def test_context_overflow_is_a_structured_error(monkeypatch: pytest.Monkey
     monkeypatch.setattr(orch, "fit_bundle", overflow)
     spark = ScriptedSpark()
     rt = _runtime(spark=spark)
-    events, result = await _run(rt, {"query": "Assess Apple."})
+    events, result = await _run(rt, {"query": "Assess $AAPL."})
     names = [e.event for e in events]
     assert names[-1] == "analysis.failed" and "spark.started" not in names
     error = events[-1].data["error"]
@@ -180,11 +180,11 @@ async def test_context_overflow_is_a_structured_error(monkeypatch: pytest.Monkey
 
 async def test_result_exposes_freshness_and_serialized_source_flags() -> None:
     rt = _runtime()
-    _events, result = await _run(rt, {"query": "Assess Apple."})
-    assert result["freshness_summary"]["facts"]["total"] > 0
+    _events, result = await _run(rt, {"query": "Assess $AAPL."})
+    assert result["freshness_summary"]["facts"]["total"] == 0  # web pages carry no facts
     assert "warnings" in result["freshness_summary"]
     assert all("is_primary" in s and "rank" in s for s in result["sources"])
-    assert any(s["is_primary"] for s in result["sources"])
+    assert any(s["is_primary"] for s in result["sources"])  # the fixture's earnings release
     assert result["partial"] is False
 
 
@@ -194,7 +194,7 @@ async def test_result_exposes_freshness_and_serialized_source_flags() -> None:
 async def test_research_loop_honours_laya_stop_and_never_repeats_an_intent() -> None:
     laya = RuleLaya(force={"research_intent": "stop_research", "evidence_sufficient": 0.5})
     rt = _runtime(laya=laya)
-    events, result = await _run(rt, {"query": "Assess Apple."})
+    events, result = await _run(rt, {"query": "Assess $AAPL."})
     assert result["status"] == "completed"
     research = result["telemetry"]["research"]
     assert research["termination_reason"] in {"laya_stop", "no_new_evidence"}
@@ -206,53 +206,130 @@ async def test_research_loop_honours_laya_stop_and_never_repeats_an_intent() -> 
 # --------------------------------------------------------------- evidence gate
 
 
-def test_evidence_gate_refuses_prices_or_news_alone() -> None:
-    price_only = NormalizedEvidence(
-        symbol="X", as_of=AS_OF, sources=[_src("src_px", "market_data", "csv")]
+def _page(source_id: str, url: str, text_chars: int = 900) -> SourceRecord:
+    """A kept web page as the runner records it (``text_chars`` from the extractor)."""
+    return make_source(source_id).model_copy(
+        update={
+            "url": url,
+            "source_type": "financial_journalism",
+            "extraction_method": "html_readability_v1",
+            "metadata": {"text_chars": text_chars},
+        }
+    )
+
+
+def test_evidence_gate_needs_two_pages_from_two_websites() -> None:
+    one_page = NormalizedEvidence(
+        symbol="X", as_of=AS_OF, sources=[_page("src_a", "https://www.cnbc.com/a")]
     )
     with pytest.raises(AnalysisError) as info:
-        _evidence_gate(price_only, ["earnings_history"])
+        _evidence_gate(one_page, ["earnings_history"])
     assert info.value.code == ErrorCode.INSUFFICIENT_EVIDENCE
-    assert len(info.value.details["missing"]) == 3
-    assert info.value.details["evidence_gaps"] == ["earnings_history"]
-    news_and_facts = NormalizedEvidence(
-        symbol="X",
-        as_of=AS_OF,
-        facts=[make_fact("f1", "src_news")],
-        sources=[_src("src_news", "financial_journalism", "html_readability_v1")],
+    details = info.value.details
+    assert details["missing"] == [
+        "at least 2 web pages with readable text (found 1)",
+        "pages from at least 2 different websites (found 1)",
+    ]
+    assert details["evidence_gaps"] == ["earnings_history"]
+    assert details["web_pages"] == 1 and details["domains"] == ["cnbc.com"]
+    # Two pages from one site (www and a subdomain count as the same site) are not enough.
+    same_site = one_page.model_copy(
+        update={
+            "sources": [
+                _page("src_a", "https://www.cnbc.com/a"),
+                _page("src_b", "https://markets.cnbc.com/b"),
+            ]
+        }
     )
-    with pytest.raises(AnalysisError):
-        _evidence_gate(news_and_facts, [])  # a fact without a primary source is still refused
-    ok = news_and_facts.model_copy(
-        update={"sources": [_src("src_10k", "regulatory_filing", "edgar_submissions")]}
+    with pytest.raises(AnalysisError) as info:
+        _evidence_gate(same_site, [])
+    assert info.value.details["missing"] == ["pages from at least 2 different websites (found 1)"]
+    # A kept source without extracted text (or a rejected one) is not a page to rest on.
+    textless = one_page.model_copy(
+        update={
+            "sources": [
+                _page("src_a", "https://www.cnbc.com/a"),
+                _page("src_b", "https://www.fool.com/b", text_chars=0),
+                _page("src_c", "https://www.wsj.com/c").model_copy(
+                    update={"rejected_reason": "paywalled"}
+                ),
+            ]
+        }
     )
+    with pytest.raises(AnalysisError) as info:
+        _evidence_gate(textless, [])
+    assert info.value.details["web_pages"] == 1
+    # Two sites are enough: no financial figure, filing or price series is required.
+    ok = one_page.model_copy(
+        update={
+            "sources": [
+                _page("src_a", "https://www.cnbc.com/a"),
+                _page("src_b", "https://www.fool.com/b"),
+            ]
+        }
+    )
+    assert not ok.facts and ok.prices is None
     _evidence_gate(ok, [])
 
 
-def test_evidence_gate_blames_a_structured_outage_only_when_one_happened() -> None:
-    price_only = NormalizedEvidence(
-        symbol="X", as_of=AS_OF, sources=[_src("src_px", "market_data", "csv")]
-    )
+def test_evidence_gate_reports_a_search_outage_only_when_every_search_failed() -> None:
+    empty = NormalizedEvidence(symbol="X", as_of=AS_OF)
     with pytest.raises(AnalysisError) as info:
-        _evidence_gate(price_only, ["earnings_history"], structured_failures=2)
+        _evidence_gate(empty, ["recent_news"], searches_issued=5, searches_failed=5)
     outage = info.value
     assert outage.code == ErrorCode.RESEARCH_UNAVAILABLE and outage.retryable is True
-    assert outage.details["reason"] == "structured_source_failed"
-    assert outage.details["structured_failures"] == 2
-    assert len(outage.details["missing"]) == 3
-    # Without an outage the same evidence is simply insufficient (and not retryable).
+    assert outage.details == {"reason": "search_failed", "searches_issued": 5, "searches_failed": 5}
+    # Some searches answered: whatever they found is judged on its own, not blamed on search.
     with pytest.raises(AnalysisError) as info:
-        _evidence_gate(price_only, [], structured_failures=0)
+        _evidence_gate(empty, [], searches_issued=5, searches_failed=4)
     assert info.value.code == ErrorCode.INSUFFICIENT_EVIDENCE
     assert info.value.retryable is False
-    # Complete evidence is never blamed on a failure elsewhere.
-    complete = NormalizedEvidence(
-        symbol="X",
-        as_of=AS_OF,
-        facts=[make_fact("f1", "src_10k")],
-        sources=[_src("src_10k", "regulatory_filing", "edgar_submissions")],
+    # No search issued at all (an empty plan) is not an outage either.
+    with pytest.raises(AnalysisError) as info:
+        _evidence_gate(empty, [], searches_issued=0, searches_failed=0)
+    assert info.value.code == ErrorCode.INSUFFICIENT_EVIDENCE
+
+
+async def test_an_analysis_without_a_search_backend_fails_before_research() -> None:
+    settings = _settings()
+    spark = ScriptedSpark()
+    rt = build_runtime(
+        settings,
+        laya=RuleLaya(),
+        spark=spark,
+        transcriber=FixedTranscriber(),
+        research=fixture_research_stack(settings, FIXTURES, search_configured=False),
     )
-    _evidence_gate(complete, [], structured_failures=3)
+    events, result = await _run(rt, {"query": "Assess $AAPL."})
+    names = [e.event for e in events]
+    assert result["status"] == "failed"
+    error = result["error"]
+    assert error["code"] == "RESEARCH_UNAVAILABLE" and error["retryable"] is False
+    assert error["details"] == {"reason": "search_not_configured"}
+    assert "BAY_RESEARCH_SEARCH_URL" in error["message"]
+    assert not any(n.startswith("research.") for n in names) and "spark.loading" not in names
+    assert spark.runs == [] and rt.research.queries == []
+    async with _client(rt) as client:
+        caps = (await client.get("/api/v1/capabilities")).json()
+    assert caps["web_search"] is False and caps["execution"]["search_configured"] is False
+
+
+async def test_an_analysis_whose_every_search_fails_is_a_research_outage() -> None:
+    settings = _settings()
+    rt = build_runtime(
+        settings,
+        laya=RuleLaya(),
+        spark=ScriptedSpark(),
+        transcriber=FixedTranscriber(),
+        research=fixture_research_stack(settings, FIXTURES, search_error="backend down"),
+    )
+    events, result = await _run(rt, {"query": "Assess $AAPL."})
+    assert result["status"] == "failed"
+    assert result["error"]["code"] == "RESEARCH_UNAVAILABLE"
+    assert result["error"]["details"]["reason"] == "search_failed"
+    searches = [e.data for e in events if e.event == "research.search_results"]
+    assert searches and all(s["failed"] is True and s["hits"] == [] for s in searches)
+    assert "backend down" not in str(result)  # transport text never reaches the client
 
 
 # --------------------------------------------------------------- shutdown and cancel semantics
@@ -296,7 +373,7 @@ async def test_shutdown_marks_running_jobs_interrupted_not_cancelled() -> None:
     rt = fake_runtime(_slow_pipeline)
     await rt.runner.start()
     job = await rt.runner.submit(
-        CreateAnalysisRequest(query="Assess Apple."), resolved_horizon="multi_horizon", budget=None
+        CreateAnalysisRequest(query="Assess $AAPL."), resolved_horizon="multi_horizon", budget=None
     )
     await asyncio.sleep(0.05)
     await rt.runner.shutdown(timeout_s=2.0)
@@ -315,7 +392,7 @@ async def test_hard_cancel_on_shutdown_is_reported_as_interrupted() -> None:
     rt = fake_runtime(_stubborn_pipeline)
     await rt.runner.start()
     job = await rt.runner.submit(
-        CreateAnalysisRequest(query="Assess Apple."), resolved_horizon="multi_horizon", budget=None
+        CreateAnalysisRequest(query="Assess $AAPL."), resolved_horizon="multi_horizon", budget=None
     )
     await asyncio.sleep(0.02)
     await rt.runner.shutdown(timeout_s=0.05)  # cooperative cancel ignored -> task.cancel()
@@ -335,7 +412,7 @@ async def test_user_cancel_keeps_the_flag_on_the_final_row() -> None:
     rt = fake_runtime(_slow_pipeline)
     await rt.runner.start()
     job = await rt.runner.submit(
-        CreateAnalysisRequest(query="Assess Apple."), resolved_horizon="multi_horizon", budget=None
+        CreateAnalysisRequest(query="Assess $AAPL."), resolved_horizon="multi_horizon", budget=None
     )
     await asyncio.sleep(0.03)
     await rt.runner.cancel(job.analysis_id)
@@ -571,7 +648,7 @@ async def test_cancel_is_honoured_while_llama_server_is_silent(tmp_path: Path) -
 async def test_reconnect_with_terminal_id_closes_immediately() -> None:
     rt = _runtime()
     async with _client(rt) as client:
-        created = await client.post("/api/v1/analyses", json={"query": "Assess Apple."})
+        created = await client.post("/api/v1/analyses", json={"query": "Assess $AAPL."})
         analysis_id = created.json()["analysis_id"]
         events = [e async for e in rt.bus.stream(analysis_id)]
         terminal_seq = events[-1].seq
@@ -600,8 +677,8 @@ async def test_reconnect_with_terminal_id_closes_immediately() -> None:
 async def test_spark_queued_is_emitted_while_the_lane_is_busy() -> None:
     rt = _runtime(spark=ScriptedSpark(delay_s=0.02))
     async with _client(rt) as client:
-        first = (await client.post("/api/v1/analyses", json={"query": "Assess Apple."})).json()
-        second = (await client.post("/api/v1/analyses", json={"query": "Assess Apple."})).json()
+        first = (await client.post("/api/v1/analyses", json={"query": "Assess $AAPL."})).json()
+        second = (await client.post("/api/v1/analyses", json={"query": "Assess $AAPL."})).json()
         ev1 = [e async for e in rt.bus.stream(first["analysis_id"])]
         ev2 = [e async for e in rt.bus.stream(second["analysis_id"])]
         names2 = [e.event for e in ev2]
@@ -620,8 +697,8 @@ async def test_too_many_analyses_has_retry_after_and_keepalive_setting_is_used()
     rt.runner._max_active = 1
     rt.settings = rt.settings.model_copy(update={"sse_keepalive_s": 0.05})
     async with _client(rt) as client:
-        first = await client.post("/api/v1/analyses", json={"query": "Assess Apple."})
-        second = await client.post("/api/v1/analyses", json={"query": "Assess Apple."})
+        first = await client.post("/api/v1/analyses", json={"query": "Assess $AAPL."})
+        second = await client.post("/api/v1/analyses", json={"query": "Assess $AAPL."})
         assert second.status_code == 429 and second.headers["retry-after"] == "5"
         analysis_id = first.json()["analysis_id"]
         await asyncio.sleep(0.2)

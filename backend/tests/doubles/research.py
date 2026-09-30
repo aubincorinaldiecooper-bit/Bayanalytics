@@ -6,7 +6,7 @@ Fixture layout (one directory per scenario, e.g. ``tests/fixtures/research/apple
                     "body_file": "relative/path", "final_url": "...", "paywalled": false}}}
     searches.json  {"fixture": true, "searches": {"<query>": [SearXNG-shaped result, ...],
                     "*": [...]}}
-    <body files>   HTML / JSON / CSV bodies referenced from pages.json
+    <body files>   HTML bodies referenced from pages.json (web pages a search returns)
 
 URL keys are matched after ``canonical_url`` so tracking parameters and trailing slashes do
 not matter. Query keys are matched case-insensitively with collapsed whitespace; ``"*"`` is
@@ -100,8 +100,19 @@ class FixtureFetcher:
 class FixtureResearchProvider:
     """``ResearchProvider`` reading searches from ``searches.json`` and pages via FixtureFetcher."""
 
-    def __init__(self, fixture_dir: Path | str, fetcher: FixtureFetcher | None = None) -> None:
+    def __init__(
+        self,
+        fixture_dir: Path | str,
+        fetcher: FixtureFetcher | None = None,
+        *,
+        search_configured: bool = True,
+        search_error: str | None = None,
+    ) -> None:
         self.dir = Path(fixture_dir)
+        # The fixture answers searches, so it counts as a configured search backend unless a
+        # test says otherwise; ``search_error`` makes every search fail like a backend outage.
+        self.search_configured = search_configured
+        self.search_error = search_error
         self.fetcher = fetcher or FixtureFetcher(self.dir)
         payload = _load_json(self.dir / SEARCHES_FILE)
         searches = payload.get("searches") if isinstance(payload.get("searches"), dict) else {}
@@ -123,6 +134,8 @@ class FixtureResearchProvider:
         max_results: int = 10,
     ) -> list[SearchResult]:
         self.queries.append(query)
+        if self.search_error is not None:
+            raise ResearchProviderError(self.search_error)
         items = self._searches.get(_normalise_query(query))
         if items is None:
             items = self._searches.get("*", [])

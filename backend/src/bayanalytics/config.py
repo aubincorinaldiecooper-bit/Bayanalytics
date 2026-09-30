@@ -76,8 +76,10 @@ class Settings(BaseModel):
     database_pool_max: int = 4
 
     # --- research -----------------------------------------------------------------------
-    research_search_url: str | None = None  # SearXNG base URL (carried over from GNSIS)
-    research_contact_email: str | None = None  # required by SEC EDGAR fair-access policy
+    # SearXNG base URL: the only data source. Research contacts this search engine and the pages
+    # its searches return, nothing else; without it analyses cannot run.
+    research_search_url: str | None = None
+    research_contact_email: str | None = None  # optional contact appended to the User-Agent
     research_user_agent: str = "BayAnalytics/0.1"
     research_cache_dir: Path | None = None
     research_max_rounds: int = 4
@@ -86,7 +88,6 @@ class Settings(BaseModel):
     research_timeout_s: float = 240.0
     research_fetch_timeout_s: float = 20.0
     research_min_request_interval_s: float = 0.25
-    research_price_history_days: int = 5 * 366
     eval_as_of: datetime | None = None  # leakage guard: drop evidence published after this
 
     # --- laya ---------------------------------------------------------------------------

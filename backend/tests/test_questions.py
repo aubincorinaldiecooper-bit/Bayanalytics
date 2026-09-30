@@ -23,7 +23,6 @@ from typing import Any
 import pytest
 
 import bayanalytics.instruments.questions as questions_module
-from bayanalytics.calculations.reconciliation import VERDICTS as RECONCILIATION_VERDICTS
 from bayanalytics.calculations.registry import CALCULATION_PACKS, SPECS, compute
 from bayanalytics.config import Settings
 from bayanalytics.context import AnalysisContext
@@ -39,7 +38,6 @@ from bayanalytics.instruments.equity import EquityAnalyzer
 from bayanalytics.instruments.identity import InstrumentResolver
 from bayanalytics.instruments.questions import (
     INTENT_TABLE,
-    LONG_PRICE_WINDOW_DAYS,
     OPERAND_NAMES,
     REJECTED_NOTE,
     REQUIREMENT_REJECT_BELOW,
@@ -67,14 +65,10 @@ from bayanalytics.pipeline.understanding import (
     understanding_options,
 )
 from bayanalytics.research.intents import (
-    INTENT_QUERY_KIND,
-    PRICE_DAYS,
     SEED_PLANS,
     ResearchIntent,
     build_queries,
-    facts_first,
     gap_to_intent,
-    retrieval_rank,
     seed_plan,
 )
 from bayanalytics.schemas.calculations import CalculationInput
@@ -84,8 +78,6 @@ from bayanalytics.schemas.evidence import (
     NormalizedEvidence,
     NormalizedFact,
     Period,
-    PricePoint,
-    PriceSeries,
     SourceRecord,
 )
 from bayanalytics.schemas.questions import (
@@ -110,14 +102,7 @@ from test_vertical_slice import _run_to_completion, _runtime, _settings
 
 FIXTURES = Path(__file__).parent / "fixtures" / "research" / "apple"
 AS_OF = datetime(2026, 9, 26, tzinfo=UTC)
-IDENTITY = InstrumentIdentity(
-    symbol="AAPL",
-    exchange="NASDAQ",
-    name="Apple Inc.",
-    cik="320193",
-    sic="3571",
-    fiscal_year_end="0930",
-)
+IDENTITY = InstrumentIdentity(symbol="AAPL", exchange="NASDAQ")
 RAW_KEYS = ("needs_benchmark", "needs_prior_assessment", "recent_period_focus", "comparison_focus")
 
 
@@ -140,11 +125,11 @@ def interpretation(
     }
 
 
-VALUATION_Q = "Assess Apple's valuation"
-GROWTH_Q = "Analyze Apple's growth"
-EVENT_Q = "Did Apple's latest quarter change the thesis?"
-RELATIVE_Q = "How has Apple performed against the market?"
-BROAD_Q = "Assess Apple"
+VALUATION_Q = "Assess $AAPL's valuation"
+GROWTH_Q = "Analyze $AAPL's growth"
+EVENT_Q = "Did $AAPL's latest quarter change the thesis?"
+RELATIVE_Q = "How has $AAPL performed against the market?"
+BROAD_Q = "Assess $AAPL"
 SCRIPT: dict[str, dict[str, Any]] = {
     VALUATION_Q: interpretation(
         "valuation", "valuation_multiples", "valuation_history", comparison="own_history"
@@ -184,17 +169,18 @@ def _qsettings() -> Settings:
 
 def _analyzer(laya: RuleLaya | None = None) -> EquityAnalyzer:
     settings = _qsettings()
-    stack = fixture_research_stack(settings, FIXTURES)
-    edgar = stack[1]
+    provider = fixture_research_stack(settings, FIXTURES)
 
     async def resolver_factory() -> InstrumentResolver:
-        return InstrumentResolver(await edgar.company_tickers())
+        return InstrumentResolver()
 
-    return EquityAnalyzer(settings, stack, LayaFinanceWrapper(laya or RuleLaya()), resolver_factory)
+    return EquityAnalyzer(
+        settings, provider, LayaFinanceWrapper(laya or RuleLaya()), resolver_factory
+    )
 
 
 def _bare() -> EquityAnalyzer:
-    analyzer = EquityAnalyzer(Settings(), (None, None, None), None, None)  # type: ignore[arg-type]
+    analyzer = EquityAnalyzer(Settings(), None, None, None)  # type: ignore[arg-type]
     analyzer.identity = IDENTITY
     return analyzer
 
@@ -233,7 +219,6 @@ async def _fixture_evidence(
     rec = Recorder()
     identity = IDENTITY.model_copy()
     analyzer.identity = identity
-    await analyzer.enrich_identity(identity, rec.ctx)
     sources = await analyzer.retrieve(identity, request, rec.ctx)
     return await analyzer.normalize(sources, rec.ctx)
 
@@ -368,7 +353,7 @@ def test_understanding_prompt_is_short_structured_and_evidence_free() -> None:
     user = messages[1].content.splitlines()
     assert user[0].startswith("Question: Is Apple overvalued [marker removed] really")
     assert len(user[0]) <= len("Question: ") + QUESTION_MAX_CHARS and user[0].endswith("...")
-    assert user[1:] == ["Company: Apple Inc. (AAPL)", "Horizon: Near term (days to several weeks)"]
+    assert user[1:] == ["Company: AAPL", "Horizon: Near term (days to several weeks)"]
     joined = "\n".join(m.content for m in messages)
     assert "\x07" not in joined and EVIDENCE_OPEN not in joined and "src_" not in joined
     options = understanding_options(Settings())
@@ -521,7 +506,10 @@ async def test_the_analysis_continues_after_a_pass_one_runtime_failure(code: Err
     assert started["intents"] == [str(i) for i in seed_plan("multi_horizon")]  # the broad plan
     assert _validation_calls(laya) == []  # nothing was proposed, so nothing to validate
     assert "research.completed" in names and result["sources"]
-    assert result["calculations"] and any(c["status"] == "computed" for c in result["calculations"])
+    # web pages carry no verified figures: every calculation runs and reports what it lacks
+    assert result["calculations"] and all(
+        c["status"] == "unavailable" for c in result["calculations"]
+    )
     assert spark.attempts == ["understanding", "synthesis"]
     assert names.index("research.completed") < names.index("spark.started")
     requirements = _requirements_of(result)
@@ -644,7 +632,6 @@ def test_tables_cover_every_value_with_registry_names() -> None:
         assert all(o in OPERAND_NAMES for o in row.operands), name
     history = REQUIREMENT_TABLE["valuation_history"]
     assert history.calculations == ("pe_ttm", "pe_5y_percentile", "pe_history_percentile")
-    assert history.min_price_days == LONG_PRICE_WINDOW_DAYS >= 5 * 365
     reconciliation = REQUIREMENT_TABLE["price_vs_earnings"]
     assert reconciliation.calculations == ("valuation_reconciliation_1y",)
     assert reconciliation.also_calculated == ("valuation_reconciliation_3y",)
@@ -682,7 +669,6 @@ def test_requirements_are_composed_from_the_rows() -> None:
         "retrieve_latest_filing",
         "retrieve_historical_coverage",
     ]
-    assert valuation.min_price_days == LONG_PRICE_WINDOW_DAYS
     assert valuation.focus.startswith(INTENT_TABLE["valuation"].focus)
     assert valuation.focus.endswith(
         "The comparison asked for is against the company's own history."
@@ -707,7 +693,7 @@ def test_requirements_are_composed_from_the_rows() -> None:
     broad = build_requirements(QueryUnderstanding.broad(), source="spark")
     assert broad.broad and broad.requirements == [] and broad.required_research_intents == []
     assert broad.required_calculations == [] and broad.required_operands == []
-    assert broad.min_price_days is None and broad.horizons_emphasis == []
+    assert broad.horizons_emphasis == []
 
 
 # ------------------------------------------------------------------ Laya's bounded validation
@@ -822,7 +808,7 @@ async def test_laya_drops_a_requirement_or_rejects_the_interpretation() -> None:
     assert dropped.requirements == ["valuation_multiples"]
     assert dropped.dropped_by_validation == ["valuation_history"]
     assert "pe_5y_percentile" not in dropped.required_calculations
-    assert dropped.min_price_days is None and dropped.intent == "valuation"
+    assert dropped.intent == "valuation"
     rejected, _ = await resolve_requirements(
         understood,
         VALUATION_Q,
@@ -839,7 +825,7 @@ async def test_laya_drops_a_requirement_or_rejects_the_interpretation() -> None:
 # ------------------------------------------------------------------ research plan and gaps
 
 
-def test_seed_plan_adds_required_intents_facts_first() -> None:
+def test_seed_plan_puts_required_intents_first() -> None:
     base = seed_plan("multi_horizon")
     assert seed_plan("multi_horizon", None) == base == SEED_PLANS["multi_horizon"]
     broad = build_requirements(QueryUnderstanding.broad(), source="spark")
@@ -850,109 +836,13 @@ def test_seed_plan_adds_required_intents_facts_first() -> None:
         ResearchIntent.retrieve_earnings_history,
         ResearchIntent.retrieve_price_history,
         ResearchIntent.retrieve_latest_filing,
-        ResearchIntent.retrieve_sector_benchmark,
         ResearchIntent.retrieve_historical_coverage,
+        ResearchIntent.retrieve_sector_benchmark,
         ResearchIntent.retrieve_recent_news,
         ResearchIntent.retrieve_guidance_history,
     ]
     assert len(plan) == len(set(plan)) and ResearchIntent.stop_research not in plan
     assert set(base) <= set(plan)
-
-
-def test_company_facts_are_planned_before_any_search() -> None:
-    # Review finding (P1): search intents fetch several sources each and the loop stops at
-    # max_sources, so a question needing searches must not plan them ahead of company facts.
-    for intent, kind in INTENT_QUERY_KIND.items():
-        assert build_queries(intent, IDENTITY, "near_term", AS_OF, ["total_debt"])[0].kind == kind
-    guidance = _requirements(
-        "guidance_outlook", "guidance", "recent_coverage", "earnings_trajectory"
-    )
-    assert guidance.required_research_intents[:2] == [
-        "retrieve_earnings_history",
-        "retrieve_latest_filing",
-    ]
-    for horizon in SEED_PLANS:
-        plan = seed_plan(horizon, guidance)
-        ranks = [retrieval_rank(i) for i in plan]
-        assert ranks == sorted(ranks), horizon
-        assert plan[0] is ResearchIntent.retrieve_earnings_history
-        assert plan.index(ResearchIntent.retrieve_price_history) < min(
-            plan.index(i) for i in plan if retrieval_rank(i) == 2
-        )
-    assert facts_first(
-        [ResearchIntent.retrieve_recent_news, ResearchIntent.retrieve_price_history]
-    ) == [ResearchIntent.retrieve_price_history, ResearchIntent.retrieve_recent_news]
-
-
-async def test_a_guidance_question_with_a_small_source_budget_still_gets_company_facts() -> None:
-    query = "What is Apple guiding to, and are earnings and margins holding up?"
-    script = {
-        query: interpretation(
-            "guidance_outlook",
-            "guidance",
-            "recent_coverage",
-            "earnings_trajectory",
-            "margin_trajectory",
-        )
-    }
-    rt = _runtime(_settings(research_max_sources=4), spark=ScriptedSpark(interpretations=script))
-    _id, events, result = await _run_to_completion(rt, {"query": query})
-    assert result["status"] == "completed", result["error"]
-    labels = [e["data"]["label"] for e in events if e["event"] == "research.query"]
-    assert labels[:2] == ["XBRL company facts for Apple Inc.", "daily prices for AAPL"]
-    assert result["telemetry"]["research"]["termination_reason"] == "max_sources"
-    requirements = result["requirements"]
-    assert {
-        "eps_growth_yoy",
-        "gross_margin",
-        "operating_margin",
-        "net_margin",
-        "operating_margin_change_bp",
-    } <= set(requirements["satisfied_calculations"])
-    assert requirements["missing_operands"] == []
-    # the searches the budget could not reach are reported, never a failure
-    assert "retrieve_guidance_history" in requirements["missing_research_intents"]
-
-
-def test_price_window_is_widened_by_the_requirements_never_narrowed() -> None:
-    # Review finding (P2): the P/E percentiles need years of quarter-end prices.
-    def days(intent: ResearchIntent, horizon: str, floor: int | None) -> int:
-        planned = build_queries(intent, IDENTITY, horizon, AS_OF, [], min_price_days=floor)
-        return int(planned[0].params["days"])
-
-    for intent in (ResearchIntent.retrieve_price_history, ResearchIntent.retrieve_sector_benchmark):
-        assert days(intent, "near_term", None) == PRICE_DAYS["near_term"] == 400
-        assert days(intent, "near_term", LONG_PRICE_WINDOW_DAYS) == LONG_PRICE_WINDOW_DAYS
-        assert days(intent, "long_term", 100) == PRICE_DAYS["long_term"]
-
-
-async def test_valuation_history_widens_the_price_query_under_a_short_horizon() -> None:
-    planned: list[Any] = []
-
-    def recording(analyzer: EquityAnalyzer) -> EquityAnalyzer:
-        execute = analyzer._execute
-
-        async def wrapped(runner, query, identity, request, ctx, round_no):  # type: ignore[no-untyped-def]
-            planned.append(query)
-            await execute(runner, query, identity, request, ctx, round_no)
-
-        analyzer._execute = wrapped  # type: ignore[method-assign]
-        return analyzer
-
-    force = {"research_intent": "stop_research", "evidence_sufficient": 0.9}
-    windows: dict[str, dict[str, int]] = {}
-    for label, requirements in (
-        ("valuation", _requirements(*VALUATION)),
-        ("growth", _requirements("growth", "revenue_trajectory")),
-        ("none", None),
-    ):
-        planned.clear()
-        analyzer = recording(_analyzer(RuleLaya(force=force)))
-        await _fixture_evidence(analyzer, _request(VALUATION_Q, requirements, "near_term"))
-        windows[label] = {q.kind: q.params["days"] for q in planned if "days" in q.params}
-    wide = {"prices": LONG_PRICE_WINDOW_DAYS, "benchmarks": LONG_PRICE_WINDOW_DAYS}
-    assert windows["valuation"] == wide
-    assert windows["growth"] == windows["none"] == {"prices": 400, "benchmarks": 400}
 
 
 def test_compute_gaps_reports_missing_required_operands() -> None:
@@ -972,21 +862,9 @@ def test_compute_gaps_reports_missing_required_operands() -> None:
     ]
     assert gaps.count("price_history") == 1  # the loop's own label is reused, not duplicated
     assert gaps[len(baseline) :] == ["shares_outstanding", "eps_diluted", "revenue"]
-    analyzer.state.rows = [
-        {"metric": metric, "fy": 2026, "fp": "Q3", "value": 1.0}
-        for metric in ("revenue", "eps_diluted", "shares_outstanding")
-    ]
-    analyzer.state.price_series = PriceSeries(
-        symbol="AAPL",
-        source_id="src_px",
-        points=[PricePoint(date=date(2026, 9, 25), close=200.0)],
-        retrieved_at=AS_OF,
-    )
-    analyzer.compute_gaps("multi_horizon", AS_OF)
-    assert analyzer.operand_gaps == []
     analyzer.requirements = _requirements("relative_performance", "benchmark_comparison")
     assert analyzer.compute_gaps("near_term", AS_OF).count("sector_benchmark") == 1
-    assert analyzer.operand_gaps == ["sector_benchmark"]
+    assert analyzer.operand_gaps == ["price_history", "sector_benchmark"]
     assert operand_gaps(None, [], None, {}) == []
 
 
@@ -997,7 +875,7 @@ def test_operand_gaps_route_to_bounded_intents_and_spelled_out_queries() -> None
     queries = build_queries(
         ResearchIntent.retrieve_missing_metric, IDENTITY, "medium_term", AS_OF, ["total_debt"]
     )
-    assert [q.query for q in queries] == ['"Apple Inc." total debt 2026']
+    assert [q.query for q in queries] == ['"AAPL" total debt 2026']
 
 
 async def test_plan_next_escalates_an_operand_gap_to_one_metric_search() -> None:
@@ -1034,7 +912,6 @@ async def test_research_started_carries_product_labels() -> None:
     analyzer = _analyzer(laya)
     rec = Recorder()
     identity = IDENTITY.model_copy()
-    await analyzer.enrich_identity(identity, rec.ctx)
     requirements = _requirements(*VALUATION)
     await analyzer.retrieve(identity, _request(VALUATION_Q, requirements), rec.ctx)
     started = [d for n, d in rec.events if n == "research.started"]
@@ -1049,8 +926,7 @@ async def test_research_started_carries_product_labels() -> None:
         RuleLaya(force={"research_intent": "stop_research", "evidence_sufficient": 0.9})
     )
     rec = Recorder()
-    await plain.enrich_identity(identity, rec.ctx)
-    await plain.retrieve(identity, _request("Assess Apple."), rec.ctx)
+    await plain.retrieve(identity, _request("Assess $AAPL."), rec.ctx)
     started = next(d for n, d in rec.events if n == "research.started")
     assert started["question_intent"] is None and started["requirements"] == []
     assert started["interpretation_source"] is None
@@ -1095,7 +971,7 @@ async def test_calculate_runs_required_calculations_whichever_pack_laya_chose() 
     assert extra == ["valuation_reconciliation_1y", "valuation_reconciliation_3y"]
     # a broad request runs the chosen pack only
     plain = _analyzer()
-    evidence = await _fixture_evidence(plain, _request("Assess Apple."))
+    evidence = await _fixture_evidence(plain, _request("Assess $AAPL."))
     rec = Recorder()
     calculated = await plain.calculate(evidence, decisions, rec.ctx)
     assert [c.name for c in calculated.calculations] == growth
@@ -1322,17 +1198,15 @@ async def test_spark_bundle_carries_the_focus_and_the_unmet_requirements() -> No
         "recent_period": False,
         "unmet_requirements": report.uncertainties,
     }
-    # the fixture has no four consecutive EPS quarters, so both percentiles are honestly unmet
-    assert [m.name for m in report.missing_calculations] == [
-        "pe_5y_percentile",
-        "pe_history_percentile",
-    ]
-    assert all(m.missing_inputs == ["eps_ttm", "pe_history"] for m in report.missing_calculations)
-    assert report.missing_operands == [] and report.missing_research_intents == []
+    # web pages carry no verified figures, so every required calculation is honestly unmet
+    assert [m.name for m in report.missing_calculations] == requirements.required_calculations
+    assert all(m.missing_inputs for m in report.missing_calculations)
+    assert [m.name for m in report.missing_operands] == requirements.required_operands
+    assert report.missing_research_intents == []
     # a broad request builds exactly the bundle it always did
     bare = _bare()
     plain = bare.build_spark_bundle(
-        evidence, LayaDecisions(), calculated, _request("Assess Apple.")
+        evidence, LayaDecisions(), calculated, _request("Assess $AAPL.")
     )
     assert plain.question_focus == {} and plain.uncertainties == evidence.uncertainties
     assert bare.validate_requirements(evidence, calculated) is None
@@ -1414,30 +1288,31 @@ async def test_valuation_question_end_to_end() -> None:
     requirements = _requirements_of(result)
     assert requirements["interpretation_source"] == "spark"
     assert requirements["dropped_by_validation"] == []
-    assert requirements["satisfied_calculations"] == [
+    # Web pages carry no verified figures: every required calculation is reported missing,
+    # with its missing inputs, and the synthesis is told so; nothing is filled in.
+    assert requirements["satisfied_calculations"] == []
+    assert [m["name"] for m in requirements["missing_calculations"]] == [
         "market_cap",
         "pe_ttm",
         "ps_ttm",
         "fcf_yield_ttm",
-    ]
-    assert [m["name"] for m in requirements["missing_calculations"]] == [
         "pe_5y_percentile",
         "pe_history_percentile",
     ]
-    assert requirements["satisfied_requirements"] == ["Valuation multiples"]
-    assert [u["name"] for u in requirements["unmet_requirements"]] == ["Valuation history"]
-    unmet = (
-        "the question needs valuation history but the P/E's five-year percentile could not be "
-        "computed: missing eps_ttm, pe_history"
-    )
+    assert all(m["missing_inputs"] for m in requirements["missing_calculations"])
+    assert [u["name"] for u in requirements["unmet_requirements"]] == [
+        "Valuation multiples",
+        "Valuation history",
+    ]
+    unmet = "the question needs valuation multiples but no price history was retrieved"
     assert unmet in requirements["uncertainties"] and unmet in result["assessment"]["uncertainties"]
     user = spark.runs[-1]["messages"][1].content
     assert f"Question focus (Valuation): {INTENT_TABLE['valuation'].focus}" in user
     assert "What the question requires: Valuation multiples, Valuation history." in user
     assert f"- {unmet}" in user and user.index("Question focus") < user.index(EVIDENCE_OPEN)
+    assert "No verified financial figures are available" in user
     by_name = {c["name"]: c for c in result["calculations"]}
-    assert by_name["pe_ttm"]["status"] == "computed"
-    assert by_name["pe_history_percentile"]["status"] == "unavailable"
+    assert by_name["pe_ttm"]["status"] == "unavailable"
     decisions = [d for d in result["laya_decisions"] if d["stage"] == "question_validation"]
     assert [d["decision_type"] for d in decisions] == [
         "requirement_valuation_multiples",
@@ -1447,18 +1322,16 @@ async def test_valuation_question_end_to_end() -> None:
 
 
 async def test_price_versus_earnings_uses_the_existing_reconciliation_record() -> None:
-    query = "Is Apple's price justified by its earnings?"
+    query = "Is $AAPL's price justified by its earnings?"
     script = {query: interpretation("valuation_vs_fundamentals", "price_vs_earnings")}
     _id, _events, result = await _run_to_completion(
         _runtime(spark=ScriptedSpark(interpretations=script)), {"query": query}
     )
     requirements = _requirements_of(result)
     assert requirements["required_calculations"] == ["valuation_reconciliation_1y"]
-    assert requirements["satisfied_calculations"] == ["valuation_reconciliation_1y"]
+    assert requirements["satisfied_calculations"] == []  # no verified figures to reconcile
     records = [c for c in result["calculations"] if c["name"] == "valuation_reconciliation_1y"]
-    assert len(records) == 1 and records[0]["meta"]["reconciliation"]["verdict"] in (
-        RECONCILIATION_VERDICTS
-    )
+    assert len(records) == 1 and records[0]["status"] == "unavailable"
 
 
 async def test_event_question_requires_the_prior_assessment_and_reports_its_absence() -> None:

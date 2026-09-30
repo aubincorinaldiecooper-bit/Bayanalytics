@@ -1,10 +1,10 @@
-"""Polite HTTP page fetcher used by the HTTP research provider, EDGAR and Stooq clients.
+"""Polite HTTP page fetcher used by the HTTP research provider for pages its search returned.
 
 Responsibilities (AGENT.md sections 21 and 26):
 
-* identifies itself with the settings user agent (SEC EDGAR requires contact information),
-* keeps a per-host minimum interval between requests and never exceeds the SEC fair-access
-  limit (10 requests per second) on ``sec.gov`` / ``data.sec.gov``,
+* identifies itself with the settings user agent (plus the optional operator contact),
+* keeps a per-host minimum interval between requests and, when a search result is a
+  ``sec.gov`` page, never exceeds the SEC fair-access limit (10 requests per second),
 * honours ``robots.txt`` (cached per host, unavailable robots -> allow),
 * streams bodies and cuts them at 2 MiB so a filing can never be stored whole by accident,
 * retries once on connect/timeout errors,
@@ -27,8 +27,9 @@ gap needs address pinning inside the transport. A name that does not resolve at 
 to the transport, which then fails to connect.
 
 Cache policy (data rights). The on-disk cache is transient scratch space, not an archive:
-full bodies are written only for structured / public-domain hosts (``CACHE_BODY_HOSTS``:
-SEC EDGAR and Stooq); pages from journalism and other third-party hosts are never stored.
+full bodies are written only for public-domain hosts (``CACHE_BODY_HOSTS``: US government
+``sec.gov`` pages a search returned); pages from journalism and other third-party hosts are
+never stored.
 Every write also sweeps the directory (bounded scan) and unlinks files older than
 ``CACHE_MAX_AGE_S``, and reads unlink entries that have expired for the caller's TTL.
 
@@ -66,14 +67,13 @@ log = logging.getLogger(__name__)
 MAX_BODY_BYTES = 2 * 1024 * 1024
 MAX_REDIRECTS = 5
 DEFAULT_TTL_S = 6 * 3600.0
-EDGAR_TICKERS_TTL_S = 24 * 3600.0
-PRICE_CSV_TTL_S = 3600.0
 SEC_HOSTS: frozenset[str] = frozenset({"sec.gov", "www.sec.gov", "data.sec.gov", "efts.sec.gov"})
 SEC_MIN_INTERVAL_S = 0.11  # SEC fair-access policy: at most 10 requests per second
-# Hosts whose bodies may be stored on disk: US government works (EDGAR) and Stooq CSVs that
-# the price client only keeps as metadata + derived series. Everything else is metadata-only.
-CACHE_BODY_HOSTS: frozenset[str] = frozenset(SEC_HOSTS | {"stooq.com"})
-CACHE_MAX_AGE_S = EDGAR_TICKERS_TTL_S  # longest TTL any caller uses; bounds on-disk retention
+# Hosts whose bodies may be stored on disk: US government works. Everything else is
+# metadata-only. The fetcher never initiates a request to these hosts; it only fetches
+# URLs a search returned.
+CACHE_BODY_HOSTS: frozenset[str] = SEC_HOSTS
+CACHE_MAX_AGE_S = 24 * 3600.0  # bounds on-disk retention whatever TTL a caller asks for
 CACHE_SWEEP_LIMIT = 256  # directory entries examined per sweep
 PAYWALL_HEADER = "x-bay-paywalled"
 TRUNCATED_HEADER = "x-bay-truncated"
@@ -121,7 +121,7 @@ class TaggedProviderError(ResearchProviderError):
 
 
 class PageFetcher(Protocol):
-    """What EDGAR/Stooq clients and the HTTP provider need from a fetcher."""
+    """What the HTTP provider needs from a fetcher."""
 
     async def open(
         self, url: str, *, ttl_s: float | None = None, accept: str | None = None

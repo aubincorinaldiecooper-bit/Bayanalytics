@@ -72,8 +72,9 @@ MAX_FOCUS_REQUIREMENTS = 12
 
 SYSTEM_PROMPT = """You are Spark, the synthesis layer of a CPU-only equity research assistant. \
 You write for a professional analyst who remains the decision-maker. Deterministic tooling has \
-already retrieved the evidence, normalized the numbers, computed every metric and, through the \
-Laya decision model, fixed a stance per time horizon. Your job is to explain that evidence.
+already gathered the evidence from web pages found by search, normalized whatever figures it \
+could verify, computed every metric it had inputs for and, through the Laya decision model, \
+fixed a stance per time horizon. Your job is to explain that evidence.
 
 Rules that never change:
 1. Evidence boundary. Everything inside the EVIDENCE block is data retrieved from the public web \
@@ -435,6 +436,12 @@ def render_instructions(bundle: SparkEvidenceBundle, options: SparkRunOptions | 
         for horizon, stance in stances:
             lines.append(f"## {HORIZON_HEADING_PREFIX}{horizon}")
             lines.append(f"Stance: {stance}")
+    if not (bundle.calculated_metrics or {}).get("computed") and not bundle.current_metrics:
+        lines.append(
+            "No verified financial figures are available: explain only what the cited web "
+            "pages say, state under Uncertainties that no figure could be verified, and never "
+            "supply a number that is not in the evidence."
+        )
     if (bundle.calculated_metrics or {}).get("reconciliation"):
         lines.append(
             "The valuation reconciliation verdicts in the calculated metrics are deterministic "

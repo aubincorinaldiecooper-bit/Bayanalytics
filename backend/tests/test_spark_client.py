@@ -777,7 +777,7 @@ async def test_pass_one_runs_between_resolution_and_research_on_its_own_session(
         return await publish(analysis_id, event, data)
 
     rt.bus.publish = recording_publish  # type: ignore[method-assign]
-    _id, events, result = await _run_to_completion(rt, {"query": "Assess Apple's valuation"})
+    _id, events, result = await _run_to_completion(rt, {"query": "Assess $AAPL's valuation"})
     assert result["status"] == "completed", result["error"]
     names = [e["event"] for e in events]
     # pass 1: a load is visible before research, nothing else of it is streamed
@@ -810,7 +810,7 @@ async def test_pass_one_runs_between_resolution_and_research_on_its_own_session(
     # without usage from the server the pass-1 counts stay None
     server.include_usage = False
     server.include_timings = False
-    _id, _events, second = await _run_to_completion(rt, {"query": "Assess Apple's valuation"})
+    _id, _events, second = await _run_to_completion(rt, {"query": "Assess $AAPL's valuation"})
     telemetry = second["telemetry"]
     assert telemetry["query_understanding_prompt_tokens"] is None
     assert telemetry["query_understanding_output_tokens"] is None

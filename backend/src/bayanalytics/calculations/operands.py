@@ -15,8 +15,8 @@ operands, always by the same rules so the same evidence yields the same operands
   (:mod:`bayanalytics.normalization.sessions`), never a partial session;
 * market cap pairs that close with the latest ``shares_outstanding`` fact and records both
   dates, noting when they differ;
-* benchmark series are looked up by role through ``evidence.benchmark_refs`` and then
-  ``evidence.benchmarks`` (keyed by role or by symbol).
+* benchmark series are looked up by role in ``evidence.benchmarks``; a missing series is a
+  missing operand.
 """
 
 from __future__ import annotations
@@ -518,22 +518,12 @@ class OperandResolver:
 
     def benchmark_series(self, role: str) -> tuple[PriceSeries | None, dict[str, Any]]:
         """The benchmark series for a role plus a record of which benchmark was used."""
-        ref = next((r for r in self.evidence.benchmark_refs if r.role == role), None)
+        series = self.evidence.benchmarks.get(role)
         record: dict[str, Any] = {
             "role": role,
-            "symbol": ref.symbol if ref else None,
-            "name": ref.name if ref else None,
-            "reason": ref.reason if ref else None,
+            "symbol": series.symbol if series is not None else None,
+            "name": (series.label or None) if series is not None else None,
         }
-        series = self.evidence.benchmarks.get(role)
-        if series is None and ref is not None:
-            series = self.evidence.benchmarks.get(ref.symbol)
-        if series is None and ref is not None:
-            series = next(
-                (s for s in self.evidence.benchmarks.values() if s.symbol == ref.symbol), None
-            )
-        if series is not None and record["symbol"] is None:
-            record["symbol"] = series.symbol
         return series, record
 
     def latest_close_point(self, series: PriceSeries | None = None) -> PricePoint | None:

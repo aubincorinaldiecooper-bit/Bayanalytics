@@ -13,7 +13,7 @@ import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from bayanalytics.calculations.primitives import annualized_volatility, growth_rate, margin
@@ -41,13 +41,9 @@ from bayanalytics.laya.wrapper import LayaFinanceWrapper
 from bayanalytics.normalization import NORMALIZATION_VERSION
 from bayanalytics.normalization.corporate_actions import comparable_periods
 from bayanalytics.normalization.facts import (
-    build_facts,
-    derive_fourth_quarter_rows,
-    detect_stale_mix,
     freshness_summary,
 )
 from bayanalytics.normalization.periods import label as period_label
-from bayanalytics.normalization.sessions import label_series
 from bayanalytics.research.intents import (
     PlannedQuery,
     ResearchIntent,
@@ -55,12 +51,16 @@ from bayanalytics.research.intents import (
     gap_to_intent,
     seed_plan,
 )
-from bayanalytics.research.provider import EvidenceRecord, ResearchProviderError
+from bayanalytics.research.provider import (
+    EvidenceRecord,
+    ResearchProvider,
+    ResearchProviderError,
+)
 from bayanalytics.research.runner import REASON_SEARCH_FAILED, ResearchRunner, RoundResult
-from bayanalytics.schemas.common import ErrorCode, source_rank, stable_id
+from bayanalytics.research.sources import web_pages
+from bayanalytics.schemas.common import source_rank, stable_id
 from bayanalytics.schemas.decisions import ChoiceAnswer, LayaDecision, LayaQuestionSet, NoulAnswer
 from bayanalytics.schemas.evidence import (
-    BenchmarkRef,
     CorporateAction,
     EventSegment,
     NormalizedEvidence,
@@ -86,10 +86,6 @@ _SUFFICIENT_THRESHOLD = 0.7
 class RetrievalState:
     sources: list[SourceRecord] = field(default_factory=list)
     evidence: list[EvidenceRecord] = field(default_factory=list)
-    rows: list[dict[str, Any]] = field(default_factory=list)
-    price_series: PriceSeries | None = None
-    benchmark_series: dict[str, PriceSeries] = field(default_factory=dict)
-    benchmark_refs: list[BenchmarkRef] = field(default_factory=list)
     rejected: list[tuple[SourceRecord, str]] = field(default_factory=list)
     executed: list[str] = field(default_factory=list)
     rounds: int = 0
@@ -97,8 +93,8 @@ class RetrievalState:
     source_by_id: dict[str, SourceRecord] = field(default_factory=dict)
     evidence_by_source: dict[str, EvidenceRecord] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)  # provider outages, dropped rows, gaps
+    searches_issued: int = 0
     queries_failed: int = 0
-    structured_failures: int = 0
 
     def absorb(self, result: RoundResult) -> None:
         for source in result.sources:
@@ -110,22 +106,12 @@ class RetrievalState:
             sid = record.metadata.get("source_id") if record.metadata else None
             if sid:
                 self.evidence_by_source[sid] = record
-        self.rows.extend(result.facts_rows)
-        if result.price_series is not None:
-            self.price_series = result.price_series
-        self.benchmark_series.update(result.benchmark_series)
-        for ref in result.benchmark_refs:
-            if all(r.symbol != ref.symbol for r in self.benchmark_refs):
-                self.benchmark_refs.append(ref)
         self.rejected.extend(result.rejected)
         for note in result.notes:
             if note not in self.notes:
                 self.notes.append(note)
-            lowered = note.lower()
-            if lowered.startswith(REASON_SEARCH_FAILED):
+            if note.lower().startswith(REASON_SEARCH_FAILED):
                 self.queries_failed += 1
-            elif "unavailable" in lowered or "failed" in lowered:
-                self.structured_failures += 1
 
 
 class EquityAnalyzer:
@@ -134,12 +120,12 @@ class EquityAnalyzer:
     def __init__(
         self,
         settings: Settings,
-        research_stack: Any,
+        research_provider: ResearchProvider,
         laya: LayaFinanceWrapper,
         resolver_factory: ResolverFactory,
     ) -> None:
         self.settings = settings
-        self.provider, self.edgar, self.prices = research_stack
+        self.provider = research_provider
         self.laya = laya
         self._resolver_factory = resolver_factory
         self.state = RetrievalState()
@@ -148,7 +134,6 @@ class EquityAnalyzer:
         self.instrument_ref: InstrumentRef | None = None
         self.research_decisions: list[LayaDecision] = []
         self.request_as_of: datetime = datetime.now(tz=UTC)
-        self._submissions: Any = None
         # What the question requires (set from the request in retrieve) and, after the
         # calculations, which of it was met.
         self.requirements: AnalyticalRequirements | None = None
@@ -162,27 +147,6 @@ class EquityAnalyzer:
         self.identity = identity
         return identity
 
-    async def enrich_identity(self, identity: InstrumentIdentity, ctx: AnalysisContext) -> None:
-        """Fill exchange / SIC / fiscal-year-end from EDGAR submissions (first structured call)."""
-        if not identity.cik:
-            return
-        try:
-            submissions = await self.edgar.submissions(identity.cik)
-        except ResearchProviderError as exc:
-            raise AnalysisError(
-                ErrorCode.RESEARCH_UNAVAILABLE, details={"stage": "edgar_submissions"}
-            ) from exc
-        identity.sic = getattr(submissions, "sic", None) or identity.sic
-        identity.sector = getattr(submissions, "sic_description", None) or identity.sector
-        identity.fiscal_year_end = getattr(submissions, "fiscal_year_end", None)
-        exchanges = getattr(submissions, "exchanges", None) or []
-        if not identity.exchange and exchanges:
-            identity.exchange = str(exchanges[0]).upper()
-        identity.ticker_history = list(submissions.name_history)[:6]
-        if getattr(submissions, "name", None):
-            identity.name = submissions.name
-        self._submissions = submissions
-
     # ------------------------------------------------------------------ retrieve
     async def retrieve(
         self, identity: InstrumentIdentity, request: AnalysisRequest, ctx: AnalysisContext
@@ -190,7 +154,7 @@ class EquityAnalyzer:
         budget = request.budget
         self.request_as_of = request.as_of
         self.requirements = request.requirements
-        runner = ResearchRunner(self.provider, self.edgar, self.prices, self.settings, budget)
+        runner = ResearchRunner(self.provider, self.settings, budget)
         plan: list[ResearchIntent] = list(seed_plan(request.resolved_horizon, request.requirements))
         gaps: list[str] = []
         with ctx.timers.span("retrieval"):
@@ -244,14 +208,7 @@ class EquityAnalyzer:
                             g for g in gaps if g not in self.operand_gaps
                         ]
                     for planned in build_queries(
-                        intent,
-                        identity,
-                        request.resolved_horizon,
-                        request.as_of,
-                        query_gaps,
-                        min_price_days=(
-                            request.requirements.min_price_days if request.requirements else None
-                        ),
+                        intent, identity, request.resolved_horizon, request.as_of, query_gaps
                     ):
                         ctx.check_cancelled()
                         await self._execute(runner, planned, identity, request, ctx, round_no)
@@ -288,6 +245,7 @@ class EquityAnalyzer:
         ctx: AnalysisContext,
         round_no: int,
     ) -> None:
+        self.state.searches_issued += 1
         try:
             result = await runner.execute(planned, identity, request.as_of, ctx)
         except AnalysisError:
@@ -302,24 +260,20 @@ class EquityAnalyzer:
         merged.evidence_gaps_remaining = len(gaps)
         merged.search_rounds = self.state.rounds
         merged.queries_failed = self.state.queries_failed
-        merged.structured_failures = self.state.structured_failures
         return merged
 
     def compute_gaps(self, horizon: str, as_of: datetime) -> list[str]:
+        """Topics the kept web pages do not cover yet, as evidence-gap labels."""
         gaps: list[str] = []
-        revenue_quarters = {
-            (r.get("fy"), r.get("fp"))
-            for r in self.state.rows
-            if r.get("metric") == "revenue" and r.get("fp") in {"Q1", "Q2", "Q3", "Q4"}
-        }
-        if len(revenue_quarters) < 4:
-            gaps.append("earnings_history")
-        if self.state.price_series is None or not self.state.price_series.points:
-            gaps.append("price_history")
-        if not self.state.benchmark_series:
-            gaps.append("sector_benchmark")
-        if not any(s.source_type == "regulatory_filing" for s in self.state.sources):
-            gaps.append("latest_filing")
+        covered = {s.research_intent for s in self.state.sources if s.research_intent}
+        for label, intent in (
+            ("earnings_history", ResearchIntent.retrieve_earnings_history),
+            ("price_history", ResearchIntent.retrieve_price_history),
+            ("sector_benchmark", ResearchIntent.retrieve_sector_benchmark),
+            ("latest_filing", ResearchIntent.retrieve_latest_filing),
+        ):
+            if str(intent) not in covered:
+                gaps.append(label)
         recent_news = [
             s
             for s in self.state.sources
@@ -338,14 +292,9 @@ class EquityAnalyzer:
             "transcript" in s.title.lower() or "call" in s.title.lower() for s in self.state.sources
         ):
             gaps.append("management_commentary")
-        # Operands the question requires and the retrieval state does not hold yet (metric
-        # names, or the labels above for prices / benchmarks); nothing for general_assessment.
-        self.operand_gaps = operand_gaps(
-            self.requirements,
-            self.state.rows,
-            self.state.price_series,
-            self.state.benchmark_series,
-        )
+        # Operands the question requires: web pages are not parsed into facts or price series,
+        # so every required operand stays a gap (and its calculation reports it missing).
+        self.operand_gaps = operand_gaps(self.requirements, [], None, {})
         for gap in self.operand_gaps:
             if gap not in gaps:
                 gaps.append(gap)
@@ -359,21 +308,14 @@ class EquityAnalyzer:
         ctx: AnalysisContext,
     ) -> tuple[ResearchIntent, float]:
         primary = [s for s in self.state.sources if s.is_primary]
-        freshness = freshness_summary(
-            self._quick_facts(request.as_of), self.state.price_series, request.as_of
-        )
         state = {
             "instrument": identity.symbol,
             "horizon": request.resolved_horizon,
             "round": self.state.rounds,
             "sources_count": len(self.state.sources),
             "primary_sources": len(primary),
-            "facts_count": len(self.state.rows),
-            "has_price_history": self.state.price_series is not None,
-            "has_benchmark": bool(self.state.benchmark_series),
             "evidence_gaps": gaps,
             "executed_intents": self.state.executed[-6:],
-            "freshness": freshness.get("warnings", [])[:3],
             "latest_sources": [
                 {
                     "title": s.title[:80],
@@ -435,8 +377,8 @@ class EquityAnalyzer:
             candidate = gap_to_intent(gap)
             if str(candidate) not in self.state.executed:
                 return candidate, sufficient
-        # A required operand the structured sources did not carry: one metric search before
-        # stopping (the intent the schema reserves for "a metric a calculation needs").
+        # A required operand no page supplied: one metric search before stopping (the intent
+        # the schema reserves for "a metric a calculation needs").
         if (
             any(gap in self.operand_gaps for gap in gaps)
             and str(ResearchIntent.retrieve_missing_metric) not in self.state.executed
@@ -445,86 +387,44 @@ class EquityAnalyzer:
         return ResearchIntent.stop_research, sufficient
 
     # ------------------------------------------------------------------ normalize
-    def _quick_facts(self, as_of: datetime) -> list[NormalizedFact]:
-        try:
-            return build_facts(derive_fourth_quarter_rows(self.state.rows), as_of).facts
-        except Exception:  # pragma: no cover - defensive; normalize() surfaces real errors
-            return []
-
     async def normalize(
         self, records: list[SourceRecord], ctx: AnalysisContext
     ) -> NormalizedEvidence:
+        """Web pages are evidence as text: they are not parsed into financial facts or price
+        series, so the generic normalization runs with none and the calculations report
+        their missing operands."""
         assert self.identity is not None
         as_of = self._as_of
         with ctx.timers.span("normalization"):
-            fact_build = build_facts(derive_fourth_quarter_rows(self.state.rows), as_of)
-            prices = (
-                label_series(self.state.price_series, as_of) if self.state.price_series else None
-            )
-            benchmarks = {
-                key: label_series(series, as_of)
-                for key, series in self.state.benchmark_series.items()
-            }
-            uncertainties: list[str] = list(fact_build.notes) + [
-                n for n in self.state.notes if not n.lower().startswith("no cik")
-            ]
-            if prices is not None:
-                uncertainties.extend(detect_stale_mix(prices, fact_build.facts, as_of))
-            summary = freshness_summary(fact_build.facts, prices, as_of)
+            facts: list[NormalizedFact] = []
+            uncertainties: list[str] = [web_only_note(len(web_pages(records)))]
+            uncertainties.extend(self.state.notes)
+            summary = freshness_summary(facts, None, as_of)
             uncertainties.extend(summary.get("warnings", []))
-            text_evidence = self._text_evidence(records)
             actions = self._corporate_actions()
-            # comparable_periods also reports every identity break among the actions
-            comparable, comparability_notes = comparable_periods(fact_build.facts, actions)
+            comparable, comparability_notes = comparable_periods(facts, actions)
             uncertainties.extend(comparability_notes)
-            if prices is not None:
-                uncertainties.append(
-                    "price returns exclude dividends (price return, not total return)"
-                )
-            segments = self._segments(comparable, prices)
             evidence = NormalizedEvidence(
                 symbol=self.identity.symbol,
                 as_of=as_of,
-                facts=fact_build.facts,
-                prices=prices,
-                benchmarks=benchmarks,
-                benchmark_refs=list(self.state.benchmark_refs),
+                facts=facts,
+                prices=None,
+                benchmarks={},
                 sources=list(records),
-                conflicts=fact_build.conflicts,
+                conflicts=[],
                 uncertainties=_dedupe(uncertainties),
-                segments=segments,
+                segments=self._segments(comparable),
                 corporate_actions=actions,
-                text_evidence=text_evidence,
+                text_evidence=self._text_evidence(records),
                 freshness_summary=summary,
                 normalization_version=NORMALIZATION_VERSION,
             )
         return evidence
 
     def _corporate_actions(self) -> list[CorporateAction]:
-        """Identity events the vertical slice can see: EDGAR's former-name history (the
-        entity is unchanged; older material is filed under the former name). Splits, mergers
-        and spin-offs need a corporate-actions source that is not retrieved yet."""
-        submissions = getattr(self, "_submissions", None)
-        actions: list[CorporateAction] = []
-        for item in getattr(submissions, "former_names", None) or []:
-            name = item.get("name") if isinstance(item, dict) else None
-            if not name:
-                continue
-            until = item.get("to") if isinstance(item, dict) else None
-            effective = None
-            if isinstance(until, str) and len(until) >= 10:
-                try:
-                    effective = date.fromisoformat(until[:10])
-                except ValueError:
-                    effective = None
-            actions.append(
-                CorporateAction(
-                    kind="name_change",
-                    effective=effective,
-                    detail=f"formerly {name}",
-                )
-            )
-        return actions
+        """Splits, renames, mergers and spin-offs need a corporate-actions source; web pages
+        are not parsed into actions, so none are known and ``comparable_periods`` sees none."""
+        return []
 
     @property
     def _as_of(self) -> datetime:
@@ -536,7 +436,7 @@ class EquityAnalyzer:
             if not source.excerpt:
                 continue
             if source.extraction_method in {"json", "csv"} or source.source_type == "market_data":
-                continue  # structured endpoints are facts/prices, not prose to be judged
+                continue  # structured payloads and quote pages are not prose to be judged
             items.append(
                 {
                     "source_id": source.source_id,
@@ -880,7 +780,6 @@ class EquityAnalyzer:
                 "name": self.identity.name,
                 "exchange": self.identity.exchange,
                 "sector": self.identity.sector,
-                "fiscal_year_end": self.identity.fiscal_year_end,
             },
             request={
                 "query": request.query,
@@ -897,9 +796,7 @@ class EquityAnalyzer:
             or important_events[-3:],
             historical_analogues=_historical_analogues(evidence, decisions),
             calculated_metrics={"computed": computed, "unavailable": unavailable},
-            benchmark_context={
-                "benchmarks": [r.model_dump() for r in evidence.benchmark_refs],
-            },
+            benchmark_context={},
             sources=sources,
             excerpts=excerpts,
             conflicts=[c.model_dump(mode="json") for c in evidence.conflicts],
@@ -943,6 +840,15 @@ class EquityAnalyzer:
                 "source_id": evidence.prices.source_id,
             }
         return latest
+
+
+def web_only_note(pages: int) -> str:
+    """The uncertainty every assessment without verified financial figures carries."""
+    noun = "page" if pages == 1 else "pages"
+    return (
+        "No verified financial figures: this assessment is based only on "
+        f"{pages} web {noun} found by search."
+    )
 
 
 def _dedupe(items: list[str]) -> list[str]:

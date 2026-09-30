@@ -19,7 +19,6 @@ import pytest
 
 from bayanalytics.config import Settings
 from bayanalytics.context import AnalysisContext
-from bayanalytics.errors import AnalysisError
 from bayanalytics.instruments.base import InstrumentIdentity, ResearchBudget
 from bayanalytics.research import fetch
 from bayanalytics.research.extract import (
@@ -40,15 +39,12 @@ from bayanalytics.research.http_provider import HttpResearchProvider, build_rese
 from bayanalytics.research.intents import ResearchIntent, build_queries
 from bayanalytics.research.provider import PageResult, ResearchProviderError
 from bayanalytics.research.runner import REJECTION_REASONS, ResearchRunner, reject_reason
-from bayanalytics.schemas.common import ErrorCode
 from doubles import fixture_research_stack
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures" / "research" / "apple"
 AS_OF = datetime(2026, 9, 26, tzinfo=UTC)
 NOW = datetime(2026, 9, 26, 12, 0, tzinfo=UTC)
-IDENTITY = InstrumentIdentity(
-    symbol="AAPL", exchange="NASDAQ", name="Apple Inc.", cik="320193", sic="3571"
-)
+IDENTITY = InstrumentIdentity(symbol="AAPL", exchange="NASDAQ")
 PUBLIC_IP = "93.184.216.34"
 RESOLVER_TABLE: dict[str, list[str]] = {
     "public.example": [PUBLIC_IP, "2606:2800:220:1:248:1893:25c8:1946"],
@@ -308,20 +304,24 @@ async def test_configured_search_backend_on_lan_is_allowed(
     assert search_backend_hosts(settings.research_search_url) == {"searx.lan:8080"}
     async with mock_client(recorder) as http:
         provider = HttpResearchProvider(settings, http)
-        assert provider.fetcher.allowed_hosts == {"searx.lan:8080"}
-        result = await provider.open("http://searx.lan:8080/search?q=x&format=json")
+        fetcher = provider.fetcher
+        assert fetcher.allowed_hosts == {"searx.lan:8080"}
+        result = await fetcher.open("http://searx.lan:8080/search?q=x&format=json")
         assert result.status == 200
         with pytest.raises(ResearchProviderError, match="blocked_target"):
-            await provider.open("http://searx.lan:9090/")  # same host, other port
+            await fetcher.open("http://searx.lan:9090/")  # same host, other port
         with pytest.raises(ResearchProviderError, match="blocked_target"):
-            await provider.open("http://192.168.1.20:8080/")  # the address itself is not listed
+            await fetcher.open("http://192.168.1.20:8080/")  # the address itself is not listed
         with pytest.raises(ResearchProviderError, match="blocked_target"):
-            await provider.open("http://192.168.1.21/")
-        stack_provider, _, _ = build_research_stack(settings, http)
+            await fetcher.open("http://192.168.1.21/")
+        # the provider itself opens nothing its search did not return
+        with pytest.raises(ResearchProviderError, match="not_from_search"):
+            await provider.open("http://searx.lan:8080/search?q=x&format=json")
+        stack_provider = build_research_stack(settings, http)
         assert isinstance(stack_provider, HttpResearchProvider)
         assert stack_provider.fetcher.allowed_hosts == {"searx.lan:8080"}
         literal = make_settings(research_search_url="http://192.168.1.20:8080")
-        by_ip = HttpResearchProvider(literal, http)
+        by_ip = HttpResearchProvider(literal, http).fetcher
         assert (await by_ip.open("http://192.168.1.20:8080/search")).status == 200
         with pytest.raises(ResearchProviderError, match="blocked_target"):
             await by_ip.open("http://192.168.1.20:8081/")
@@ -416,13 +416,19 @@ async def test_provider_extract_maps_deep_page_to_extract_failed(
 ) -> None:
     recorder = Recorder(
         {
+            "/search": lambda r: httpx.Response(
+                200, json=_searx_payload("https://news.example/deep")
+            ),
             "/deep": lambda r: httpx.Response(
                 200, text=deep_html(5_000), headers={"content-type": "text/html"}
-            )
+            ),
         }
     )
     async with mock_client(recorder) as http:
-        provider = HttpResearchProvider(make_settings(research_search_url=None), http)
+        provider = HttpResearchProvider(
+            make_settings(research_search_url="https://searx.example"), http
+        )
+        await provider.search("deep page")
         with pytest.raises(ResearchProviderError, match="extract_failed") as info:
             await provider.extract("https://news.example/deep")
     assert str(info.value) == "extract_failed"
@@ -448,7 +454,6 @@ def fixture_stack():
 async def test_runner_rejects_deep_page_with_extract_failed_and_continues(
     resolver: dict[str, list[str]], fixture_stack
 ) -> None:
-    _, (_, edgar, prices) = fixture_stack
     recorder = Recorder(
         {
             "/search": lambda r: httpx.Response(
@@ -471,7 +476,7 @@ async def test_runner_rejects_deep_page_with_extract_failed_and_continues(
     settings = make_settings(research_search_url="https://searx.example")
     async with mock_client(recorder) as http:
         provider = HttpResearchProvider(settings, http)
-        runner = ResearchRunner(provider, edgar, prices, settings, ResearchBudget())
+        runner = ResearchRunner(provider, settings, ResearchBudget())
         rec = RecordingCtx()
         planned = build_queries(ResearchIntent.retrieve_recent_news, IDENTITY, "near_term", AS_OF)[
             0
@@ -494,7 +499,8 @@ async def test_runner_rejects_deep_page_with_extract_failed_and_continues(
             AS_OF,
             rec.ctx,
         )
-        assert more.price_series is not None and runner.stats.termination_reason is None
+        assert more.kind == "search" and runner.stats.termination_reason is None
+        assert runner.stats.queries_issued == 2
 
 
 # --------------------------------------------------------------------------------------
@@ -546,37 +552,6 @@ async def test_fetch_errors_carry_keyword_reasons(resolver: dict[str, list[str]]
                 await fetcher.open(f"https://public.example{path}")
             assert reject_reason(info.value) == expected, path
             assert str(info.value).startswith(expected)
-
-
-async def test_research_unavailable_details_carry_no_urls_or_exception_text(
-    fixture_stack,
-) -> None:
-    settings, (provider, edgar, prices) = fixture_stack
-    runner = ResearchRunner(provider, edgar, prices, settings, ResearchBudget())
-    rec = RecordingCtx()
-    missing = InstrumentIdentity(symbol="NOPE", name="Nowhere Corp", cik="999999")
-    planned = build_queries(ResearchIntent.retrieve_latest_filing, missing, "near_term", AS_OF)[0]
-    with pytest.raises(AnalysisError) as info:
-        await runner.execute(planned, missing, AS_OF, rec.ctx)
-    assert info.value.code is ErrorCode.RESEARCH_UNAVAILABLE
-    assert info.value.details == {
-        "kind": "edgar_submissions",
-        "stage": "edgar_submissions",
-        "reason": "fetch_failed",
-    }
-    assert "http" not in json.dumps(info.value.details).lower()
-
-
-async def test_price_failure_reason_is_a_keyword(fixture_stack) -> None:
-    settings, (provider, edgar, prices) = fixture_stack
-    runner = ResearchRunner(provider, edgar, prices, settings, ResearchBudget())
-    rec = RecordingCtx()
-    planned = build_queries(ResearchIntent.retrieve_price_history, IDENTITY, "near_term", AS_OF)[
-        0
-    ].model_copy(update={"params": {"symbol": "zzzz.us", "days": 30}})
-    result = await runner.execute(planned, IDENTITY, AS_OF, rec.ctx)
-    assert [reason for _, reason in result.rejected] == ["fetch_failed"]
-    assert [e["reason"] for e in rec.named("research.source_rejected")] == ["fetch_failed"]
 
 
 # --------------------------------------------------------------------------------------
@@ -650,7 +625,7 @@ async def test_cache_write_sweeps_expired_files(
         os.utime(path, (expired, expired))
     async with mock_client(handler) as http:
         fetcher = Fetcher(make_settings(research_cache_dir=tmp_path), http)
-        result = await fetcher.open("https://stooq.com/q/d/l/?s=aapl.us&i=d", ttl_s=3600)
+        result = await fetcher.open("https://www.sec.gov/Archives/x.htm", ttl_s=3600)
     assert result.status == 200
     assert not stale.exists() and not stale_tmp.exists()
     assert fresh.exists() and unrelated.exists()  # recent entries and foreign files survive
