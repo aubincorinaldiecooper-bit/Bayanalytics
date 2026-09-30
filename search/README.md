@@ -10,13 +10,14 @@ On Railway it runs as the `searxng` service in the `bayanalytics` project:
 - health check: `/healthz`
 - no public domain; the backend reaches it over the private network with
   `BAY_RESEARCH_SEARCH_URL=http://${{searxng.RAILWAY_PRIVATE_DOMAIN}}:8080`
-- the one variable it needs is `SEARXNG_SECRET`, a random value that is never shared with CLIPIT
+- no variables: `start.sh` generates a random `SEARXNG_SECRET` inside the container at every start,
+  so no secret is stored in Railway or the repository (set `SEARXNG_SECRET` only to pin one)
 
 To run it locally:
 
 ```sh
 docker build -t bay-searxng search
-docker run --rm -p 8888:8080 -e SEARXNG_SECRET="$(openssl rand -hex 32)" bay-searxng
+docker run --rm -p 8888:8080 bay-searxng
 # then: BAY_RESEARCH_SEARCH_URL=http://127.0.0.1:8888
 ```
 

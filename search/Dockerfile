@@ -4,6 +4,9 @@
 FROM searxng/searxng:latest
 
 COPY settings.yml /etc/searxng/settings.yml
+COPY start.sh /usr/local/bin/bay-searxng-start
+RUN chmod 0755 /usr/local/bin/bay-searxng-start
 
 ENV SEARXNG_SETTINGS_PATH=/etc/searxng/settings.yml
 EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/bay-searxng-start"]
