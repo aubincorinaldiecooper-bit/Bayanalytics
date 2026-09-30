@@ -6,8 +6,14 @@ No subprocess, no model. Answers are derived from a handful of well-known state 
 ``freshness``, ``guidance_hint``, ``sentiment_hint``, ...) with stable defaults when they are
 missing, so orchestration code sees plausible, repeatable decisions. The
 ``question_validation`` nouls (``requirement_<name>``, ``requirements_supported``) confirm at
-0.8 unless ``force`` pins them; the double never reads the question text. Every choice answer
-returns a probability for every option summing to one; every call is recorded in ``calls``.
+0.8 unless ``force`` pins them; the double never reads the question text (the instructions).
+The dynamic research choices read their options' descriptions instead, as a model would:
+``instrument_choice`` picks the candidate whose name contains the question's company phrase
+and that the most websites named (unsure on a tie), ``open_order`` ranks hits by the words
+their site and title share with the topic, ``price_table`` / ``figures_table`` /
+``close_column`` / ``line_<metric>`` pick the option whose header or label names the thing
+asked for, else ``none``. Every choice answer returns a probability for every option summing
+to one; every call is recorded in ``calls``.
 
 Token figures are measured with the doubles' word/punctuation tokenizer (``doubles.tokens``):
 ``count_tokens`` returns one count per text and ``usage.input_tokens`` is the sequence length
@@ -19,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import re
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -146,6 +153,92 @@ def _choice_probs(keys: list[str], preferred: str, top: float) -> dict[str, floa
     return {k: (top if k == preferred else rest) for k in keys}
 
 
+def _options(q: LayaQuestion) -> dict[str, str]:
+    criteria = q.criteria
+    if isinstance(criteria, Mapping):
+        return {str(k): str(v) for k, v in criteria.items()}
+    return {str(k): "" for k in criteria or []}
+
+
+def _words(text: str) -> set[str]:
+    return {w for w in re.split(r"[^a-z0-9%]+", text.lower()) if len(w) >= 3}
+
+
+def _rule_open_order(state: Mapping[str, Any], q: LayaQuestion) -> ChoiceAnswer:
+    topic = _words(_text(state, "question"))
+    options = _options(q)
+    hits = state.get("hits")
+    for hit in hits if isinstance(hits, list) else []:
+        if isinstance(hit, Mapping) and str(hit.get("option")) in options:
+            options[str(hit["option"])] = f"{hit.get('title', '')} {hit.get('site', '')}"
+    weights = {key: 1.0 + 2.0 * len(topic & _words(text)) for key, text in options.items()}
+    total = sum(weights.values())
+    probs = {key: weight / total for key, weight in weights.items()}
+    best = max(probs, key=lambda k: (probs[k], -list(probs).index(k)))
+    return ChoiceAnswer(choice=best, probabilities=probs)
+
+
+def _rule_instrument(state: Mapping[str, Any], q: LayaQuestion) -> ChoiceAnswer:
+    phrase = _words(_text(state, "company"))
+    sites: dict[str, float] = {}
+    candidates = state.get("candidates")
+    for item in candidates if isinstance(candidates, list) else []:
+        if isinstance(item, Mapping) and isinstance(item.get("sites"), (int, float)):
+            sites[str(item.get("option"))] = float(item["sites"])
+    matching = [
+        key
+        for key, name in _options(q).items()
+        if key != "none" and phrase and phrase <= _words(name)
+    ]
+    if not matching:
+        return _choice_answer(q, "none", 0.7)
+    most = max(sites.get(key, 0.0) for key in matching)
+    best = [key for key in matching if sites.get(key, 0.0) == most]
+    return _choice_answer(q, best[0], 0.8 if len(best) == 1 else 0.4)
+
+
+_LINE_RULES: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
+    # metric -> (every word group must appear, none of these may appear)
+    "revenue": (("revenue|sales",), ("cost", "growth", "per")),
+    "gross_profit": (("gross",), ("%",)),
+    "operating_income": (("operating", "income|profit"), ("cash", "margin")),
+    "net_income": (("net", "income|earnings|profit"), ("per", "share")),
+    "eps_diluted": (("diluted|eps",), ("basic", "shares")),
+    "eps_basic": (("basic", "eps|share"), ("shares",)),
+    "operating_cash_flow": (("operating", "cash"), ()),
+    "capex": (("capital|capex|property",), ("proceeds", "sale")),
+    "free_cash_flow": (("free", "cash"), ()),
+    "shares_outstanding": (("shares", "outstanding"), ()),
+}
+
+
+def _rule_line(metric: str, q: LayaQuestion) -> ChoiceAnswer:
+    need, avoid = _LINE_RULES.get(metric, ((), ()))
+    for key, text in _options(q).items():
+        if key == "none":
+            continue
+        words = _words(text) | ({"%"} if "%" in text else set())
+        if all(any(alt in words for alt in group.split("|")) for group in need) and not (
+            words & set(avoid)
+        ):
+            return _choice_answer(q, key, 0.8)
+    return _choice_answer(q, "none", 0.8)
+
+
+def _rule_option_named(q: LayaQuestion, *names: str) -> ChoiceAnswer:
+    for key, text in _options(q).items():
+        if key != "none" and any(name in _words(text) for name in names):
+            return _choice_answer(q, key, 0.8)
+    return _choice_answer(q, "none", 0.8)
+
+
+def _rule_close_column(q: LayaQuestion) -> ChoiceAnswer:
+    for key, text in _options(q).items():
+        if key != "none" and re.match(r"\s*close\b", text.lower()):
+            return _choice_answer(q, key, 0.8)
+    return _choice_answer(q, "none", 0.8)
+
+
 def _choice_answer(question: LayaQuestion, preferred: str, top: float = 0.7) -> ChoiceAnswer:
     criteria = question.criteria
     keys = [str(k) for k in (criteria if isinstance(criteria, Mapping) else criteria or [])]
@@ -264,7 +357,8 @@ def _material(state: Mapping[str, Any]) -> bool:
 class RuleLaya:
     """Rule-based ``LayaClient``; see the module docstring for the rules.
 
-    ``force`` pins answers per question key (a choice key, a score level or a noul probability);
+    ``force`` pins answers per question key (a choice key, a score level or a noul probability;
+    a ``(choice, probability)`` pair pins a choice at that probability, e.g. an unsure one);
     ``raise_error`` makes ``system_one`` raise it, for failure-path tests; ``latency_ms`` makes
     every ``system_one`` really wait that long (the reported latency is the measured wait).
     """
@@ -365,6 +459,9 @@ class RuleLaya:
 
     @staticmethod
     def _forced(q: LayaQuestion, value: Any) -> LayaAnswer:
+        if q.type == "choice" and isinstance(value, tuple):
+            choice, top = value
+            return _choice_answer(q, str(choice), float(top))
         if q.type == "choice":
             return _choice_answer(q, str(value), 0.9)
         if q.type == "score":
@@ -374,6 +471,18 @@ class RuleLaya:
     def _choice(self, key: str, q: LayaQuestion, state: Mapping[str, Any]) -> ChoiceAnswer:
         if key == "research_intent":
             return _rule_research_intent(state, q)
+        if key == "open_order":
+            return _rule_open_order(state, q)
+        if key == "instrument_choice":
+            return _rule_instrument(state, q)
+        if key == "price_table":
+            return _rule_option_named(q, "close", "price")
+        if key == "figures_table":
+            return _rule_option_named(q, "revenue", "sales", "income", "eps")
+        if key == "close_column":
+            return _rule_close_column(q)
+        if key.startswith("line_"):
+            return _rule_line(key.removeprefix("line_"), q)
         if key == "calculation_pack":
             return _rule_calculation_pack(state, q)
         if key == "guidance_trend":

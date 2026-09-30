@@ -1,0 +1,30 @@
+{
+ "fixture": true,
+ "pages": {
+  "https://www.fixturewire.example/markets/northwind-fixture-quarter-review": {
+   "status": 200,
+   "content_type": "text/html; charset=utf-8",
+   "body_file": "pages/fixturewire_news.html"
+  },
+  "https://quotes.fixture-markets.example/nwnd/history": {
+   "status": 200,
+   "content_type": "text/html; charset=utf-8",
+   "body_file": "pages/nwnd_price_history.html"
+  },
+  "https://www.fixture-financials.example/stocks/nwnd/financials/quarterly": {
+   "status": 200,
+   "content_type": "text/html; charset=utf-8",
+   "body_file": "pages/nwnd_quarterly_financials.html"
+  },
+  "https://www.fixture-earnings.example/nwnd/results-by-quarter": {
+   "status": 200,
+   "content_type": "text/html; charset=utf-8",
+   "body_file": "pages/nwnd_results_by_quarter.html"
+  },
+  "https://data.fixture-index.example/sp500/daily.csv": {
+   "status": 200,
+   "content_type": "text/csv",
+   "body_file": "pages/sp500_daily.csv"
+  }
+ }
+}

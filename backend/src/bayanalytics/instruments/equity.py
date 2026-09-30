@@ -3,8 +3,13 @@
 Owns the research strategy for one analysis: a deterministic seed plan by horizon, then a
 Laya-directed loop over bounded research intents until evidence is sufficient, retrieval stops
 changing the picture, the budget is spent, or the user cancels. Retrieval itself is done by the
-research runner; normalization, Laya question construction, calculation selection and the Spark
-bundle are built here from the accumulated evidence.
+research runner (with Laya choosing which hits to open and which tables, columns and lines of a
+page hold the data); normalization, Laya question construction, calculation selection and the
+Spark bundle are built here from the accumulated evidence: the web pages' text, and the price
+series and figures read from their tables, each keeping the page it came from.
+
+A question that names a company instead of a ticker is resolved here by one web search and a
+Laya choice among the tickers the results name (stage ``instrument_resolution``).
 """
 
 from __future__ import annotations
@@ -28,11 +33,23 @@ from bayanalytics.instruments.base import (
     LayaDecisions,
     SparkEvidenceBundle,
 )
-from bayanalytics.instruments.identity import InstrumentResolver
+from bayanalytics.instruments.identity import (
+    MAX_NAME_CANDIDATES,
+    MULTIPLE_TICKERS_MESSAGE,
+    TICKER_REQUIRED_MESSAGE,
+    InstrumentResolver,
+    NameCandidate,
+    company_phrase,
+    name_query,
+    ticker_candidates,
+)
 from bayanalytics.instruments.questions import check_requirements, operand_gaps
 from bayanalytics.laya.schemas import (
+    INSTRUMENT_CHOICE_KEY,
+    STAGE_INSTRUMENT_RESOLUTION,
     history_segment_questions,
     horizon_context_questions,
+    instrument_choice_questions,
     overall_scan_questions,
     research_plan_questions,
     text_evidence_questions,
@@ -41,9 +58,12 @@ from bayanalytics.laya.wrapper import LayaFinanceWrapper
 from bayanalytics.normalization import NORMALIZATION_VERSION
 from bayanalytics.normalization.corporate_actions import comparable_periods
 from bayanalytics.normalization.facts import (
+    build_facts,
+    detect_stale_mix,
     freshness_summary,
 )
 from bayanalytics.normalization.periods import label as period_label
+from bayanalytics.normalization.sessions import label_series
 from bayanalytics.research.intents import (
     PlannedQuery,
     ResearchIntent,
@@ -51,14 +71,17 @@ from bayanalytics.research.intents import (
     gap_to_intent,
     seed_plan,
 )
+from bayanalytics.research.market import MarketData
 from bayanalytics.research.provider import (
     EvidenceRecord,
     ResearchProvider,
     ResearchProviderError,
+    SearchResult,
 )
 from bayanalytics.research.runner import REASON_SEARCH_FAILED, ResearchRunner, RoundResult
-from bayanalytics.research.sources import web_pages
-from bayanalytics.schemas.common import source_rank, stable_id
+from bayanalytics.research.selection import ask_shrinking, chosen_option
+from bayanalytics.research.sources import domain_of, web_pages
+from bayanalytics.schemas.common import ErrorCode, source_rank, stable_id
 from bayanalytics.schemas.decisions import ChoiceAnswer, LayaDecision, LayaQuestionSet, NoulAnswer
 from bayanalytics.schemas.evidence import (
     CorporateAction,
@@ -80,6 +103,10 @@ ResolverFactory = Callable[[], Awaitable[InstrumentResolver]]
 _MAX_TEXT_EVIDENCE_FOR_LAYA = 8
 _MAX_SEGMENTS_FOR_LAYA = 8
 _SUFFICIENT_THRESHOLD = 0.7
+INSTRUMENT_CHOICE_MIN_CONFIDENCE = 0.6
+"""Laya's confidence needed to accept a company it chose among the searched candidates."""
+RESOLVE_INTENT = "resolve_instrument"
+"""The ``intent`` the name lookup's research events carry (not a research intent Laya picks)."""
 
 
 @dataclass
@@ -139,13 +166,141 @@ class EquityAnalyzer:
         self.requirements: AnalyticalRequirements | None = None
         self.requirements_report: RequirementsReport | None = None
         self.operand_gaps: list[str] = []
+        # Price series and figures read from the pages research kept (with their pages).
+        self.market = MarketData()
+        self.market_labels: dict[Any, str] = {}
+        self.identity_decisions: list[LayaDecision] = []
 
     # ------------------------------------------------------------------ identify
     async def identify(self, user_input: str, ctx: AnalysisContext) -> InstrumentIdentity:
+        """The ticker the analyst gave; without one, the company the question names, looked up
+        by web search and chosen by Laya among the tickers the results name."""
         resolver = await self._resolver_factory()
-        identity = resolver.resolve(user_input, self.instrument_ref)
+        try:
+            identity = resolver.resolve(user_input, self.instrument_ref)
+        except AnalysisError as exc:
+            phrase = company_phrase(user_input)
+            if phrase is None or not self._name_lookup_applies(exc):
+                raise
+            identity = await self._resolve_by_name(phrase, ctx)
         self.identity = identity
         return identity
+
+    def _name_lookup_applies(self, exc: AnalysisError) -> bool:
+        return (
+            exc.code == ErrorCode.AMBIGUOUS_INSTRUMENT
+            and (exc.details or {}).get("reason") == "ticker_required"
+            and self.instrument_ref is None
+            and self.provider is not None
+            and bool(getattr(self.provider, "search_configured", True))
+        )
+
+    async def _search(self, query: str) -> list[SearchResult]:
+        search_with = getattr(self.provider, "search_with", None)
+        if callable(search_with):
+            return await search_with(query)
+        return await self.provider.search(query)
+
+    async def _resolve_by_name(self, phrase: str, ctx: AnalysisContext) -> InstrumentIdentity:
+        """One topic-only web search for the phrase, the tickers its results name (ranked by
+        distinct websites), and Laya's choice among them. Unsure, tied or no candidates:
+        ``AMBIGUOUS_INSTRUMENT`` with the candidates as found (or ``ticker_required``)."""
+        query = name_query(phrase)
+        await ctx.event(
+            "research.query",
+            intent=RESOLVE_INTENT,
+            kind="search",
+            query=query,
+            label=f"ticker lookup for {phrase}",
+            round=0,
+        )
+        ticker_required = AnalysisError(
+            ErrorCode.AMBIGUOUS_INSTRUMENT,
+            TICKER_REQUIRED_MESSAGE,
+            details={"reason": "ticker_required", "candidates": []},
+        )
+        try:
+            results = await self._search(query)
+        except ResearchProviderError as exc:
+            log.warning("ticker lookup search failed: %s", exc)
+            await ctx.event(
+                "research.search_results",
+                query=query,
+                intent=RESOLVE_INTENT,
+                round=0,
+                total=0,
+                failed=True,
+                hits=[],
+            )
+            raise ticker_required from exc
+        await ctx.event(
+            "research.search_results",
+            query=query,
+            intent=RESOLVE_INTENT,
+            round=0,
+            total=len(results),
+            failed=False,
+            hits=[
+                {
+                    "url": h.url,
+                    "title": h.title,
+                    "domain": domain_of(h.url),
+                    "published_at": h.published_at.isoformat() if h.published_at else None,
+                }
+                for h in results[:8]
+            ],
+        )
+        candidates = ticker_candidates(results)[:MAX_NAME_CANDIDATES]
+        if not candidates:
+            raise ticker_required
+        chosen, confidence = await self._choose_company(phrase, candidates, ctx)
+        tied = chosen is not None and any(
+            other is not chosen and len(other.domains) == len(chosen.domains)
+            for other in candidates
+        )
+        if chosen is None or confidence < INSTRUMENT_CHOICE_MIN_CONFIDENCE or tied:
+            raise AnalysisError(
+                ErrorCode.AMBIGUOUS_INSTRUMENT,
+                MULTIPLE_TICKERS_MESSAGE,
+                details={
+                    "reason": "multiple_companies",
+                    "candidates": [c.as_candidate().model_dump() for c in candidates],
+                },
+            )
+        return InstrumentIdentity(
+            symbol=chosen.symbol,
+            exchange=chosen.exchange,
+            name=chosen.name,
+            confidence=confidence,
+            resolution_method="name_search",
+        )
+
+    async def _choose_company(
+        self, phrase: str, candidates: list[NameCandidate], ctx: AnalysisContext
+    ) -> tuple[NameCandidate | None, float]:
+        """Laya's choice among the candidates (``None`` when Laya declines, is unavailable, or
+        there is no Laya)."""
+        if self.laya is None:
+            return None, 0.0
+        options = [(c.symbol, c.name or c.symbol) for c in candidates]
+        state = {
+            "company": phrase,
+            "candidates": [
+                {"option": c.symbol, "name": c.name, "sites": len(c.domains)} for c in candidates
+            ],
+        }
+        decisions = await ask_shrinking(
+            self.laya,
+            STAGE_INSTRUMENT_RESOLUTION,
+            state,
+            lambda n: instrument_choice_questions(options[:n]),
+            len(options),
+            stable_id("name", phrase),
+            ctx,
+        )
+        self.identity_decisions.extend(decisions or [])
+        choice, confidence = chosen_option(decisions, INSTRUMENT_CHOICE_KEY)
+        return next((c for c in candidates if c.symbol == choice), None), confidence
 
     # ------------------------------------------------------------------ retrieve
     async def retrieve(
@@ -154,7 +309,14 @@ class EquityAnalyzer:
         budget = request.budget
         self.request_as_of = request.as_of
         self.requirements = request.requirements
-        runner = ResearchRunner(self.provider, self.settings, budget)
+        runner = ResearchRunner(
+            self.provider,
+            self.settings,
+            budget,
+            laya=self.laya,
+            market=self.market,
+            decisions=self.research_decisions,
+        )
         plan: list[ResearchIntent] = list(seed_plan(request.resolved_horizon, request.requirements))
         gaps: list[str] = []
         with ctx.timers.span("retrieval"):
@@ -292,9 +454,14 @@ class EquityAnalyzer:
             "transcript" in s.title.lower() or "call" in s.title.lower() for s in self.state.sources
         ):
             gaps.append("management_commentary")
-        # Operands the question requires: web pages are not parsed into facts or price series,
-        # so every required operand stays a gap (and its calculation reports it missing).
-        self.operand_gaps = operand_gaps(self.requirements, [], None, {})
+        # Operands the question requires that no page has supplied yet (figures by metric,
+        # the company's price series, a benchmark series).
+        self.operand_gaps = operand_gaps(
+            self.requirements,
+            self.market.metric_rows(),
+            self.market.prices(),
+            self.market.benchmarks(),
+        )
         for gap in self.operand_gaps:
             if gap not in gaps:
                 gaps.append(gap)
@@ -390,16 +557,32 @@ class EquityAnalyzer:
     async def normalize(
         self, records: list[SourceRecord], ctx: AnalysisContext
     ) -> NormalizedEvidence:
-        """Web pages are evidence as text: they are not parsed into financial facts or price
-        series, so the generic normalization runs with none and the calculations report
-        their missing operands."""
+        """The pages' text plus what was read from their tables: figures become normalized facts
+        (one row per page, so pages that disagree become conflicts), the company's price series
+        and the S&P 500 series become the price evidence. The uncertainties say what was found
+        and where, or that search returned no page with it."""
         assert self.identity is not None
         as_of = self._as_of
         with ctx.timers.span("normalization"):
-            facts: list[NormalizedFact] = []
-            uncertainties: list[str] = [web_only_note(len(web_pages(records)))]
+            rows, alignment_notes, self.market_labels = self.market.fact_rows()
+            fact_build = build_facts(rows, as_of)
+            facts: list[NormalizedFact] = fact_build.facts
+            company = self.market.prices()
+            prices = label_series(company, as_of) if company is not None else None
+            benchmarks = {
+                role: label_series(series, as_of)
+                for role, series in self.market.benchmarks().items()
+            }
+            uncertainties: list[str] = self.market.data_notes(
+                self.identity.symbol, len(web_pages(records)), rows
+            )
+            uncertainties.extend(self.market.notes)
+            uncertainties.extend(alignment_notes)
+            uncertainties.extend(fact_build.notes)
             uncertainties.extend(self.state.notes)
-            summary = freshness_summary(facts, None, as_of)
+            if prices is not None:
+                uncertainties.extend(detect_stale_mix(prices, facts, as_of))
+            summary = freshness_summary(facts, prices, as_of)
             uncertainties.extend(summary.get("warnings", []))
             actions = self._corporate_actions()
             comparable, comparability_notes = comparable_periods(facts, actions)
@@ -408,12 +591,12 @@ class EquityAnalyzer:
                 symbol=self.identity.symbol,
                 as_of=as_of,
                 facts=facts,
-                prices=None,
-                benchmarks={},
+                prices=prices,
+                benchmarks=benchmarks,
                 sources=list(records),
-                conflicts=[],
+                conflicts=fact_build.conflicts,
                 uncertainties=_dedupe(uncertainties),
-                segments=self._segments(comparable),
+                segments=self._segments(comparable, prices),
                 corporate_actions=actions,
                 text_evidence=self._text_evidence(records),
                 freshness_summary=summary,
@@ -480,6 +663,7 @@ class EquityAnalyzer:
         ordered = sorted(periods.items(), key=lambda kv: kv[1].end or datetime.min.date())
         segments: list[EventSegment] = []
         prev_year: dict[tuple[int | None, str | None], dict[str, NormalizedFact]] = {}
+        by_end: list[tuple[Period, dict[str, NormalizedFact]]] = []
         for key, period in ordered:
             metrics = by_period[key]
             summary: dict[str, Any] = {"period": period_label(period)}
@@ -493,9 +677,19 @@ class EquityAnalyzer:
                 fact = metrics.get(metric)
                 if fact is not None:
                     summary[metric] = fact.value
-            prior = prev_year.get(
-                (period.fiscal_year - 1 if period.fiscal_year else None, period.fiscal_period)
-            )
+            if period.fiscal_year is not None and period.fiscal_period:
+                prior = prev_year.get((period.fiscal_year - 1, period.fiscal_period))
+            else:
+                # Unlabelled quarters (read from web pages) pair by end date: the quarter
+                # that ended 350-380 days earlier.
+                prior = next(
+                    (
+                        m
+                        for p, m in by_end
+                        if period.end and p.end and 350 <= (period.end - p.end).days <= 380
+                    ),
+                    None,
+                )
             if prior and "revenue" in metrics and "revenue" in prior:
                 growth = growth_rate(metrics["revenue"].value, prior["revenue"].value)
                 if growth is not None:
@@ -508,6 +702,7 @@ class EquityAnalyzer:
             if vol is not None:
                 summary["volatility_annualized_pct"] = round(vol * 100, 2)
             prev_year[(period.fiscal_year, period.fiscal_period)] = metrics
+            by_end.append((period, metrics))
             segments.append(
                 EventSegment(
                     segment_id=stable_id("seg", self.identity.symbol, period_label(period)),
@@ -840,15 +1035,6 @@ class EquityAnalyzer:
                 "source_id": evidence.prices.source_id,
             }
         return latest
-
-
-def web_only_note(pages: int) -> str:
-    """The uncertainty every assessment without verified financial figures carries."""
-    noun = "page" if pages == 1 else "pages"
-    return (
-        "No verified financial figures: this assessment is based only on "
-        f"{pages} web {noun} found by search."
-    )
 
 
 def _dedupe(items: list[str]) -> list[str]:

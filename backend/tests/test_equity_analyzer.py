@@ -227,13 +227,14 @@ async def test_normalize_keeps_web_pages_as_text_and_says_so() -> None:
     sources = await analyzer.retrieve(analyzer.identity, _request(), rec.ctx)
     assert sources and analyzer.stats.queries_failed == 0
     evidence = await analyzer.normalize(sources, rec.ctx)
-    # Pages are not parsed into figures: no facts, prices, segments or corporate actions ...
+    # No page the search returned holds a price or figures table: no facts, prices,
+    # segments or corporate actions ...
     assert evidence.facts == [] and evidence.prices is None and evidence.benchmarks == {}
     assert evidence.segments == [] and evidence.corporate_actions == []
-    # ... and the result says what it rests on.
+    # ... and the result says so plainly.
     assert evidence.uncertainties[0] == (
-        "No verified financial figures: this assessment is based only on "
-        f"{len(sources)} web pages found by search."
+        "Web search returned no page with price history or quarterly figures: this "
+        f"assessment is based only on the text of {len(sources)} web pages found by search."
     )
     assert evidence.text_evidence
     assert len(evidence.uncertainties) == len(set(evidence.uncertainties))
