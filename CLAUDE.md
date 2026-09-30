@@ -24,6 +24,16 @@ Outbound traffic that is not data is limited to model downloads from Hugging Fac
 Third-party usage reporting is off (`procenv.FORCED_ENV`, `ORT_DISABLE_TELEMETRY=1` in the image).
 Keep it off.
 
+## How changes ship (owner's rule, not negotiable)
+
+- Finish the whole change first, then run the checks once. When asked to remove something, remove
+  all of it (code, wiring, config, labels, docs, tests) in one pass before checking.
+- Once a change has passed its checks, **leave it alone**: no follow-up tidying, relabelling or
+  "one more fix" before it ships, and no re-running checks on code that already passed. Ship
+  exactly what passed.
+- Leftovers noticed after checks pass are reported to the owner, not fixed on the spot. They go
+  in a later change only if the owner asks.
+
 ## Other standing rules
 
 - The browser never receives `BAY_API_KEY`. There is no temporary password-based auth.
